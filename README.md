@@ -237,19 +237,22 @@ docker compose up -d --build order-service
 Create a `docker-compose.override.yml` — Compose merges it automatically, and it stays
 out of the committed `docker-compose.yml`:
 
+Mount the service directory at `/app` and the shared chassis at `/app/common`, so edits to
+either are picked up:
+
 ```yaml
 services:
   user-service:
-    volumes: ["./services/user:/app"]
+    volumes: ["./services/user:/app", "./services/common:/app/common"]
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
   restaurant-service:
-    volumes: ["./services/restaurant:/app"]
+    volumes: ["./services/restaurant:/app", "./services/common:/app/common"]
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
   menu-service:
-    volumes: ["./services/menu:/app"]
+    volumes: ["./services/menu:/app", "./services/common:/app/common"]
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003", "--reload"]
   order-service:
-    volumes: ["./services/order:/app"]
+    volumes: ["./services/order:/app", "./services/common:/app/common"]
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004", "--reload"]
 ```
 
@@ -276,6 +279,9 @@ Point the URLs at `localhost` and keep the rest of the stack in Compose:
 cd services/user
 python3 -m venv .venv && source .venv/bin/activate
 pip install fastapi uvicorn "pydantic[email]" psycopg2-binary bcrypt
+
+# In the image, `common/` sits inside /app; on the host it is one level up.
+export PYTHONPATH=..
 
 # Substitute the database username and password before running this line.
 # Take them from .env (POSTGRES_USER / POSTGRES_PASSWORD) — they are not repeated here.
@@ -345,11 +351,17 @@ Week 1). Add the package to that service's `pip install` block and rebuild with
 ```text
 smartfoodops-backend/
 ├── api-gateway/nginx.conf     # Path-based routing + /health
-├── services/
-│   ├── user/                  # Dockerfile, main.py, schemas.py  (:8001)
-│   ├── restaurant/            # …                                (:8002)
-│   ├── menu/                  # …                                (:8003)
-│   └── order/                 # …                                (:8004)
+├── services/                  # Shared Docker build context
+│   ├── common/                # Shared chassis — infrastructure only, no domain code
+│   │   ├── config.py          # Env defaults, timeouts, pool bounds
+│   │   ├── errors.py          # HTTPException factories (400/403/404/409/422/500/502/503)
+│   │   ├── logging_config.py  # Uniform log format
+│   │   ├── postgres.py        # PostgresPool: lifespan, cursor, health probe
+│   │   └── service_client.py  # Inter-service HTTP + failure translation
+│   ├── user/                  # main.py, repository.py, schemas.py           (:8001)
+│   ├── restaurant/            # + clients.py (User Service)                  (:8002)
+│   ├── menu/                  # + clients.py, datastores.py (Mongo/Redis)    (:8003)
+│   └── order/                 # + clients.py, pricing.py (re-pricing rules)  (:8004)
 ├── readme/                    # Week 1 blueprints and contracts
 ├── docker-compose.yml         # Orchestration
 ├── init.sql                   # Postgres DDL + role seed data
@@ -357,8 +369,26 @@ smartfoodops-backend/
 └── .env                       # Local environment variables — gitignored, create it yourself
 ```
 
-Each service is self-contained — `main.py` (routes and logic) plus `schemas.py` (Pydantic
-models). There is no shared library, so a service directory is its whole build context.
+Every service follows the same layering, so any one of them can be read the same way:
+
+| File | Responsibility |
+|---|---|
+| `main.py` | Wiring and route handlers only — no SQL, no HTTP calls |
+| `repository.py` | All datastore access for the tables/collections this service owns |
+| `clients.py` | Outbound calls to sibling services |
+| `schemas.py` | Pydantic request/response models (the service's public contract) |
+| `pricing.py`, `datastores.py` | Service-specific domain or infrastructure detail |
+
+`services/common/` is a shared *chassis*, not a shared domain. It holds connection
+pooling, logging, error mapping, and HTTP transport — the plumbing that would otherwise be
+copy-pasted into every new service. Domain models, business rules, and table knowledge
+stay inside their owning service, so no service can reason about another's data. Because
+all four images need it, the Docker build context is `./services` (not the individual
+service directory) and each `Dockerfile` copies `common/` alongside its own source.
+
+The trade-off: a change to `common/` requires rebuilding every service. That is acceptable
+in a single-repo Compose setup; if services ever ship on independent release cycles,
+`common/` should become a versioned, pip-installed package instead.
 
 ---
 
@@ -367,6 +397,7 @@ models). There is no shared library, so a service directory is its whole build c
 | Symptom | Cause and fix |
 |---|---|
 | `502 Bad Gateway` from Nginx | Target service crashed on boot. `docker compose logs <service>` |
+| `502` but the service logs look healthy | Nginx resolved the upstream IP at startup and the container was recreated since. `docker compose restart api-gateway` |
 | Port 80 already in use | Another web server is bound. Stop it, or change the gateway's published port |
 | `database_reachable: false` | Postgres still starting, or the volume is mid-init. Re-check after ~10s |
 | Schema changes not visible | `init.sql` only runs on an empty volume — `docker compose down -v` |

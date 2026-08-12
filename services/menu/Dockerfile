@@ -11,8 +11,9 @@ RUN pip install --no-cache-dir \
     redis==5.2.1 \
     httpx==0.28.1
 
-# Copy application source code
-COPY . /app
+# Build context is ./services so the shared chassis can be copied alongside this service.
+COPY common/ /app/common/
+COPY menu/ /app/
 
 EXPOSE 8003
 

@@ -5,153 +5,53 @@ active state are resolved over HTTP against the Restaurant Service; this service
 touches PostgreSQL.
 """
 
-import logging
-import os
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import UUID
 
-import httpx
-import redis.asyncio as aioredis
-from fastapi import FastAPI, HTTPException, status
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ReturnDocument
-from pymongo.errors import PyMongoError
+from fastapi import FastAPI, status
 
+from clients import RestaurantServiceClient
+from common.errors import not_found
+from common.logging_config import configure_logging
+from datastores import DocumentStores
+from repository import MenuRepository
 from schemas import MenuResponse, MenuUpsertRequest, OrderTrackingLogCreateRequest
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("menu-service")
+SERVICE_NAME = "menu-service"
 
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://db-nosql:27017/smartfoodops_menus")
-REDIS_URL = os.getenv("REDIS_URL", "redis://cache-redis:6379/0")
-RESTAURANT_SERVICE_URL = os.getenv(
-    "RESTAURANT_SERVICE_URL", "http://restaurant-service:8002"
-)
-HTTP_TIMEOUT = 5.0
-MONGO_TIMEOUT_MS = 5000
+logger = configure_logging(SERVICE_NAME)
+stores = DocumentStores(logger=logger)
+menus = MenuRepository(stores)
+restaurant_service = RestaurantServiceClient(logger)
 
-mongo_client: AsyncIOMotorClient | None = None
-mongo_db = None
-redis_client = None
+app = FastAPI(title="SmartFoodOps Menu Service", lifespan=stores.lifespan)
 
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    """Create the Mongo/Redis clients once and reuse their connection pools."""
-    global mongo_client, mongo_db, redis_client
-    mongo_client = AsyncIOMotorClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=MONGO_TIMEOUT_MS,
-        socketTimeoutMS=MONGO_TIMEOUT_MS,
-        connectTimeoutMS=MONGO_TIMEOUT_MS,
+def _as_response(document: dict) -> MenuResponse:
+    return MenuResponse(
+        restaurant_id=document["restaurant_id"], categories=document["categories"]
     )
-    mongo_db = mongo_client.get_default_database()
-    redis_client = aioredis.from_url(REDIS_URL, socket_timeout=2.0)
-    logger.info("Mongo and Redis clients initialised")
-    try:
-        yield
-    finally:
-        mongo_client.close()
-        await redis_client.aclose()
-        mongo_client, mongo_db, redis_client = None, None, None
-
-
-app = FastAPI(title="SmartFoodOps Menu Service", lifespan=lifespan)
-
-
-def unavailable(exc: Exception) -> HTTPException:
-    """Translate a MongoDB socket timeout / network failure into 503."""
-    logger.error("MongoDB operation failed: %s", exc)
-    return HTTPException(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        detail="Document database is unavailable; please retry shortly",
-    )
-
-
-async def verify_restaurant_active(restaurant_id: UUID) -> dict:
-    """Confirm via the Restaurant Service that the restaurant exists and is active."""
-    url = f"{RESTAURANT_SERVICE_URL}/api/v1/restaurants/{restaurant_id}"
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            response = await client.get(url)
-    except httpx.RequestError as exc:
-        logger.error("Restaurant Service unreachable at %s: %s", url, exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Restaurant Service is unreachable; cannot verify restaurant",
-        ) from exc
-
-    if response.status_code == status.HTTP_404_NOT_FOUND:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Restaurant {restaurant_id} does not exist",
-        )
-    if response.status_code != status.HTTP_200_OK:
-        logger.error(
-            "Unexpected Restaurant Service response %s: %s",
-            response.status_code,
-            response.text[:200],
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Unexpected response from Restaurant Service",
-        )
-
-    restaurant = response.json()
-    if not restaurant.get("is_active", False):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Restaurant {restaurant_id} is not active",
-        )
-    return restaurant
 
 
 @app.get("/api/v1/menus/health")
 async def health():
-    mongo_ok, redis_ok = True, True
-    try:
-        await mongo_client.admin.command("ping")
-    except Exception as exc:  # pragma: no cover - health must never raise
-        logger.warning("Mongo health probe failed: %s", exc)
-        mongo_ok = False
-    try:
-        await redis_client.ping()
-    except Exception as exc:  # pragma: no cover - health must never raise
-        logger.warning("Redis health probe failed: %s", exc)
-        redis_ok = False
     return {
         "status": "Menu Service running with NoSQL + Redis connection",
-        "service": "menu-service",
-        "mongo_reachable": mongo_ok,
-        "redis_reachable": redis_ok,
-        "restaurant_service_url": RESTAURANT_SERVICE_URL,
+        "service": SERVICE_NAME,
+        "mongo_reachable": await stores.mongo_reachable(),
+        "redis_reachable": await stores.redis_reachable(),
+        "restaurant_service_url": restaurant_service.base_url,
     }
 
 
 @app.post("/api/v1/menus", response_model=MenuResponse)
 async def upsert_menu(payload: MenuUpsertRequest) -> MenuResponse:
     """Upsert the full category/item/customization tree for one restaurant."""
-    await verify_restaurant_active(payload.restaurant_id)
+    await restaurant_service.verify_active(payload.restaurant_id)
 
-    now = datetime.now(timezone.utc)
     categories = [category.model_dump() for category in payload.categories]
-    try:
-        document = await mongo_db.menus.find_one_and_update(
-            {"restaurant_id": str(payload.restaurant_id)},
-            {
-                "$set": {"categories": categories, "updated_at": now},
-                "$setOnInsert": {"created_at": now},
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
-    except PyMongoError as exc:
-        raise unavailable(exc) from exc
-
-    return MenuResponse(
-        restaurant_id=document["restaurant_id"], categories=document["categories"]
-    )
+    document = await menus.upsert_menu(payload.restaurant_id, categories)
+    return _as_response(document)
 
 
 @app.post("/api/v1/menus/logs", status_code=status.HTTP_201_CREATED)
@@ -165,19 +65,12 @@ async def log_order_status(payload: OrderTrackingLogCreateRequest):
         "updated_by": payload.updated_by,
         "metadata": payload.metadata or {},
     }
-    try:
-        result = await mongo_db.order_tracking_logs.update_one(
-            {"order_id": str(payload.order_id)},
-            {"$push": {"status_history": entry}},
-            upsert=True,
-        )
-    except PyMongoError as exc:
-        raise unavailable(exc) from exc
+    created = await menus.append_status_log(payload.order_id, entry)
 
     return {
         "message": "Audit log captured",
         "order_id": str(payload.order_id),
-        "created_document": result.upserted_id is not None,
+        "created_document": created,
         "status": payload.status,
     }
 
@@ -185,19 +78,10 @@ async def log_order_status(payload: OrderTrackingLogCreateRequest):
 @app.get("/api/v1/menus/{restaurant_id}", response_model=MenuResponse)
 async def get_menu(restaurant_id: UUID) -> MenuResponse:
     """Serve the active menu tree — used by the Order Service to price a checkout."""
-    try:
-        document = await mongo_db.menus.find_one({"restaurant_id": str(restaurant_id)})
-    except PyMongoError as exc:
-        raise unavailable(exc) from exc
-
+    document = await menus.find_menu(restaurant_id)
     if document is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No menu published for restaurant {restaurant_id}",
-        )
-    return MenuResponse(
-        restaurant_id=document["restaurant_id"], categories=document["categories"]
-    )
+        raise not_found(f"No menu published for restaurant {restaurant_id}")
+    return _as_response(document)
 
 
 if __name__ == "__main__":

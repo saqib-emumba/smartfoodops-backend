@@ -84,8 +84,9 @@ services:
   # --- 3. CORE SERVICE CONTAINER SERVICES ---
   user-service:
     build:
-      context: ./services/user
-      dockerfile: Dockerfile
+      # Context is ./services so the shared `common` chassis is inside the build context.
+      context: ./services
+      dockerfile: user/Dockerfile
     container_name: sfo-user-service
     restart: always
     environment:
@@ -98,8 +99,8 @@ services:
 
   restaurant-service:
     build:
-      context: ./services/restaurant
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: restaurant/Dockerfile
     container_name: sfo-restaurant-service
     restart: always
     environment:
@@ -112,8 +113,8 @@ services:
 
   menu-service:
     build:
-      context: ./services/menu
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: menu/Dockerfile
     container_name: sfo-menu-service
     restart: always
     environment:
@@ -129,8 +130,8 @@ services:
 
   order-service:
     build:
-      context: ./services/order
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: order/Dockerfile
     container_name: sfo-order-service
     restart: always
     environment:

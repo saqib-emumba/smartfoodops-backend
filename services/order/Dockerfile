@@ -10,8 +10,9 @@ RUN pip install --no-cache-dir \
     psycopg2-binary==2.9.10 \
     httpx==0.28.1
 
-# Copy application source code
-COPY . /app
+# Build context is ./services so the shared chassis can be copied alongside this service.
+COPY common/ /app/common/
+COPY order/ /app/
 
 EXPOSE 8004
 
