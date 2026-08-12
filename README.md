@@ -47,6 +47,57 @@ Two rules the code enforces deliberately:
 - Docker Desktop (Compose v2) — `docker compose version`
 - `curl` and `python3` for the smoke tests below
 - Ports free on the host: **80, 5432, 6379, 27017**
+- A `.env` file at the repo root — see below, it is not committed
+
+---
+
+## Environment file
+
+`.env` is listed in [.gitignore](.gitignore) and is **not** committed, so a fresh clone will
+not have one. Create it at the repo root before your first run:
+
+```bash
+cat > .env <<'EOF'
+# Database Credentials
+POSTGRES_DB=smartfoodops_core
+POSTGRES_USER=sfo_admin
+POSTGRES_PASSWORD=<must match db-postgres in docker-compose.yml>
+POSTGRES_HOST=db-postgres
+POSTGRES_PORT=5432
+
+MONGO_URI=mongodb://db-nosql:27017/smartfoodops_menus
+REDIS_URL=redis://cache-redis:6379/0
+
+# Service endpoints (within the Docker network)
+USER_SERVICE_URL=http://user-service:8001
+RESTAURANT_SERVICE_URL=http://restaurant-service:8002
+MENU_SERVICE_URL=http://menu-service:8003
+ORDER_SERVICE_URL=http://order-service:8004
+EOF
+```
+
+`POSTGRES_PASSWORD` is **not** free choice — copy the value `docker-compose.yml` passes to
+the `db-postgres` service. The two must agree or a host-run service cannot authenticate
+against the container's database. It is not repeated here so this file stays the only place
+you read it from.
+
+Where these are actually read matters: `docker-compose.yml` currently **hardcodes** the
+Postgres credentials and the `*_SERVICE_URL` values inline rather than interpolating
+`${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`, so the stack boots even without a `.env`. The
+file is consumed by the host-run flow in
+[Running one service on the host](#running-one-service-on-the-host).
+
+`POSTGRES_HOST=db-postgres` is the **Docker DNS name**, reachable only from inside the
+Compose network. A service running on your host reaches the same database at
+`localhost:5432` — which is why the host-run section builds `DATABASE_URL` by hand instead
+of composing it from `POSTGRES_HOST`. The `*_SERVICE_URL` values have the same constraint.
+
+If you change `POSTGRES_PASSWORD`, change it in both places **and** reset the volume with
+`docker compose down -v`. Postgres only applies that variable when it initialises an empty
+data directory; editing it afterwards has no effect on an existing volume.
+
+Never commit `.env`. The values above are local-laptop defaults only — anything real belongs
+in a secrets manager, not in this file.
 
 ---
 
@@ -302,7 +353,8 @@ smartfoodops-backend/
 ├── readme/                    # Week 1 blueprints and contracts
 ├── docker-compose.yml         # Orchestration
 ├── init.sql                   # Postgres DDL + role seed data
-└── .env                       # Local environment variables
+├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
+└── .env                       # Local environment variables — gitignored, create it yourself
 ```
 
 Each service is self-contained — `main.py` (routes and logic) plus `schemas.py` (Pydantic
@@ -351,3 +403,6 @@ Two additions beyond the v6 contracts, both required by the flow:
 **Credentials in this repo are local development defaults only.** They live in
 `docker-compose.yml` and `.env` for convenience on a laptop. Do not reuse them anywhere
 else, and move real values to a secrets manager before this leaves a local environment.
+`.env` is gitignored, but `docker-compose.yml` still carries its Postgres password inline —
+switching Compose to `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}` interpolation would leave
+`.env` as the single place credentials live.
