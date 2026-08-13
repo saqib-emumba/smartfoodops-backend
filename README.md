@@ -174,6 +174,10 @@ slate.
 
 Requires `bash`, `curl`, and `python3` on the host; nothing is installed into the containers.
 
+For poking at a single endpoint by hand, see
+[readme/api-testing-guide.md](readme/api-testing-guide.md) — the same scenarios as
+copy-pasteable `curl` commands, grouped by service, with the expected response for each.
+
 ### Shut down
 
 ```bash
