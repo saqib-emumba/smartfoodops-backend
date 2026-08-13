@@ -1,13 +1,16 @@
 """SmartFoodOps Order Service — idempotent checkout (Port 8004).
 
-Owns the PostgreSQL `orders` table. Prices are always recalculated server-side from the
-Menu Service's published menu, and audit logs are written through the Menu Service so that
-this service never talks to MongoDB directly.
+Owns the `orders` and `payments` tables in its own PostgreSQL database. Prices are always
+recalculated server-side from the Menu Service's published menu, and audit logs are written
+through the Menu Service so that this service never talks to MongoDB directly.
+
+The customer and restaurant an order names live in other services' databases, so they are
+verified over HTTP before the insert — see clients.py.
 """
 
 from fastapi import FastAPI, Header, Response, status
 
-from clients import MenuServiceClient
+from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
 from common.config import required
 from common.errors import bad_request
 from common.logging_config import configure_logging
@@ -27,6 +30,8 @@ db = PostgresPool(
 )
 orders = OrderRepository(db, logger=logger)
 menu_service = MenuServiceClient(logger, service_name=SERVICE_NAME)
+user_service = UserServiceClient(logger)
+restaurant_service = RestaurantServiceClient(logger)
 
 app = FastAPI(title="SmartFoodOps Order Service", lifespan=db.lifespan)
 
@@ -37,6 +42,8 @@ def health():
         "status": "Orders Service operational",
         "service": SERVICE_NAME,
         "database_reachable": db.is_reachable(),
+        "user_service_url": user_service.base_url,
+        "restaurant_service_url": restaurant_service.base_url,
         "menu_service_url": menu_service.base_url,
     }
 
@@ -66,9 +73,15 @@ def create_order(
     menu = menu_service.fetch_menu(payload.restaurant_id)
     items_snapshot, total = build_order_snapshot(menu, payload)
 
+    # (d) Both participants live in other services' databases, so the foreign keys that
+    # used to reject an unknown id at insert time are gone. The HTTP checks that replace
+    # them sit here, immediately before the write, for the same reason.
+    user_service.verify_customer(payload.customer_id)
+    restaurant_service.verify_restaurant(payload.restaurant_id)
+
     order = orders.create(payload, items_snapshot, total, x_idempotency_key)
 
-    # (d) Audit trail is written through the Menu Service, never straight to MongoDB.
+    # (e) Audit trail is written through the Menu Service, never straight to MongoDB.
     menu_service.write_audit_log(order, x_idempotency_key)
 
     return OrderResponse(**order)

@@ -7,7 +7,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class UserRole(str, Enum):
-    """Roles seeded into the PostgreSQL `roles` lookup table by init.sql."""
+    """Roles seeded into the `roles` lookup table by db/user/init.sql."""
 
     customer = "customer"
     restaurant_admin = "restaurant_admin"

@@ -6,22 +6,23 @@ set -e
 echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
-echo "📂 Creating services and gateway directories..."
-mkdir -p smartfoodops-backend/{api-gateway,services/{user,restaurant,menu,order}}
+echo "📂 Creating services, gateway and per-service database directories..."
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order},services/{common,user,restaurant,menu,order}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
+# Only the database passwords live here: docker-compose.yml builds each service's DSN from
+# them, so a password is written in exactly one place. Database and role names are not
+# secrets and stay literal in docker-compose.yml.
 echo "📝 Generating .env configuration file..."
 cat << 'EOF' > .env
-# Database Credentials
-POSTGRES_DB=smartfoodops_core
-POSTGRES_USER=sfo_admin
-POSTGRES_PASSWORD=sfo_password_123
-POSTGRES_HOST=db-postgres
-POSTGRES_PORT=5432
+# Database Credentials — one password per physical database (database-per-service)
+USER_POSTGRES_PASSWORD=sfo_user_password_123
+RESTAURANT_POSTGRES_PASSWORD=sfo_restaurant_password_123
+ORDER_POSTGRES_PASSWORD=sfo_order_password_123
 
-MONGO_URI=mongodb://db-nosql:27017/smartfoodops_menus
-REDIS_URL=redis://cache-redis:6379/0
+# NoSQL & caching tier (owned by the Menu Service)
+MONGO_DB=smartfoodops_menus
 
 # Services Endpoints (Within Docker Network)
 USER_SERVICE_URL=http://user-service:8001
@@ -30,15 +31,21 @@ MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 EOF
 
-# 3. Write out the normalized database initialization migration script
-echo "🐘 Generating Postgres Database Schema (init.sql)..."
-cat << 'EOF' > init.sql
+# 3. Write out one initialization migration script per physical database.
+# Each is mounted into its own container, so a service's schema exists only in the database
+# that service holds credentials for.
+echo "🐘 Generating Postgres schemas (db/{user,restaurant,order}/init.sql)..."
+cat << 'EOF' > db/user/init.sql
+-- ============================================================================
+-- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
+--
+-- Owns identity: `roles`, `users` and the `riders` profile extension. Only the
+-- User Service connects here; every other service reads a profile through
+-- GET /api/v1/users/{user_id}.
+-- ============================================================================
+
 -- Enable UUID extension for secure, non-sequential IDs
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
--- Define custom ENUM types
-CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
-CREATE TYPE payment_status AS ENUM ('pending', 'authorized', 'captured', 'refunded');
 
 -- 1a. Roles Lookup Table (Normalized Database Design)
 CREATE TABLE IF NOT EXISTS roles (
@@ -71,24 +78,9 @@ CREATE TABLE IF NOT EXISTS users (
 -- Case-insensitive unique constraint index for emails (prevent duplicate registrations)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
 
--- 2. Restaurants Table
-CREATE TABLE IF NOT EXISTS restaurants (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    name VARCHAR(255) NOT NULL,
-    address TEXT NOT NULL,
-    latitude DECIMAL(9, 6) NOT NULL,
-    longitude DECIMAL(9, 6) NOT NULL,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    capacity INT NOT NULL DEFAULT 50,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Index for restaurants geo queries
-CREATE INDEX IF NOT EXISTS idx_restaurants_geo ON restaurants(latitude, longitude);
-
--- 3. Riders Table
+-- 2. Riders Table
+-- A rider is an extension of a user identity, so it stays in this database where the
+-- foreign key to `users` is still enforceable. Orders reference a rider by id only.
 CREATE TABLE IF NOT EXISTS riders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -102,13 +94,67 @@ CREATE TABLE IF NOT EXISTS riders (
 );
 
 CREATE INDEX IF NOT EXISTS idx_riders_availability ON riders(is_available);
+EOF
 
--- 4. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
+cat << 'EOF' > db/restaurant/init.sql
+-- ============================================================================
+-- Restaurant Service database — sfo_restaurant_core
+-- (container sfo-restaurant-db, host port 5433)
+--
+-- Owns `restaurants`. Only the Restaurant Service connects here; every other
+-- service reads a restaurant through GET /api/v1/restaurants/{restaurant_id}.
+-- ============================================================================
+
+-- Enable UUID extension for secure, non-sequential IDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Restaurants Table
+CREATE TABLE IF NOT EXISTS restaurants (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- users.id, which lives in the User Service database. There is no foreign key to
+    -- enforce across databases, so the owner is verified over HTTP before onboarding.
+    owner_id UUID NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    address TEXT NOT NULL,
+    latitude DECIMAL(9, 6) NOT NULL,
+    longitude DECIMAL(9, 6) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    capacity INT NOT NULL DEFAULT 50,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Index for restaurants geo queries
+CREATE INDEX IF NOT EXISTS idx_restaurants_geo ON restaurants(latitude, longitude);
+
+-- Owner lookups ("list my restaurants") scan by owner, so index the reference.
+CREATE INDEX IF NOT EXISTS idx_restaurants_owner ON restaurants(owner_id);
+EOF
+
+cat << 'EOF' > db/order/init.sql
+-- ============================================================================
+-- Order Service database — sfo_order_core (container sfo-order-db, host port 5434)
+--
+-- Owns `orders` and `payments`. Only the Order Service connects here.
+--
+-- Every column pointing at another service's table is a plain UUID: a foreign key
+-- cannot span physical databases, so the reference is verified over HTTP before the
+-- insert (see services/order/clients.py) instead of by the engine.
+-- ============================================================================
+
+-- Enable UUID extension for secure, non-sequential IDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Define custom ENUM types
+CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
+CREATE TYPE payment_status AS ENUM ('pending', 'authorized', 'captured', 'refunded');
+
+-- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    customer_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE RESTRICT,
-    rider_id UUID REFERENCES riders(id) ON DELETE SET NULL,
+    customer_id UUID NOT NULL,   -- users.id       (User Service database)
+    restaurant_id UUID NOT NULL, -- restaurants.id (Restaurant Service database)
+    rider_id UUID,               -- riders.id      (User Service database)
     items JSONB NOT NULL, -- Stores snapshot of ordered items, prices, and selected customization options at checkout
     total_amount DECIMAL(10, 2) NOT NULL,
     status order_status NOT NULL DEFAULT 'created',
@@ -119,7 +165,12 @@ CREATE TABLE IF NOT EXISTS orders (
 
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
--- 5. Payments Table (Built with Idempotency Protection)
+-- Order-history reads filter by customer, which no longer benefits from a foreign key.
+CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
+
+-- 2. Payments Table (Built with Idempotency Protection)
+-- Payments belong to the order lifecycle, so they stay in this database and keep a real
+-- foreign key to `orders`.
 CREATE TABLE IF NOT EXISTS payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     order_id UUID UNIQUE NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
@@ -142,32 +193,85 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:
+  user_postgres_data:
+  restaurant_postgres_data:
+  order_postgres_data:
   mongodb_data:
   redis_data:
 
+# Database-per-service: each Postgres-backed service gets its own physical database, with
+# its own credentials, so no service can reach another's tables even by accident.
+#
+# Each DSN is defined once here and injected as that service's DATABASE_URL, so a password
+# is never repeated in this file. Passwords come from the gitignored root .env, which
+# Compose reads automatically; `:?` aborts every compose command with the message below
+# when one is missing, rather than starting the stack with an empty password.
+# Database and role names are not secrets, so they stay literal and readable.
+x-user-db-env: &user-db-env
+  DATABASE_URL: postgresql://sfo_user_admin:${USER_POSTGRES_PASSWORD:?set USER_POSTGRES_PASSWORD in the root .env}@db-user-postgres:5432/sfo_user_core
+
+x-restaurant-db-env: &restaurant-db-env
+  DATABASE_URL: postgresql://sfo_restaurant_admin:${RESTAURANT_POSTGRES_PASSWORD:?set RESTAURANT_POSTGRES_PASSWORD in the root .env}@db-restaurant-postgres:5432/sfo_restaurant_core
+
+x-order-db-env: &order-db-env
+  DATABASE_URL: postgresql://sfo_order_admin:${ORDER_POSTGRES_PASSWORD:?set ORDER_POSTGRES_PASSWORD in the root .env}@db-order-postgres:5432/sfo_order_core
+
+# The three Postgres containers differ only in credentials, published port, volume and
+# schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
+# variables (`$$` defers expansion to the container) so it needs no per-database copy.
+x-postgres-base: &postgres-base
+  image: postgres:15-alpine
+  restart: always
+  networks:
+    - smartfoodops-network
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 5s
+    retries: 5
+
 services:
-  # --- 1. DATABASES & CACHING ---
-  db-postgres:
-    image: postgres:15-alpine
-    container_name: sfo-postgres
-    restart: always
+  # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
+  # Each database runs on 5432 inside the network and publishes a distinct host port, so a
+  # local SQL client can reach all three at once.
+  db-user-postgres:
+    <<: *postgres-base
+    container_name: sfo-user-db
     environment:
-      POSTGRES_DB: smartfoodops_core
-      POSTGRES_USER: sfo_admin
-      POSTGRES_PASSWORD: sfo_password_123
+      POSTGRES_DB: sfo_user_core
+      POSTGRES_USER: sfo_user_admin
+      POSTGRES_PASSWORD: ${USER_POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Auto-runs DDL migrations on boot
-    networks:
-      - smartfoodops-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sfo_admin -d smartfoodops_core"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - user_postgres_data:/var/lib/postgresql/data
+      - ./db/user/init.sql:/docker-entrypoint-initdb.d/init.sql:ro # Auto-runs DDL on first boot
+
+  db-restaurant-postgres:
+    <<: *postgres-base
+    container_name: sfo-restaurant-db
+    environment:
+      POSTGRES_DB: sfo_restaurant_core
+      POSTGRES_USER: sfo_restaurant_admin
+      POSTGRES_PASSWORD: ${RESTAURANT_POSTGRES_PASSWORD}
+    ports:
+      - "5433:5432" # Maps host 5433 to container 5432
+    volumes:
+      - restaurant_postgres_data:/var/lib/postgresql/data
+      - ./db/restaurant/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  db-order-postgres:
+    <<: *postgres-base
+    container_name: sfo-order-db
+    environment:
+      POSTGRES_DB: sfo_order_core
+      POSTGRES_USER: sfo_order_admin
+      POSTGRES_PASSWORD: ${ORDER_POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432" # Maps host 5434 to container 5432
+    volumes:
+      - order_postgres_data:/var/lib/postgresql/data
+      - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   db-nosql:
     image: mongo:6.0
@@ -219,43 +323,47 @@ services:
       - smartfoodops-network
 
   # --- 3. CORE SERVICE CONTAINER SERVICES ---
+  # Every service depends on its own database only, and on nothing else's.
   user-service:
     build:
-      context: ./services/user
-      dockerfile: Dockerfile
+      # Context is ./services so the shared `common` chassis is inside the build context.
+      context: ./services
+      dockerfile: user/Dockerfile
     container_name: sfo-user-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
+      <<: *user-db-env
     depends_on:
-      db-postgres:
+      db-user-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network
 
   restaurant-service:
     build:
-      context: ./services/restaurant
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: restaurant/Dockerfile
     container_name: sfo-restaurant-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
+      <<: *restaurant-db-env
+      USER_SERVICE_URL: http://user-service:8001
     depends_on:
-      db-postgres:
+      db-restaurant-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network
 
   menu-service:
     build:
-      context: ./services/menu
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: menu/Dockerfile
     container_name: sfo-menu-service
     restart: always
     environment:
-      - MONGO_URI=mongodb://db-nosql:27017/smartfoodops_menus
-      - REDIS_URL=redis://cache-redis:6379/0
+      MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
+      REDIS_URL: redis://cache-redis:6379/0
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
     depends_on:
       db-nosql:
         condition: service_healthy
@@ -266,17 +374,17 @@ services:
 
   order-service:
     build:
-      context: ./services/order
-      dockerfile: Dockerfile
+      context: ./services
+      dockerfile: order/Dockerfile
     container_name: sfo-order-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
-      - USER_SERVICE_URL=http://user-service:8001
-      - RESTAURANT_SERVICE_URL=http://restaurant-service:8002
-      - MENU_SERVICE_URL=http://menu-service:8003
+      <<: *order-db-env
+      USER_SERVICE_URL: http://user-service:8001
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      MENU_SERVICE_URL: http://menu-service:8003
     depends_on:
-      db-postgres:
+      db-order-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network

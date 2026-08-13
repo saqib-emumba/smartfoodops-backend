@@ -1,12 +1,16 @@
 # SmartFoodOps — Backend (Week 1)
 
 A containerised, four-service food-ordering backend fronted by an Nginx API gateway.
-Everything runs locally through Docker Compose: PostgreSQL, MongoDB, Redis, the gateway,
-and the four FastAPI services.
+Everything runs locally through Docker Compose: three PostgreSQL databases, MongoDB, Redis,
+the gateway, and the four FastAPI services.
 
 ---
 
 ## Architecture
+
+**Database-per-service.** Every service has its own physical database with its own
+credentials, so no service can read another's tables even by mistake — the connection it
+would need does not exist.
 
 ```
                        ┌───────────────────────┐
@@ -20,25 +24,50 @@ and the four FastAPI services.
        │   :8001    │◀──│   :8002    │◀──│   :8003    │◀──│   :8004    │
        └─────┬──────┘   └─────┬──────┘   └─────┬──────┘   └─────┬──────┘
              │                │            ┌───┴───┐            │
-             └────────┬───────┘            ▼       ▼            │
-                      ▼                 MongoDB   Redis         │
-                  PostgreSQL             :27017   :6379         │
-                    :5432 ◀──────────────────────────────────────┘
+             ▼                ▼            ▼       ▼            ▼
+      ┌─────────────┐  ┌─────────────┐  MongoDB   Redis  ┌─────────────┐
+      │ sfo-user-db │  │sfo-restaurant│  :27017   :6379  │sfo-order-db │
+      │    :5432    │  │  -db :5433   │                  │   :5434     │
+      └─────────────┘  └─────────────┘                   └─────────────┘
 ```
 
 Arrows between services are **HTTP calls, not shared tables**. Each service owns its data:
 
-| Service | Port | Owns | Reaches out to |
-|---|---|---|---|
-| `user-service` | 8001 | Postgres `users`, `roles` | — |
-| `restaurant-service` | 8002 | Postgres `restaurants` | User Service (owner check) |
-| `menu-service` | 8003 | Mongo `menus`, `order_tracking_logs` | Restaurant Service (active check) |
-| `order-service` | 8004 | Postgres `orders` | Menu Service (pricing + audit log) |
+| Service | Port | Owns | Its database (host port) | Reaches out to |
+|---|---|---|---|---|
+| `user-service` | 8001 | `roles`, `users`, `riders` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
+| `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
+| `menu-service` | 8003 | Mongo `menus`, `order_tracking_logs` | `smartfoodops_menus` @ `sfo-mongodb` (27017) + Redis | Restaurant Service (active check) |
+| `order-service` | 8004 | `orders`, `payments` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing + audit log), User + Restaurant Services (participant checks) |
 
-Two rules the code enforces deliberately:
+Three rules the code enforces deliberately:
 
 - The Restaurant Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
 - The Order Service never writes to MongoDB — it POSTs to `/api/v1/menus/logs`.
+- No service holds credentials for a database it does not own.
+
+### References that cross a database boundary
+
+A foreign key cannot span two physical databases, so a column pointing at another service's
+table (`restaurants.owner_id`, `orders.customer_id`, `orders.restaurant_id`,
+`orders.rider_id`) is a plain `UUID`. The engine no longer validates it; the owning service
+does, over HTTP, immediately before the write:
+
+| Write | Verified by | Rejects with |
+|---|---|---|
+| `POST /api/v1/restaurants/onboard` | User Service — owner exists **and** is a `restaurant_admin` | `404` / `403` |
+| `POST /api/v1/orders` | User Service — customer exists | `422` |
+| `POST /api/v1/orders` | Restaurant Service — restaurant exists | `422` |
+
+Those status codes are unchanged from the single-database version, where the same failures
+arrived as foreign-key violations.
+
+Two references stay inside one database and keep real foreign keys: `riders.user_id` (a rider
+is an extension of a user identity) and `payments.order_id`.
+
+The trade-off is eventual, not immediate, integrity: a user deleted between verification and
+insert leaves an order pointing at nobody. Week 2's outbox/compensation work is where that
+gets reconciled — a single Postgres instance was hiding the problem, not solving it.
 
 ---
 
@@ -46,7 +75,7 @@ Two rules the code enforces deliberately:
 
 - Docker Desktop (Compose v2) — `docker compose version`
 - `curl` and `python3` for the smoke tests below
-- Ports free on the host: **80, 5432, 6379, 27017**
+- Ports free on the host: **80, 5432, 5433, 5434, 6379, 27017**
 - A `.env` file at the repo root — see below, it is not committed
 
 ---
@@ -58,15 +87,14 @@ not have one. Create it at the repo root before your first run:
 
 ```bash
 cat > .env <<'EOF'
-# Database Credentials
-POSTGRES_DB=smartfoodops_core
-POSTGRES_USER=sfo_admin
-POSTGRES_PASSWORD=<must match db-postgres in docker-compose.yml>
-POSTGRES_HOST=db-postgres
-POSTGRES_PORT=5432
+# Database Credentials — one password per physical database (database-per-service).
+# Pick your own values; these initialise the databases and build the service DSNs.
+USER_POSTGRES_PASSWORD=<choose one>
+RESTAURANT_POSTGRES_PASSWORD=<choose one>
+ORDER_POSTGRES_PASSWORD=<choose one>
 
-MONGO_URI=mongodb://db-nosql:27017/smartfoodops_menus
-REDIS_URL=redis://cache-redis:6379/0
+# NoSQL & caching tier (owned by the Menu Service)
+MONGO_DB=smartfoodops_menus
 
 # Service endpoints (within the Docker network)
 USER_SERVICE_URL=http://user-service:8001
@@ -77,42 +105,42 @@ EOF
 ```
 
 `.env` is the **single source of truth** for credentials, and the stack no longer boots
-without it. `docker-compose.yml` interpolates `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}` /
-`${POSTGRES_DB}` — into the `db-postgres` environment, into its healthcheck, and into the
-one `DATABASE_URL` definition the three Postgres-backed services share via a YAML anchor.
-No credential appears in a committed file.
+without it. Each password appears in exactly one place in `docker-compose.yml`: a YAML
+anchor that builds that service's `DATABASE_URL` and is merged into both the database
+container and the service. No credential appears in a committed file.
 
-`POSTGRES_PASSWORD` is therefore yours to choose: the same value initialises the database
-and builds the DSN handed to the services, so there is nothing to keep in sync by hand.
-
-These three keys are **required**:
+Database and role names (`sfo_user_core` / `sfo_user_admin`, and so on) are **not** secrets,
+so they stay literal in `docker-compose.yml` rather than being threaded through `.env` —
+there is nothing to keep in sync by hand, and the file reads as documentation of which
+service talks to which database.
 
 | Key | Required | Notes |
 |---|---|---|
-| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | yes | Compose substitutes these; a missing key resolves to an empty string and the stack fails to authenticate |
+| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
 | `MONGO_DB` | no | Defaults to `smartfoodops_menus` |
-| `POSTGRES_HOST`, `POSTGRES_PORT`, `*_SERVICE_URL` | no | Consumed only by the host-run flow below |
+| `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
-Services **fail fast** rather than falling back to a baked-in password: starting one
-without `DATABASE_URL` aborts at startup with
-`RuntimeError: DATABASE_URL is not set…` instead of silently connecting as a default user.
+Nothing falls back to a baked-in password, at either layer. Compose refuses to start with an
+unset password, and a service started without `DATABASE_URL` aborts with
+`RuntimeError: DATABASE_URL is not set…` rather than silently connecting as a default user.
 
 Verify substitution resolved before debugging anything else — this prints the effective
-config, so redirect it rather than pasting the output anywhere:
+config **including passwords**, so redirect it rather than pasting the output anywhere:
 
 ```bash
 docker compose config | grep DATABASE_URL
 ```
 
-`POSTGRES_HOST=db-postgres` is the **Docker DNS name**, reachable only from inside the
-Compose network. A service running on your host reaches the same database at
-`localhost:5432` — which is why the host-run section builds `DATABASE_URL` by hand instead
-of composing it from `POSTGRES_HOST`. The `*_SERVICE_URL` values have the same constraint.
+Three DSNs must come back, each naming a different host and database.
 
-If you change `POSTGRES_PASSWORD`, reset the volume with `docker compose down -v`. Postgres
-only applies that variable when it initialises an empty data directory; editing it
-afterwards has no effect on an existing volume, so the new password and the existing
-database will disagree.
+Host names like `db-user-postgres` are **Docker DNS names**, reachable only from inside the
+Compose network. From your host the same databases are `localhost:5432`, `:5433` and `:5434`
+— which is why the host-run section below builds `DATABASE_URL` by hand. The
+`*_SERVICE_URL` values have the same constraint.
+
+If you change a password, reset that volume with `docker compose down -v`. Postgres only
+applies the variable when it initialises an empty data directory; editing it afterwards has
+no effect on an existing volume, so the new password and the existing database will disagree.
 
 Never commit `.env`. The values above are local-laptop defaults only — anything real belongs
 in a secrets manager, not in this file.
@@ -122,13 +150,20 @@ in a secrets manager, not in this file.
 ## Quick start
 
 ```bash
-docker compose up --build -d      # build images and start all 8 containers
+docker compose up --build -d      # build images and start all 10 containers
 docker compose ps                 # all should read "Up" / "healthy"
 ```
 
-First boot takes a few minutes while the Python images build. Postgres runs
-[init.sql](init.sql) automatically on the **first** boot of its volume — see
-[Resetting the databases](#resetting-the-databases) if you change the schema.
+First boot takes a few minutes while the Python images build. Each Postgres container runs
+its own schema — [db/user/init.sql](db/user/init.sql),
+[db/restaurant/init.sql](db/restaurant/init.sql), [db/order/init.sql](db/order/init.sql) —
+automatically on the **first** boot of its volume. See
+[Resetting the databases](#resetting-the-databases) if you change one.
+
+> **Upgrading an existing checkout?** The single `sfo-postgres` container is gone. Add the
+> three password keys to `.env`, then `docker compose down -v && docker compose up --build -d`.
+> The old `postgres_data` volume is not migrated — there is no data to keep in a local
+> sandbox, and the smoke test recreates everything it needs.
 
 ### Verify everything routes
 
@@ -256,7 +291,7 @@ the client's `total_amount` is only checked, never trusted. Repeating the same
 | `POST` | `/api/v1/menus` | Upsert full category/item/customization tree |
 | `GET` | `/api/v1/menus/{restaurant_id}` | Used by the Order Service to price a cart |
 | `POST` | `/api/v1/menus/logs` | Appends to `order_tracking_logs.status_history` |
-| `POST` | `/api/v1/orders` | `201` new / `200` idempotent replay |
+| `POST` | `/api/v1/orders` | `201` new / `200` idempotent replay; verifies customer + restaurant over HTTP |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -268,7 +303,7 @@ Interactive docs per service, once you expose a port (see below): `http://localh
 | `403` | Owner exists but is not a `restaurant_admin` |
 | `404` | Unknown user / restaurant / menu; inactive restaurant |
 | `409` | Duplicate email (case-insensitive) or phone |
-| `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch |
+| `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown customer or restaurant |
 | `500` | Postgres connection pool starved |
 | `502` | Unexpected response from an upstream service |
 | `503` | Upstream service unreachable; MongoDB socket timeout |
@@ -336,20 +371,21 @@ pip install fastapi uvicorn "pydantic[email]" psycopg2-binary bcrypt
 # In the image, `common/` sits inside /app; on the host it is one level up.
 export PYTHONPATH=..
 
-# Substitute the database username and password before running this line.
-# Take them from .env (POSTGRES_USER / POSTGRES_PASSWORD) — they are not repeated here.
-export DATABASE_URL=postgresql://<DB_USER>:<DB_PASSWORD>@localhost:5432/smartfoodops_core
+# Source the password from .env so it never lands in your shell history.
+set -a && source ../../.env && set +a
+export DATABASE_URL="postgresql://sfo_user_admin:${USER_POSTGRES_PASSWORD}@localhost:5432/sfo_user_core"
 
 uvicorn main:app --reload --port 8001
 ```
 
-If you would rather not type the password into your shell (it lands in your history),
-source it from the env file instead:
+Each service reads the same `DATABASE_URL` variable, but points it at a different host port
+— that is the whole of the change database-per-service asks of the application code:
 
-```bash
-set -a && source ../../.env && set +a
-export DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@localhost:5432/${POSTGRES_DB}"
-```
+| Service | Host DSN |
+|---|---|
+| `user` | `postgresql://sfo_user_admin:${USER_POSTGRES_PASSWORD}@localhost:5432/sfo_user_core` |
+| `restaurant` | `postgresql://sfo_restaurant_admin:${RESTAURANT_POSTGRES_PASSWORD}@localhost:5433/sfo_restaurant_core` |
+| `order` | `postgresql://sfo_order_admin:${ORDER_POSTGRES_PASSWORD}@localhost:5434/sfo_order_core` |
 
 Inter-service calls still use Docker DNS names (`http://user-service:8001`), so a
 host-run service can call into the stack only if you also override that service's
@@ -365,11 +401,21 @@ docker compose logs api-gateway | tail -20  # Nginx access log — useful for 50
 
 ### Database access
 
+Each database is a separate container, so pick the one that owns the table you want. `\dt`
+in any of them is a quick proof of the split — only that service's tables are there.
+
 ```bash
-# PostgreSQL
-docker exec -it sfo-postgres psql -U sfo_admin -d smartfoodops_core
+# User database — roles, users, riders
+docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core
 #   \dt              list tables
 #   SELECT u.email, r.name FROM users u JOIN roles r ON r.id = u.role_id;
+
+# Restaurant database — restaurants
+docker exec -it sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core
+
+# Order database — orders, payments
+docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core
+#   SELECT id, status, total_amount FROM orders ORDER BY created_at DESC LIMIT 5;
 
 # MongoDB
 docker exec -it sfo-mongodb mongosh smartfoodops_menus
@@ -380,16 +426,30 @@ docker exec -it sfo-mongodb mongosh smartfoodops_menus
 docker exec -it sfo-redis redis-cli ping
 ```
 
+`psql` inside the container needs no password (local trust); from a GUI client on your host,
+connect to `localhost:5432` / `:5433` / `:5434` with the matching role and `.env` password.
+
+Joining across services is deliberately impossible now. To follow an order to its customer,
+read `customer_id` and call `GET /api/v1/users/{id}` — the same path the services take.
+
 ### Resetting the databases
 
-`init.sql` runs **only** when the Postgres data volume is empty. After editing it:
+A schema file runs **only** when its own Postgres volume is empty. After editing one:
 
 ```bash
 docker compose down -v && docker compose up --build -d
 ```
 
-This wipes Postgres, Mongo, and Redis. There is no migration tooling in Week 1 — schema
-changes mean a volume reset.
+This wipes all three Postgres volumes plus Mongo and Redis. To reset a single database,
+target its volume — the others keep their data:
+
+```bash
+docker compose rm -sf db-order-postgres
+docker volume rm smartfoodops-backend_order_postgres_data
+docker compose up -d db-order-postgres
+```
+
+There is no migration tooling in Week 1 — schema changes mean a volume reset.
 
 ### Adding a dependency
 
@@ -404,6 +464,10 @@ Week 1). Add the package to that service's `pip install` block and rebuild with
 ```text
 smartfoodops-backend/
 ├── api-gateway/nginx.conf     # Path-based routing + /health
+├── db/                        # One schema per physical database, mounted into its container
+│   ├── user/init.sql          # roles (+ seed data), users, riders
+│   ├── restaurant/init.sql    # restaurants
+│   └── order/init.sql         # order/payment enums, orders, payments
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
 │   │   ├── config.py          # Env defaults, timeouts, pool bounds
@@ -418,10 +482,12 @@ smartfoodops-backend/
 ├── scripts/smoke-test.sh      # End-to-end assertions across all four services
 ├── readme/                    # Week 1 blueprints and contracts
 ├── docker-compose.yml         # Orchestration
-├── init.sql                   # Postgres DDL + role seed data
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
 └── .env                       # Local environment variables — gitignored, create it yourself
 ```
+
+A service's schema lives under `db/<service>/`, not next to its code, because it is consumed
+by that service's *database container* at first boot — the service image never reads it.
 
 Every service follows the same layering, so any one of them can be read the same way:
 
@@ -453,9 +519,13 @@ in a single-repo Compose setup; if services ever ship on independent release cyc
 | `502 Bad Gateway` from Nginx | Target service crashed on boot. `docker compose logs <service>` |
 | `502` but the service logs look healthy | Nginx resolved the upstream IP at startup and the container was recreated since. `docker compose restart api-gateway` |
 | Port 80 already in use | Another web server is bound. Stop it, or change the gateway's published port |
-| `database_reachable: false` | Postgres still starting, or the volume is mid-init. Re-check after ~10s |
-| Schema changes not visible | `init.sql` only runs on an empty volume — `docker compose down -v` |
+| `database_reachable: false` | That service's Postgres is still starting, or its volume is mid-init. Re-check after ~10s, then `docker compose ps db-<service>-postgres` |
+| `set USER_POSTGRES_PASSWORD in the root .env` on any compose command | The three password keys are missing from `.env` — see [Environment file](#environment-file) |
+| Schema changes not visible | A `db/*/init.sql` only runs on an empty volume — `docker compose down -v` |
+| `password authentication failed` after changing `.env` | Postgres keeps the password baked into its existing volume. Reset that volume |
+| Port 5433 / 5434 already in use | Another Postgres is bound. Stop it, or change the published port for that database |
 | `503` on menu writes | MongoDB unreachable. `docker compose ps db-nosql` |
+| `422 Unknown customer …` on a valid order | The customer exists in *your* client, not in the User Service database — orders no longer share a database with users. `GET /api/v1/users/{id}` to confirm |
 | `409` on a repeated register | Working as intended — email/phone are unique |
 | Edits do nothing | Image is stale. `docker compose up -d --build <service>`, or use the hot-reload override |
 
@@ -472,9 +542,20 @@ role is rejected with `400` (per the Week 1 spec) instead of Pydantic's `422`, w
 `roles` table as the single source of truth. `UserRole` remains defined in
 [services/user/schemas.py](services/user/schemas.py) for reference.
 
-`USER_SERVICE_URL` and `RESTAURANT_SERVICE_URL` are only set on `order-service` in
-`docker-compose.yml`; the other services fall back to the in-network defaults in code.
-Setting them in Compose later overrides cleanly.
+Every inter-service URL is declared explicitly in `docker-compose.yml` for the service that
+calls it, so the wiring is readable from the compose file alone. The identical defaults in
+[services/common/config.py](services/common/config.py) exist for the host-run flow, where
+nothing sets those variables.
+
+The Database-per-Service guide's compose block drops the schema mount and hardcodes each
+password inline. Both are kept as they were: `db/<service>/init.sql` is mounted into its
+container (nothing else creates the tables), and passwords are interpolated from `.env`.
+Database and role names follow the guide exactly.
+
+The guide also lists `USER_DATABASE_URL` / `RESTAURANT_DATABASE_URL` / `ORDER_DATABASE_URL`
+in `.env`. Those are not used here: Compose already assembles each DSN from the one password
+key, and a second copy of the same DSN in `.env` would be a second place to keep a password
+correct. Each service reads plain `DATABASE_URL` — it has no idea another database exists.
 
 Audit logging is best-effort. The order is already committed when the log call fires, so a
 Menu Service failure is logged loudly rather than returned as a `500` — a `500` there would
@@ -485,9 +566,8 @@ Two additions beyond the v6 contracts, both required by the flow:
 `OrderItemSnapshot`, an `OrderItemSelection` subclass carrying `unit_price` / `line_total` /
 `selected_options` so the JSONB snapshot survives into the response.
 
-**Credentials in this repo are local development defaults only.** They live in
-`docker-compose.yml` and `.env` for convenience on a laptop. Do not reuse them anywhere
-else, and move real values to a secrets manager before this leaves a local environment.
-`.env` is gitignored, but `docker-compose.yml` still carries its Postgres password inline —
-switching Compose to `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}` interpolation would leave
-`.env` as the single place credentials live.
+**Credentials in this repo are local development values only.** The three database passwords
+live in the gitignored `.env` and nowhere else; no committed file contains one. Do not reuse
+them anywhere, and move real values to a secrets manager before this leaves a local
+environment. Splitting the databases also splits the blast radius: a leaked password now
+opens one service's data, not the whole platform.

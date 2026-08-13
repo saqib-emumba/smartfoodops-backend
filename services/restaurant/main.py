@@ -1,7 +1,7 @@
 """SmartFoodOps Restaurant Service — onboarding and lookups (Port 8002).
 
-Owns the PostgreSQL `restaurants` table. Owner identity/authorisation is resolved over HTTP
-against the User Service so that this service never touches the `users` table directly.
+Owns the `restaurants` table in its own PostgreSQL database. Owner identity/authorisation is
+resolved over HTTP against the User Service, whose database this service cannot reach.
 """
 
 from uuid import UUID

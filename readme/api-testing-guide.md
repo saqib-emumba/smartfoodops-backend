@@ -380,9 +380,10 @@ No second order is created — that is the double-charge protection.
 | Option not offered by that group | `422` |
 | Required group omitted | `422` |
 | More selections than `max_selection` | `422` |
-| `customer_id` or `restaurant_id` not in Postgres | `422` |
+| `customer_id` unknown to the User Service | `422` |
+| `restaurant_id` unknown to the Restaurant Service | `422` |
 | Restaurant has no published menu | `404` |
-| Menu Service is down | `503` |
+| Menu, User or Restaurant Service is down | `503` |
 
 ```bash
 # Missing idempotency key -> 400
@@ -425,7 +426,8 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-toomany" \
   -d "{\"customer_id\":\"$CUST_ID\",\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}],\"total_amount\":11.50}"
 
-# Customer not in Postgres -> 422 (foreign key violation)
+# Customer unknown to the User Service -> 422
+# (the Order Service has its own database, so this is an HTTP check, not a foreign key)
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-badcust" \
   -d "{\"customer_id\":\"33333333-3333-3333-3333-333333333333\",\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
@@ -472,6 +474,14 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H 'Content-Type: application/json' -H 'X-Idempotency-Key: offline-test' \
   -d '{"customer_id":"00000000-0000-0000-0000-000000000000","restaurant_id":"00000000-0000-0000-0000-000000000000","items":[{"item_id":"x","quantity":1}],"total_amount":1.0}'
 docker compose start menu-service
+
+# Order Service depends on the User Service to verify the customer, because the customer
+# lives in a database it cannot read. Needs a real cart so pricing gets past the Menu Service.
+docker compose stop user-service
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-nouser" \
+  -d "{\"customer_id\":\"$CUST_ID\",\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
+docker compose start user-service
 ```
 
 Each returns `503` with a message naming the unreachable service.
@@ -491,24 +501,35 @@ docker exec sfo-mongodb mongosh smartfoodops_menus --quiet \
   --eval "JSON.stringify(db.order_tracking_logs.findOne({order_id:'$ORDER_ID'}), null, 2)"
 ```
 
-The order itself, with its priced snapshot, lives in Postgres. Load the credentials from
-`.env` first so they never appear in your shell history:
+The order itself, with its priced snapshot, lives in the Order Service's own database —
+`sfo-order-db`, which holds `orders` and `payments` and nothing else:
 
 ```bash
-set -a && source .env && set +a
-
-docker exec -it sfo-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
   -c "SELECT id, status, total_amount, idempotency_key FROM orders ORDER BY created_at DESC LIMIT 5;"
 ```
 
 Confirm the idempotent replay created no duplicate:
 
 ```bash
-docker exec sfo-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tA \
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
   -c "SELECT count(*) FROM orders WHERE idempotency_key = '$IDEM';"
 ```
 
 Expect `1`.
+
+Database-per-service is visible from the shell too — the customer named by that order is not
+in this database at all, and the query that would have joined them cannot run:
+
+```bash
+# Fails: relation "users" does not exist
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
+  -c "SELECT count(*) FROM users;"
+
+# The customer lives here instead, one container over
+docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core \
+  -c "SELECT id, email FROM users WHERE id = '$CUST_ID';"
+```
 
 ---
 

@@ -2,6 +2,10 @@
 
 Idempotency is enforced by a unique index on `idempotency_key`, so a replay that loses the
 race to a concurrent submission is resolved here rather than by application-level locking.
+
+`customer_id` and `restaurant_id` are plain UUID columns: they point into other services'
+databases, where no foreign key can follow them, so main.py verifies both over HTTP before
+calling in here.
 """
 
 from decimal import Decimal
@@ -10,7 +14,7 @@ from logging import Logger
 import psycopg2
 from psycopg2.extras import Json
 
-from common.errors import conflict, unprocessable
+from common.errors import conflict
 from common.postgres import PostgresPool
 from schemas import OrderCreateRequest
 
@@ -59,11 +63,5 @@ class OrderRepository:
                 self._logger.info("Concurrent replay for key %s", idempotency_key)
                 raise conflict(
                     "An order with this idempotency key is already being processed"
-                ) from exc
-            except psycopg2.errors.ForeignKeyViolation as exc:
-                constraint = getattr(exc.diag, "constraint_name", None) or ""
-                subject = "restaurant" if "restaurant" in constraint else "customer"
-                raise unprocessable(
-                    f"Unknown {subject} referenced by this order"
                 ) from exc
             return cur.fetchone()

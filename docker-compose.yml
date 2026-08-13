@@ -4,38 +4,86 @@ networks:
   smartfoodops-network:
     driver: bridge
 
-# Credentials come from the gitignored root .env, which Compose reads automatically.
-# Defined once here so the DSN — and the password in it — is never repeated per service.
-x-postgres-env: &postgres-env
-  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db-postgres:5432/${POSTGRES_DB}
-
 volumes:
-  postgres_data:
+  user_postgres_data:
+  restaurant_postgres_data:
+  order_postgres_data:
   mongodb_data:
   redis_data:
 
+# Database-per-service: each Postgres-backed service gets its own physical database, with
+# its own credentials, so no service can reach another's tables even by accident.
+#
+# Each DSN is defined once here and injected as that service's DATABASE_URL, so a password
+# is never repeated in this file. Passwords come from the gitignored root .env, which
+# Compose reads automatically; `:?` aborts every compose command with the message below
+# when one is missing, rather than starting the stack with an empty password.
+# Database and role names are not secrets, so they stay literal and readable.
+x-user-db-env: &user-db-env
+  DATABASE_URL: postgresql://sfo_user_admin:${USER_POSTGRES_PASSWORD:?set USER_POSTGRES_PASSWORD in the root .env}@db-user-postgres:5432/sfo_user_core
+
+x-restaurant-db-env: &restaurant-db-env
+  DATABASE_URL: postgresql://sfo_restaurant_admin:${RESTAURANT_POSTGRES_PASSWORD:?set RESTAURANT_POSTGRES_PASSWORD in the root .env}@db-restaurant-postgres:5432/sfo_restaurant_core
+
+x-order-db-env: &order-db-env
+  DATABASE_URL: postgresql://sfo_order_admin:${ORDER_POSTGRES_PASSWORD:?set ORDER_POSTGRES_PASSWORD in the root .env}@db-order-postgres:5432/sfo_order_core
+
+# The three Postgres containers differ only in credentials, published port, volume and
+# schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
+# variables (`$$` defers expansion to the container) so it needs no per-database copy.
+x-postgres-base: &postgres-base
+  image: postgres:15-alpine
+  restart: always
+  networks:
+    - smartfoodops-network
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 5s
+    retries: 5
+
 services:
-  # --- 1. DATABASES & CACHING ---
-  db-postgres:
-    image: postgres:15-alpine
-    container_name: sfo-postgres
-    restart: always
+  # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
+  # Each database runs on 5432 inside the network and publishes a distinct host port, so a
+  # local SQL client can reach all three at once.
+  db-user-postgres:
+    <<: *postgres-base
+    container_name: sfo-user-db
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: sfo_user_core
+      POSTGRES_USER: sfo_user_admin
+      POSTGRES_PASSWORD: ${USER_POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Auto-runs DDL migrations on boot
-    networks:
-      - smartfoodops-network
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - user_postgres_data:/var/lib/postgresql/data
+      - ./db/user/init.sql:/docker-entrypoint-initdb.d/init.sql:ro # Auto-runs DDL on first boot
+
+  db-restaurant-postgres:
+    <<: *postgres-base
+    container_name: sfo-restaurant-db
+    environment:
+      POSTGRES_DB: sfo_restaurant_core
+      POSTGRES_USER: sfo_restaurant_admin
+      POSTGRES_PASSWORD: ${RESTAURANT_POSTGRES_PASSWORD}
+    ports:
+      - "5433:5432" # Maps host 5433 to container 5432
+    volumes:
+      - restaurant_postgres_data:/var/lib/postgresql/data
+      - ./db/restaurant/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  db-order-postgres:
+    <<: *postgres-base
+    container_name: sfo-order-db
+    environment:
+      POSTGRES_DB: sfo_order_core
+      POSTGRES_USER: sfo_order_admin
+      POSTGRES_PASSWORD: ${ORDER_POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432" # Maps host 5434 to container 5432
+    volumes:
+      - order_postgres_data:/var/lib/postgresql/data
+      - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   db-nosql:
     image: mongo:6.0
@@ -87,6 +135,7 @@ services:
       - smartfoodops-network
 
   # --- 3. CORE SERVICE CONTAINER SERVICES ---
+  # Every service depends on its own database only, and on nothing else's.
   user-service:
     build:
       # Context is ./services so the shared `common` chassis is inside the build context.
@@ -95,9 +144,9 @@ services:
     container_name: sfo-user-service
     restart: always
     environment:
-      <<: *postgres-env
+      <<: *user-db-env
     depends_on:
-      db-postgres:
+      db-user-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -109,9 +158,10 @@ services:
     container_name: sfo-restaurant-service
     restart: always
     environment:
-      <<: *postgres-env
+      <<: *restaurant-db-env
+      USER_SERVICE_URL: http://user-service:8001
     depends_on:
-      db-postgres:
+      db-restaurant-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -125,6 +175,7 @@ services:
     environment:
       MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
       REDIS_URL: redis://cache-redis:6379/0
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
     depends_on:
       db-nosql:
         condition: service_healthy
@@ -140,12 +191,12 @@ services:
     container_name: sfo-order-service
     restart: always
     environment:
-      <<: *postgres-env
+      <<: *order-db-env
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
     depends_on:
-      db-postgres:
+      db-order-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network

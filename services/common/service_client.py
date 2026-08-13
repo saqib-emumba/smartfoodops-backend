@@ -12,12 +12,18 @@ the same regardless of which service is calling.
 """
 
 from logging import Logger
+from typing import Callable
 
 import httpx
-from fastapi import status
+from fastapi import HTTPException, status
 
 from common.config import HTTP_TIMEOUT
 from common.errors import bad_gateway, not_found, service_unavailable
+
+# Builds the exception raised when the downstream answers 404. Callers that reference an
+# entity rather than fetch it override this — see the Order Service, where an unknown
+# customer is a 422 because the order, not the customer, is what the client asked for.
+MissingError = Callable[[str], HTTPException]
 
 
 class ServiceClient:
@@ -44,11 +50,16 @@ class ServiceClient:
         return service_unavailable(f"{self.name} is unreachable; {hint}")
 
     def _payload(
-        self, response: httpx.Response, *, missing: str, bad_gateway_hint: str | None
+        self,
+        response: httpx.Response,
+        *,
+        missing: str,
+        missing_error: MissingError,
+        bad_gateway_hint: str | None,
     ) -> dict:
         """Map the downstream status code onto this service's error contract."""
         if response.status_code == status.HTTP_404_NOT_FOUND:
-            raise not_found(missing)
+            raise missing_error(missing)
         if response.status_code != status.HTTP_200_OK:
             self._logger.error(
                 "Unexpected %s response %s: %s",
@@ -67,11 +78,13 @@ class ServiceClient:
         missing: str,
         unreachable_hint: str,
         bad_gateway_hint: str | None = None,
+        missing_error: MissingError = not_found,
     ) -> dict:
         """Blocking GET returning the decoded JSON body.
 
-        `missing` is the 404 detail shown to our caller; `unreachable_hint` completes the
-        sentence "<Service> is unreachable; ...".
+        `missing` is the detail shown to our caller when the downstream answers 404, and
+        `missing_error` the status it becomes; `unreachable_hint` completes the sentence
+        "<Service> is unreachable; ...".
         """
         url = self._url(path)
         try:
@@ -80,7 +93,10 @@ class ServiceClient:
         except httpx.RequestError as exc:
             raise self._unreachable(url, exc, unreachable_hint) from exc
         return self._payload(
-            response, missing=missing, bad_gateway_hint=bad_gateway_hint
+            response,
+            missing=missing,
+            missing_error=missing_error,
+            bad_gateway_hint=bad_gateway_hint,
         )
 
     async def aget(
@@ -90,6 +106,7 @@ class ServiceClient:
         missing: str,
         unreachable_hint: str,
         bad_gateway_hint: str | None = None,
+        missing_error: MissingError = not_found,
     ) -> dict:
         """Async counterpart to :meth:`get`, for services with async route handlers."""
         url = self._url(path)
@@ -99,7 +116,10 @@ class ServiceClient:
         except httpx.RequestError as exc:
             raise self._unreachable(url, exc, unreachable_hint) from exc
         return self._payload(
-            response, missing=missing, bad_gateway_hint=bad_gateway_hint
+            response,
+            missing=missing,
+            missing_error=missing_error,
+            bad_gateway_hint=bad_gateway_hint,
         )
 
     def post_best_effort(self, path: str, payload: dict, *, purpose: str) -> bool:

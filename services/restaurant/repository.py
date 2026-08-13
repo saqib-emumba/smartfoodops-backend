@@ -1,10 +1,11 @@
-"""PostgreSQL access for the `restaurants` table."""
+"""PostgreSQL access for the `restaurants` table.
+
+`owner_id` is a plain UUID column pointing into the User Service's database, so no foreign
+key can validate it here. main.py verifies the owner over HTTP before calling in.
+"""
 
 from uuid import UUID
 
-import psycopg2
-
-from common.errors import not_found
 from common.postgres import PostgresPool
 from schemas import RestaurantOnboardRequest
 
@@ -25,21 +26,17 @@ class RestaurantRepository:
 
     def onboard(self, payload: RestaurantOnboardRequest) -> dict:
         with self._db.cursor(commit=True) as cur:
-            try:
-                cur.execute(
-                    _INSERT_RESTAURANT,
-                    (
-                        str(payload.owner_id),
-                        payload.name,
-                        payload.address,
-                        payload.latitude,
-                        payload.longitude,
-                        payload.capacity,
-                    ),
-                )
-            except psycopg2.errors.ForeignKeyViolation as exc:
-                # Owner disappeared between verification and insert.
-                raise not_found(f"Owner {payload.owner_id} does not exist") from exc
+            cur.execute(
+                _INSERT_RESTAURANT,
+                (
+                    str(payload.owner_id),
+                    payload.name,
+                    payload.address,
+                    payload.latitude,
+                    payload.longitude,
+                    payload.capacity,
+                ),
+            )
             return cur.fetchone()
 
     def find(self, restaurant_id: UUID) -> dict | None:

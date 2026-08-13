@@ -1,7 +1,8 @@
 """SmartFoodOps User Service — registration and profile lookups (Port 8001).
 
-Owns the PostgreSQL `users` table and resolves role names against the `roles` lookup table.
-Other services must never read `users` directly; they call GET /api/v1/users/{user_id}.
+Owns its own PostgreSQL database: the `users` and `riders` tables plus the `roles` lookup
+that role names resolve against. No other service can read `users` — they hold no
+credentials for this database and call GET /api/v1/users/{user_id} instead.
 """
 
 import os
