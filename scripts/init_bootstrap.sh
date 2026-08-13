@@ -7,7 +7,7 @@ echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
 echo "📂 Creating services, gateway and per-service database directories..."
-mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order},services/{common,user,restaurant,menu,order}}
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment},services/{common,user,restaurant,menu,order,payment}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
@@ -20,6 +20,7 @@ cat << 'EOF' > .env
 USER_POSTGRES_PASSWORD=sfo_user_password_123
 RESTAURANT_POSTGRES_PASSWORD=sfo_restaurant_password_123
 ORDER_POSTGRES_PASSWORD=sfo_order_password_123
+PAYMENT_POSTGRES_PASSWORD=sfo_payment_password_123
 
 # NoSQL & caching tier (owned by the Menu Service)
 MONGO_DB=smartfoodops_menus
@@ -29,12 +30,13 @@ USER_SERVICE_URL=http://user-service:8001
 RESTAURANT_SERVICE_URL=http://restaurant-service:8002
 MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
+PAYMENT_SERVICE_URL=http://payment-service:8005
 EOF
 
 # 3. Write out one initialization migration script per physical database.
 # Each is mounted into its own container, so a service's schema exists only in the database
 # that service holds credentials for.
-echo "🐘 Generating Postgres schemas (db/{user,restaurant,order}/init.sql)..."
+echo "🐘 Generating Postgres schemas (db/{user,restaurant,order,payment}/init.sql)..."
 cat << 'EOF' > db/user/init.sql
 -- ============================================================================
 -- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
@@ -135,7 +137,11 @@ cat << 'EOF' > db/order/init.sql
 -- ============================================================================
 -- Order Service database — sfo_order_core (container sfo-order-db, host port 5434)
 --
--- Owns `orders` and `payments`. Only the Order Service connects here.
+-- Owns `orders`. Only the Order Service connects here.
+--
+-- `payments` used to live here too. It now belongs to the Payment Service's own database
+-- (sfo_payment_core), which is why neither the table nor the `payment_status` enum is
+-- declared below — see readme/payments-service-migration.md.
 --
 -- Every column pointing at another service's table is a plain UUID: a foreign key
 -- cannot span physical databases, so the reference is verified over HTTP before the
@@ -147,7 +153,6 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Define custom ENUM types
 CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
-CREATE TYPE payment_status AS ENUM ('pending', 'authorized', 'captured', 'refunded');
 
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
@@ -167,20 +172,48 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
 -- Order-history reads filter by customer, which no longer benefits from a foreign key.
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
+EOF
 
--- 2. Payments Table (Built with Idempotency Protection)
--- Payments belong to the order lifecycle, so they stay in this database and keep a real
--- foreign key to `orders`.
+cat << 'EOF' > db/payment/init.sql
+-- ============================================================================
+-- Payment Service database — sfo_payment_core (container sfo-payment-db, host port 5435)
+--
+-- Owns `payments`. Only the Payment Service connects here, which is the point of the
+-- split: card handling is the one compliance boundary we want to be able to lock down
+-- on its own, without dragging the order lifecycle inside it.
+--
+-- `order_id` used to be a real foreign key into `orders`, back when both tables shared
+-- one database. It is now a plain UUID pointing into the Order Service's database, where
+-- no foreign key can follow it, so the order is verified over HTTP before the insert
+-- (see services/payment/clients.py) instead of by the engine.
+-- ============================================================================
+
+-- Enable UUID extension for secure, non-sequential IDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Define custom ENUM types. `payment_status` moved here with the table; the Order
+-- Service's database no longer declares it.
+CREATE TYPE payment_status AS ENUM ('pending', 'authorized', 'captured', 'refunded');
+
+-- 1. Payments Table (Built with Idempotency Protection)
 CREATE TABLE IF NOT EXISTS payments (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID UNIQUE NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
+    order_id UUID UNIQUE NOT NULL, -- orders.id (Order Service database), no cross-DB FK
+    -- Idempotency guard: protects transactions against double-charging under network retries
     idempotency_key VARCHAR(255) UNIQUE NOT NULL,
     amount DECIMAL(10, 2) NOT NULL,
     status payment_status NOT NULL DEFAULT 'pending',
-    transaction_reference VARCHAR(255),
+    transaction_reference VARCHAR(255), -- External gateway id (e.g. a Stripe charge_id)
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- The two hot lookups — by `idempotency_key` (replay detection, on every write) and by
+-- `order_id` ("has this order been paid for?") — are already served by the UNIQUE
+-- constraints above, which Postgres backs with a btree index each. A second index on
+-- either column would be dead weight, so the only one declared here is for the reads that
+-- have no constraint behind them: sweeping for payments left mid-flight.
+CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 EOF
 
 # 4. Write out the Docker Compose orchestration configuration
@@ -196,6 +229,7 @@ volumes:
   user_postgres_data:
   restaurant_postgres_data:
   order_postgres_data:
+  payment_postgres_data:
   mongodb_data:
   redis_data:
 
@@ -216,7 +250,12 @@ x-restaurant-db-env: &restaurant-db-env
 x-order-db-env: &order-db-env
   DATABASE_URL: postgresql://sfo_order_admin:${ORDER_POSTGRES_PASSWORD:?set ORDER_POSTGRES_PASSWORD in the root .env}@db-order-postgres:5432/sfo_order_core
 
-# The three Postgres containers differ only in credentials, published port, volume and
+# Payments are physically isolated so that card handling can be locked down on its own:
+# this password unlocks nothing but the `payments` table.
+x-payment-db-env: &payment-db-env
+  DATABASE_URL: postgresql://sfo_payment_admin:${PAYMENT_POSTGRES_PASSWORD:?set PAYMENT_POSTGRES_PASSWORD in the root .env}@db-payment-postgres:5432/sfo_payment_core
+
+# The four Postgres containers differ only in credentials, published port, volume and
 # schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
 # variables (`$$` defers expansion to the container) so it needs no per-database copy.
 x-postgres-base: &postgres-base
@@ -233,7 +272,7 @@ x-postgres-base: &postgres-base
 services:
   # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
   # Each database runs on 5432 inside the network and publishes a distinct host port, so a
-  # local SQL client can reach all three at once.
+  # local SQL client can reach all four at once.
   db-user-postgres:
     <<: *postgres-base
     container_name: sfo-user-db
@@ -272,6 +311,19 @@ services:
     volumes:
       - order_postgres_data:/var/lib/postgresql/data
       - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  db-payment-postgres:
+    <<: *postgres-base
+    container_name: sfo-payment-db
+    environment:
+      POSTGRES_DB: sfo_payment_core
+      POSTGRES_USER: sfo_payment_admin
+      POSTGRES_PASSWORD: ${PAYMENT_POSTGRES_PASSWORD}
+    ports:
+      - "5435:5432" # Maps host 5435 to container 5432
+    volumes:
+      - payment_postgres_data:/var/lib/postgresql/data
+      - ./db/payment/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   db-nosql:
     image: mongo:6.0
@@ -319,6 +371,7 @@ services:
       - restaurant-service
       - menu-service
       - order-service
+      - payment-service
     networks:
       - smartfoodops-network
 
@@ -388,6 +441,23 @@ services:
         condition: service_healthy
     networks:
       - smartfoodops-network
+
+  # Reads the order it is settling over HTTP; it holds no credentials for sfo_order_core,
+  # and no other service holds credentials for sfo_payment_core.
+  payment-service:
+    build:
+      context: ./services
+      dockerfile: payment/Dockerfile
+    container_name: sfo-payment-service
+    restart: always
+    environment:
+      <<: *payment-db-env
+      ORDER_SERVICE_URL: http://order-service:8004
+    depends_on:
+      db-payment-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
 EOF
 
 # 5. Write out the Nginx routing gateway configuration
@@ -440,6 +510,14 @@ http {
         # 🛍️ Route Order service requests
         location /api/v1/orders {
             proxy_pass http://order-service:8004;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # 💳 Route Payment service requests
+        location /api/v1/payments {
+            proxy_pass http://payment-service:8005;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

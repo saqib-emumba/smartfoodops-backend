@@ -8,6 +8,7 @@ volumes:
   user_postgres_data:
   restaurant_postgres_data:
   order_postgres_data:
+  payment_postgres_data:
   mongodb_data:
   redis_data:
 
@@ -28,7 +29,12 @@ x-restaurant-db-env: &restaurant-db-env
 x-order-db-env: &order-db-env
   DATABASE_URL: postgresql://sfo_order_admin:${ORDER_POSTGRES_PASSWORD:?set ORDER_POSTGRES_PASSWORD in the root .env}@db-order-postgres:5432/sfo_order_core
 
-# The three Postgres containers differ only in credentials, published port, volume and
+# Payments are physically isolated so that card handling can be locked down on its own:
+# this password unlocks nothing but the `payments` table.
+x-payment-db-env: &payment-db-env
+  DATABASE_URL: postgresql://sfo_payment_admin:${PAYMENT_POSTGRES_PASSWORD:?set PAYMENT_POSTGRES_PASSWORD in the root .env}@db-payment-postgres:5432/sfo_payment_core
+
+# The four Postgres containers differ only in credentials, published port, volume and
 # schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
 # variables (`$$` defers expansion to the container) so it needs no per-database copy.
 x-postgres-base: &postgres-base
@@ -45,7 +51,7 @@ x-postgres-base: &postgres-base
 services:
   # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
   # Each database runs on 5432 inside the network and publishes a distinct host port, so a
-  # local SQL client can reach all three at once.
+  # local SQL client can reach all four at once.
   db-user-postgres:
     <<: *postgres-base
     container_name: sfo-user-db
@@ -84,6 +90,19 @@ services:
     volumes:
       - order_postgres_data:/var/lib/postgresql/data
       - ./db/order/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  db-payment-postgres:
+    <<: *postgres-base
+    container_name: sfo-payment-db
+    environment:
+      POSTGRES_DB: sfo_payment_core
+      POSTGRES_USER: sfo_payment_admin
+      POSTGRES_PASSWORD: ${PAYMENT_POSTGRES_PASSWORD}
+    ports:
+      - "5435:5432" # Maps host 5435 to container 5432
+    volumes:
+      - payment_postgres_data:/var/lib/postgresql/data
+      - ./db/payment/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   db-nosql:
     image: mongo:6.0
@@ -131,6 +150,7 @@ services:
       - restaurant-service
       - menu-service
       - order-service
+      - payment-service
     networks:
       - smartfoodops-network
 
@@ -197,6 +217,23 @@ services:
       MENU_SERVICE_URL: http://menu-service:8003
     depends_on:
       db-order-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # Reads the order it is settling over HTTP; it holds no credentials for sfo_order_core,
+  # and no other service holds credentials for sfo_payment_core.
+  payment-service:
+    build:
+      context: ./services
+      dockerfile: payment/Dockerfile
+    container_name: sfo-payment-service
+    restart: always
+    environment:
+      <<: *payment-db-env
+      ORDER_SERVICE_URL: http://order-service:8004
+    depends_on:
+      db-payment-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network

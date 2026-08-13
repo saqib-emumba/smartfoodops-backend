@@ -31,12 +31,13 @@ def required(name: str) -> str:
 DEFAULT_MONGO_URI = "mongodb://db-nosql:27017/smartfoodops_menus"
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
 
-# Sibling service base URLs. There is no order-service entry: calls only ever flow
-# order -> menu -> restaurant -> user, so nothing needs the Order Service's address.
-# Add one when something first calls into it (Week 2 pushes state transitions inward).
+# Sibling service base URLs. Calls flow payment -> order -> menu -> restaurant -> user, so
+# every service except the Payment Service is addressed by something: nothing calls into
+# payments yet — the Temporal workflow that will is Week 2 work.
 DEFAULT_USER_SERVICE_URL = "http://user-service:8001"
 DEFAULT_RESTAURANT_SERVICE_URL = "http://restaurant-service:8002"
 DEFAULT_MENU_SERVICE_URL = "http://menu-service:8003"
+DEFAULT_ORDER_SERVICE_URL = "http://order-service:8004"
 
 # Ceiling on a single inter-service HTTP round trip. Kept well below the client-facing
 # timeout so a slow dependency surfaces as a 503 rather than hanging the caller.

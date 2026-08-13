@@ -10,6 +10,7 @@ calling in here.
 
 from decimal import Decimal
 from logging import Logger
+from uuid import UUID
 
 import psycopg2
 from psycopg2.extras import Json
@@ -19,6 +20,8 @@ from common.postgres import PostgresPool
 from schemas import OrderCreateRequest
 
 _COLUMNS = "id, customer_id, restaurant_id, items, total_amount, status, idempotency_key"
+
+_SELECT_BY_ID = f"SELECT {_COLUMNS} FROM orders WHERE id = %s"
 
 _SELECT_BY_KEY = f"SELECT {_COLUMNS} FROM orders WHERE idempotency_key = %s"
 
@@ -33,6 +36,11 @@ class OrderRepository:
     def __init__(self, db: PostgresPool, *, logger: Logger):
         self._db = db
         self._logger = logger
+
+    def find(self, order_id: UUID) -> dict | None:
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_BY_ID, (str(order_id),))
+            return cur.fetchone()
 
     def find_by_idempotency_key(self, key: str) -> dict | None:
         with self._db.cursor() as cur:

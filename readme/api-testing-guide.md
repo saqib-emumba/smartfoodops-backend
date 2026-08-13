@@ -42,13 +42,13 @@ export RUN=$(date +%s)
 Every service exposes a health endpoint that also round-trips its datastore.
 
 ```bash
-for p in users restaurants menus orders; do
+for p in users restaurants menus orders payments; do
   printf '%-14s ' "$p"
   curl -s -w ' [%{http_code}]\n' "$BASE/api/v1/$p/health"
 done
 ```
 
-All four return `200`. A `200` carrying `"database_reachable": false` means the app is up but
+All five return `200`. A `200` carrying `"database_reachable": false` means the app is up but
 its store is not — check `docker compose ps`.
 
 ---
@@ -446,9 +446,115 @@ A customization can be given three ways — all equivalent:
 "customizations": {"cheese": {"name": "cheddar"}}        # option object
 ```
 
+### 4.3 Fetch an order → `200`
+
+The Payment Service reads an order this way — it cannot open `sfo_order_core` — so the
+`total_amount` this returns is the figure a payment has to match:
+
+```bash
+curl -s "$BASE/api/v1/orders/$ORDER_ID" | field "['total_amount']"
+```
+
+Expect `27.0`. An unknown id is a `404`.
+
 ---
 
-## 5. Service-boundary behaviour
+## 5. Payment Service (`:8005`)
+
+A separate service with a separate database (`sfo_payment_core` on host port `5435`) and no
+credentials for any other. It fetches the order over HTTP and refuses to charge an amount
+that does not settle it exactly, so the authority on what an order costs stays with the
+Order Service.
+
+The card gateway is simulated in Week 1 — an authorised payment comes back with a
+`ch_mock_…` reference rather than a real charge id.
+
+### 5.1 Authorise a payment → `201`
+
+`X-Idempotency-Key` is mandatory **and** must equal the `idempotency_key` in the body:
+
+```bash
+export PAY_IDEM="pay-$RUN"
+
+export PAYMENT_ID=$(curl -s -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' \
+  -H "X-Idempotency-Key: $PAY_IDEM" \
+  -d "{
+    \"order_id\": \"$ORDER_ID\",
+    \"amount\": 27.00,
+    \"idempotency_key\": \"$PAY_IDEM\"
+  }" | field "['id']")
+echo "PAYMENT_ID=$PAYMENT_ID"
+```
+
+The response reads `"status": "authorized"` with a `transaction_reference`. The row is
+written as `pending` *before* the gateway is called and moved to `authorized` after it
+answers, so a gateway failure leaves a `pending` row and nothing charged.
+
+### 5.2 Replay the same key → `200`
+
+```bash
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' \
+  -H "X-Idempotency-Key: $PAY_IDEM" \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM\"}"
+```
+
+Same id, status `200`, and the gateway is never called a second time — that is the
+double-charge protection.
+
+### 5.3 Fetch a payment → `200`
+
+```bash
+curl -s "$BASE/api/v1/payments/$PAYMENT_ID" | pretty
+```
+
+### Edge cases
+
+| Scenario | Expected |
+|---|---|
+| `X-Idempotency-Key` header missing | `400` |
+| Header disagrees with `idempotency_key` in the body | `400` |
+| `order_id` unknown to the Order Service | `422` |
+| `amount` does not equal the order's `total_amount` | `422` |
+| `amount` not greater than zero | `422` |
+| A different key against an order that is already paid | `409` |
+| Unknown `payment_id` | `404` |
+| Order Service is down | `503` |
+
+```bash
+# Missing header -> 400
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-x\"}"
+
+# Header disagrees with the body -> 400
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $PAY_IDEM-header" \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-body\"}"
+
+# Unknown order -> 422 (an HTTP check, not a foreign key)
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $PAY_IDEM-badorder" \
+  -d "{\"order_id\":\"44444444-4444-4444-4444-444444444444\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-badorder\"}"
+
+# Amount does not settle the order -> 422, and the message shows both figures
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $PAY_IDEM-short" \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":1.00,\"idempotency_key\":\"$PAY_IDEM-short\"}"
+
+# Order already paid, new key -> 409
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $PAY_IDEM-again" \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-again\"}"
+
+# Unknown payment -> 404
+curl -s -w '\n[%{http_code}]\n' "$BASE/api/v1/payments/00000000-0000-0000-0000-000000000000"
+```
+
+---
+
+## 6. Service-boundary behaviour
 
 These prove the services talk over HTTP rather than sharing tables. Stop a dependency and
 the caller degrades to `503` instead of failing opaquely.
@@ -482,6 +588,14 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-nouser" \
   -d "{\"customer_id\":\"$CUST_ID\",\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
 docker compose start user-service
+
+# Payment Service depends on the Order Service, because the order it is settling lives in a
+# database it cannot read — and it will not charge a card it cannot check the amount against.
+docker compose stop order-service
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
+  -H 'Content-Type: application/json' -H "X-Idempotency-Key: $PAY_IDEM-nosvc" \
+  -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-nosvc\"}"
+docker compose start order-service
 ```
 
 Each returns `503` with a message naming the unreachable service.
@@ -491,7 +605,7 @@ Each returns `503` with a message naming the unreachable service.
 
 ---
 
-## 6. Verifying what was actually stored
+## 7. Verifying what was actually stored
 
 The order audit log is written by the Order Service **through** the Menu Service, so it
 should be in MongoDB even though `order-service` never opens a Mongo connection:
@@ -502,12 +616,31 @@ docker exec sfo-mongodb mongosh smartfoodops_menus --quiet \
 ```
 
 The order itself, with its priced snapshot, lives in the Order Service's own database —
-`sfo-order-db`, which holds `orders` and `payments` and nothing else:
+`sfo-order-db`, which holds `orders` and nothing else:
 
 ```bash
 docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
   -c "SELECT id, status, total_amount, idempotency_key FROM orders ORDER BY created_at DESC LIMIT 5;"
 ```
+
+The payment is one container over, in a database the Order Service has no credentials for:
+
+```bash
+docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core \
+  -c "SELECT order_id, amount, status, transaction_reference FROM payments ORDER BY created_at DESC LIMIT 5;"
+```
+
+And the split is visible in the negative too — the `payments` table is simply not in the
+order database any more:
+
+```bash
+# Fails: relation "payments" does not exist
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
+  -c "SELECT count(*) FROM payments;"
+```
+
+If that query *succeeds*, the volume predates the split: `init.sql` only runs on an empty
+volume, so the old table is still sitting there unused. `docker compose down -v` clears it.
 
 Confirm the idempotent replay created no duplicate:
 
@@ -537,13 +670,13 @@ docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core \
 
 | Code | Meaning in this system |
 |---|---|
-| `200` | Read succeeded, or an idempotent replay returned the stored order |
+| `200` | Read succeeded, or an idempotent replay returned the stored order or payment |
 | `201` | Resource created |
 | `400` | Missing required header, or a role name absent from the `roles` table |
 | `403` | Authenticated subject exists but lacks the required role |
 | `404` | Resource does not exist, or a restaurant is inactive |
-| `409` | Unique constraint hit — duplicate email, phone, or idempotency key race |
-| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item |
+| `409` | Unique constraint hit — duplicate email or phone, an idempotency key race, or an order that already has a payment |
+| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item, payment that does not settle its order |
 | `500` | This service failed its own job (e.g. connection pool starved) |
 | `502` | A dependency replied with something unusable |
 | `503` | A dependency is unreachable — safe to retry |

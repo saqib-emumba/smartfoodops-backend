@@ -3,8 +3,8 @@
 # End-to-end smoke test for the SmartFoodOps stack.
 #
 # Drives every service through the API gateway exactly as a client would: the full
-# happy path (register -> onboard -> publish menu -> checkout) plus every edge case
-# named in the Week 1 contract. Asserts status codes and key response fields, and
+# happy path (register -> onboard -> publish menu -> checkout -> pay) plus every edge
+# case named in the Week 1 contract. Asserts status codes and key response fields, and
 # exits non-zero if anything regresses — so it is safe to wire into CI.
 #
 # Usage:
@@ -92,10 +92,10 @@ wait_for_stack() {
   printf 'Waiting for services'
   for _ in $(seq 1 40); do
     local up=0
-    for p in users restaurants menus orders; do
+    for p in users restaurants menus orders payments; do
       [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/$p/health")" == "200" ]] && up=$((up + 1))
     done
-    if [[ $up -eq 4 ]]; then printf ' ready.\n'; return 0; fi
+    if [[ $up -eq 5 ]]; then printf ' ready.\n'; return 0; fi
     printf '.'; sleep 2
   done
   printf '\n%sServices did not become ready.%s Try: docker compose ps\n' "$RED" "$RESET"
@@ -115,7 +115,7 @@ printf '%sSmartFoodOps smoke test%s  ->  %s\n' "$BOLD" "$RESET" "$BASE_URL"
 
 # ---------------------------------------------------------------- health
 section "Health"
-for p in users restaurants menus orders; do
+for p in users restaurants menus orders payments; do
   expect "$p health" 200 GET "/api/v1/$p/health"
 done
 
@@ -169,6 +169,26 @@ assert "  initial status is 'created'"    "$(jfield "['status']")"              
 
 expect "replay same idempotency key -> 200" 200 POST /api/v1/orders "$ORDER" -H "X-Idempotency-Key: $IDEM"
 assert "  replay returned the SAME order (no duplicate)" "$(jfield "['id']")" "$ORDER_ID"
+
+# The Payment Service reads the order over HTTP, so this endpoint is part of the contract.
+expect "fetch order by id" 200 GET "/api/v1/orders/$ORDER_ID"
+assert "  returned the same order" "$(jfield "['id']")" "$ORDER_ID"
+
+# Pay for it — a separate service, a separate database, verified over HTTP.
+PAY_IDEM="pay-$TAG"
+PAYMENT="{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM\"}"
+
+expect "authorise payment" 201 POST /api/v1/payments "$PAYMENT" -H "X-Idempotency-Key: $PAY_IDEM"
+PAYMENT_ID=$(jfield "['id']")
+assert "  payment reached 'authorized'" "$(jfield "['status']")" "authorized"
+assert "  amount settles the order"     "$(jfield "['amount']")" "27.0"
+assert "  gateway reference recorded"   "$(jfield "['transaction_reference'][:8]")" "ch_mock_"
+
+expect "fetch payment by id" 200 GET "/api/v1/payments/$PAYMENT_ID"
+assert "  returned the same payment" "$(jfield "['id']")" "$PAYMENT_ID"
+
+expect "replay same payment key -> 200" 200 POST /api/v1/payments "$PAYMENT" -H "X-Idempotency-Key: $PAY_IDEM"
+assert "  replay returned the SAME payment (no double charge)" "$(jfield "['id']")" "$PAYMENT_ID"
 
 # --------------------------------------------------------- user service
 section "User Service edge cases"
@@ -246,6 +266,27 @@ expect "empty item list -> 422" 422 POST /api/v1/orders \
 expect "option object form is accepted" 201 POST /api/v1/orders \
   "{\"customer_id\":\"$CUST_ID\",\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}],\"total_amount\":11.50}" \
   -H "X-Idempotency-Key: $IDEM-dictform"
+SECOND_ORDER_ID=$(jfield "['id']")
+expect "unknown order id -> 404" 404 GET /api/v1/orders/00000000-0000-0000-0000-000000000000
+
+# ------------------------------------------------------ payment service
+section "Payment Service edge cases"
+expect "missing idempotency header -> 400" 400 POST /api/v1/payments "$PAYMENT"
+expect "header disagrees with body -> 400" 400 POST /api/v1/payments "$PAYMENT" \
+  -H "X-Idempotency-Key: $PAY_IDEM-other"
+expect "unknown order -> 422" 422 POST /api/v1/payments \
+  "{\"order_id\":\"44444444-4444-4444-4444-444444444444\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-badorder\"}" \
+  -H "X-Idempotency-Key: $PAY_IDEM-badorder"
+expect "amount does not settle the order -> 422" 422 POST /api/v1/payments \
+  "{\"order_id\":\"$SECOND_ORDER_ID\",\"amount\":1.00,\"idempotency_key\":\"$PAY_IDEM-short\"}" \
+  -H "X-Idempotency-Key: $PAY_IDEM-short"
+expect "non-positive amount -> 422" 422 POST /api/v1/payments \
+  "{\"order_id\":\"$SECOND_ORDER_ID\",\"amount\":0,\"idempotency_key\":\"$PAY_IDEM-zero\"}" \
+  -H "X-Idempotency-Key: $PAY_IDEM-zero"
+expect "second payment for a paid order -> 409" 409 POST /api/v1/payments \
+  "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-again\"}" \
+  -H "X-Idempotency-Key: $PAY_IDEM-again"
+expect "unknown payment id -> 404" 404 GET /api/v1/payments/00000000-0000-0000-0000-000000000000
 
 # ---------------------------------------------- cross-service integration
 section "Cross-service integration"
@@ -256,6 +297,18 @@ if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/n
   assert "  order-service wrote 'created' log via Menu Service" "$HISTORY" "created"
 else
   printf '  %sSKIP%s  MongoDB audit-trail check (docker/sfo-mongodb not reachable)\n' "$DIM" "$RESET"
+fi
+
+# The payments table moved out of the order database entirely — prove both halves of that.
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-payment-db$'; then
+  STORED=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -tA \
+    -c "SELECT status FROM payments WHERE order_id = '$ORDER_ID';" 2>/dev/null | tr -d '\r')
+  assert "  payment stored in sfo_payment_core" "$STORED" "authorized"
+  ABSENT=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
+    -c "SELECT to_regclass('public.payments') IS NULL;" 2>/dev/null | tr -d '\r')
+  assert "  order database no longer holds a payments table" "$ABSENT" "t"
+else
+  printf '  %sSKIP%s  payment database checks (docker/sfo-payment-db not reachable)\n' "$DIM" "$RESET"
 fi
 
 # ------------------------------------------------------------- summary

@@ -1,18 +1,21 @@
 """SmartFoodOps Order Service — idempotent checkout (Port 8004).
 
-Owns the `orders` and `payments` tables in its own PostgreSQL database. Prices are always
-recalculated server-side from the Menu Service's published menu, and audit logs are written
-through the Menu Service so that this service never talks to MongoDB directly.
+Owns the `orders` table in its own PostgreSQL database — payments moved out to the Payment
+Service (Port 8005) along with their table. Prices are always recalculated server-side from
+the Menu Service's published menu, and audit logs are written through the Menu Service so
+that this service never talks to MongoDB directly.
 
 The customer and restaurant an order names live in other services' databases, so they are
 verified over HTTP before the insert — see clients.py.
 """
 
+from uuid import UUID
+
 from fastapi import FastAPI, Header, Response, status
 
 from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
 from common.config import required
-from common.errors import bad_request
+from common.errors import bad_request, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
 from pricing import build_order_snapshot
@@ -85,6 +88,20 @@ def create_order(
     menu_service.write_audit_log(order, x_idempotency_key)
 
     return OrderResponse(**order)
+
+
+@app.get("/api/v1/orders/{order_id}", response_model=OrderResponse)
+def get_order(order_id: UUID) -> OrderResponse:
+    """Expose an order — including its server-recalculated `total_amount`.
+
+    Added for the Payment Service: `payments.order_id` used to be a foreign key into this
+    database, and this endpoint is what replaced it. The total it returns is the figure a
+    payment has to match, so the authoritative amount stays owned by this service.
+    """
+    row = orders.find(order_id)
+    if row is None:
+        raise not_found(f"Order {order_id} not found")
+    return OrderResponse(**row)
 
 
 if __name__ == "__main__":

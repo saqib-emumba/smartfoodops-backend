@@ -1,7 +1,11 @@
 -- ============================================================================
 -- Order Service database — sfo_order_core (container sfo-order-db, host port 5434)
 --
--- Owns `orders` and `payments`. Only the Order Service connects here.
+-- Owns `orders`. Only the Order Service connects here.
+--
+-- `payments` used to live here too. It now belongs to the Payment Service's own database
+-- (sfo_payment_core), which is why neither the table nor the `payment_status` enum is
+-- declared below — see readme/payments-service-migration.md.
 --
 -- Every column pointing at another service's table is a plain UUID: a foreign key
 -- cannot span physical databases, so the reference is verified over HTTP before the
@@ -13,7 +17,6 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Define custom ENUM types
 CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
-CREATE TYPE payment_status AS ENUM ('pending', 'authorized', 'captured', 'refunded');
 
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
@@ -33,17 +36,3 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
 -- Order-history reads filter by customer, which no longer benefits from a foreign key.
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
-
--- 2. Payments Table (Built with Idempotency Protection)
--- Payments belong to the order lifecycle, so they stay in this database and keep a real
--- foreign key to `orders`.
-CREATE TABLE IF NOT EXISTS payments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    order_id UUID UNIQUE NOT NULL REFERENCES orders(id) ON DELETE RESTRICT,
-    idempotency_key VARCHAR(255) UNIQUE NOT NULL,
-    amount DECIMAL(10, 2) NOT NULL,
-    status payment_status NOT NULL DEFAULT 'pending',
-    transaction_reference VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
