@@ -143,6 +143,37 @@ All five must return `200`. The service health endpoints also report whether the
 backing stores actually round-trip (`database_reachable`, `mongo_reachable`, `redis_reachable`)
 — a `200` with `"database_reachable": false` means the app is up but the DB is not.
 
+### Run the test suite
+
+[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all four services through the gateway
+exactly as a client would — the full checkout chain plus every edge case in the Week 1
+contract — and asserts status codes and response fields:
+
+```bash
+./scripts/smoke-test.sh            # 51 assertions against http://localhost
+./scripts/smoke-test.sh --wait     # poll until services are up, then run
+./scripts/smoke-test.sh --verbose  # also print response bodies
+BASE_URL=http://host:8080 ./scripts/smoke-test.sh
+```
+
+It exits `0` when everything passes and `1` with a list of failures otherwise, so it works
+as a pre-commit check or a CI step. Colour is suppressed when the output is piped.
+
+What it covers beyond status codes:
+
+- **Idempotency** — a replayed `X-Idempotency-Key` returns the *same* order id, not a duplicate
+- **Server-side pricing** — asserts the recalculated unit price and total, not just a `201`
+- **Boundary enforcement** — that `order-service` reached MongoDB *through* the Menu Service,
+  by reading `order_tracking_logs` back out
+- **Upsert semantics** — first audit-log write creates the document, the second appends
+
+Each run generates unique emails, phone numbers, and idempotency keys, so it is safe to run
+repeatedly against the same database without tripping unique constraints. It only ever
+creates data — nothing is deleted — so use `docker compose down -v` when you want a clean
+slate.
+
+Requires `bash`, `curl`, and `python3` on the host; nothing is installed into the containers.
+
 ### Shut down
 
 ```bash
@@ -380,6 +411,7 @@ smartfoodops-backend/
 │   ├── restaurant/            # + clients.py (User Service)                  (:8002)
 │   ├── menu/                  # + clients.py, datastores.py (Mongo/Redis)    (:8003)
 │   └── order/                 # + clients.py, pricing.py (re-pricing rules)  (:8004)
+├── scripts/smoke-test.sh      # End-to-end assertions across all four services
 ├── readme/                    # Week 1 blueprints and contracts
 ├── docker-compose.yml         # Orchestration
 ├── init.sql                   # Postgres DDL + role seed data
