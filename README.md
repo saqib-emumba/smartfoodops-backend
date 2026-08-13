@@ -76,25 +76,43 @@ ORDER_SERVICE_URL=http://order-service:8004
 EOF
 ```
 
-`POSTGRES_PASSWORD` is **not** free choice — copy the value `docker-compose.yml` passes to
-the `db-postgres` service. The two must agree or a host-run service cannot authenticate
-against the container's database. It is not repeated here so this file stays the only place
-you read it from.
+`.env` is the **single source of truth** for credentials, and the stack no longer boots
+without it. `docker-compose.yml` interpolates `${POSTGRES_USER}` / `${POSTGRES_PASSWORD}` /
+`${POSTGRES_DB}` — into the `db-postgres` environment, into its healthcheck, and into the
+one `DATABASE_URL` definition the three Postgres-backed services share via a YAML anchor.
+No credential appears in a committed file.
 
-Where these are actually read matters: `docker-compose.yml` currently **hardcodes** the
-Postgres credentials and the `*_SERVICE_URL` values inline rather than interpolating
-`${POSTGRES_USER}` / `${POSTGRES_PASSWORD}`, so the stack boots even without a `.env`. The
-file is consumed by the host-run flow in
-[Running one service on the host](#running-one-service-on-the-host).
+`POSTGRES_PASSWORD` is therefore yours to choose: the same value initialises the database
+and builds the DSN handed to the services, so there is nothing to keep in sync by hand.
+
+These three keys are **required**:
+
+| Key | Required | Notes |
+|---|---|---|
+| `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | yes | Compose substitutes these; a missing key resolves to an empty string and the stack fails to authenticate |
+| `MONGO_DB` | no | Defaults to `smartfoodops_menus` |
+| `POSTGRES_HOST`, `POSTGRES_PORT`, `*_SERVICE_URL` | no | Consumed only by the host-run flow below |
+
+Services **fail fast** rather than falling back to a baked-in password: starting one
+without `DATABASE_URL` aborts at startup with
+`RuntimeError: DATABASE_URL is not set…` instead of silently connecting as a default user.
+
+Verify substitution resolved before debugging anything else — this prints the effective
+config, so redirect it rather than pasting the output anywhere:
+
+```bash
+docker compose config | grep DATABASE_URL
+```
 
 `POSTGRES_HOST=db-postgres` is the **Docker DNS name**, reachable only from inside the
 Compose network. A service running on your host reaches the same database at
 `localhost:5432` — which is why the host-run section builds `DATABASE_URL` by hand instead
 of composing it from `POSTGRES_HOST`. The `*_SERVICE_URL` values have the same constraint.
 
-If you change `POSTGRES_PASSWORD`, change it in both places **and** reset the volume with
-`docker compose down -v`. Postgres only applies that variable when it initialises an empty
-data directory; editing it afterwards has no effect on an existing volume.
+If you change `POSTGRES_PASSWORD`, reset the volume with `docker compose down -v`. Postgres
+only applies that variable when it initialises an empty data directory; editing it
+afterwards has no effect on an existing volume, so the new password and the existing
+database will disagree.
 
 Never commit `.env`. The values above are local-laptop defaults only — anything real belongs
 in a secrets manager, not in this file.

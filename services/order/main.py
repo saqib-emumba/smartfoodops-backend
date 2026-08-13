@@ -5,12 +5,10 @@ Menu Service's published menu, and audit logs are written through the Menu Servi
 this service never talks to MongoDB directly.
 """
 
-import os
-
 from fastapi import FastAPI, Header, Response, status
 
 from clients import MenuServiceClient
-from common.config import DEFAULT_DATABASE_URL
+from common.config import required
 from common.errors import bad_request
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
@@ -19,7 +17,7 @@ from repository import OrderRepository
 from schemas import OrderCreateRequest, OrderResponse
 
 SERVICE_NAME = "order-service"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+DATABASE_URL = required("DATABASE_URL")
 
 logger = configure_logging(SERVICE_NAME)
 db = PostgresPool(

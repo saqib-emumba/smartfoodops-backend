@@ -1,15 +1,33 @@
-"""Infrastructure defaults shared across services.
+"""Infrastructure configuration shared across services.
 
-Every value here is a *local docker-compose* fallback for when the corresponding
-environment variable is absent; docker-compose injects the real values. Production
-deployments must supply DATABASE_URL and friends from a secret store rather than
-relying on these checked-in development credentials.
+Credentials are never defaulted in code. Anything carrying a secret — currently just
+DATABASE_URL — must arrive from the environment, which docker-compose builds from the
+gitignored root `.env`. A missing value fails the service at startup rather than silently
+falling back to a checked-in password.
+
+The defaults that remain here are credential-free in-network addresses, so publishing them
+in source costs nothing and keeps local runs friction-free.
 """
 
-# Datastore endpoints (mirrored by the environment blocks in docker-compose.yml).
-DEFAULT_DATABASE_URL = (
-    "postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core"
-)
+import os
+
+
+def required(name: str) -> str:
+    """Read a mandatory environment variable, failing loudly at startup if unset.
+
+    docker-compose supplies these from the root `.env`; export them by hand when running
+    a service directly on the host.
+    """
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set. docker-compose.yml supplies it from the root .env file; "
+            f"export it manually when running this service outside Docker."
+        )
+    return value
+
+
+# Credential-free datastore endpoints (mirrored by docker-compose.yml).
 DEFAULT_MONGO_URI = "mongodb://db-nosql:27017/smartfoodops_menus"
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
 

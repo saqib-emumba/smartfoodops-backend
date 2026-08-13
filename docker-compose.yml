@@ -4,6 +4,11 @@ networks:
   smartfoodops-network:
     driver: bridge
 
+# Credentials come from the gitignored root .env, which Compose reads automatically.
+# Defined once here so the DSN — and the password in it — is never repeated per service.
+x-postgres-env: &postgres-env
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db-postgres:5432/${POSTGRES_DB}
+
 volumes:
   postgres_data:
   mongodb_data:
@@ -16,9 +21,9 @@ services:
     container_name: sfo-postgres
     restart: always
     environment:
-      POSTGRES_DB: smartfoodops_core
-      POSTGRES_USER: sfo_admin
-      POSTGRES_PASSWORD: sfo_password_123
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     ports:
       - "5432:5432"
     volumes:
@@ -27,7 +32,7 @@ services:
     networks:
       - smartfoodops-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sfo_admin -d smartfoodops_core"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -90,7 +95,7 @@ services:
     container_name: sfo-user-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
+      <<: *postgres-env
     depends_on:
       db-postgres:
         condition: service_healthy
@@ -104,7 +109,7 @@ services:
     container_name: sfo-restaurant-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
+      <<: *postgres-env
     depends_on:
       db-postgres:
         condition: service_healthy
@@ -118,8 +123,8 @@ services:
     container_name: sfo-menu-service
     restart: always
     environment:
-      - MONGO_URI=mongodb://db-nosql:27017/smartfoodops_menus
-      - REDIS_URL=redis://cache-redis:6379/0
+      MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
+      REDIS_URL: redis://cache-redis:6379/0
     depends_on:
       db-nosql:
         condition: service_healthy
@@ -135,10 +140,10 @@ services:
     container_name: sfo-order-service
     restart: always
     environment:
-      - DATABASE_URL=postgresql://sfo_admin:sfo_password_123@db-postgres:5432/smartfoodops_core
-      - USER_SERVICE_URL=http://user-service:8001
-      - RESTAURANT_SERVICE_URL=http://restaurant-service:8002
-      - MENU_SERVICE_URL=http://menu-service:8003
+      <<: *postgres-env
+      USER_SERVICE_URL: http://user-service:8001
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      MENU_SERVICE_URL: http://menu-service:8003
     depends_on:
       db-postgres:
         condition: service_healthy

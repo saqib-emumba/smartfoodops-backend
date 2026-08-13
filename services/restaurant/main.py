@@ -4,13 +4,12 @@ Owns the PostgreSQL `restaurants` table. Owner identity/authorisation is resolve
 against the User Service so that this service never touches the `users` table directly.
 """
 
-import os
 from uuid import UUID
 
 from fastapi import FastAPI, status
 
 from clients import UserServiceClient
-from common.config import DEFAULT_DATABASE_URL
+from common.config import required
 from common.errors import not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
@@ -18,7 +17,7 @@ from repository import RestaurantRepository
 from schemas import RestaurantOnboardRequest, RestaurantResponse
 
 SERVICE_NAME = "restaurant-service"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
+DATABASE_URL = required("DATABASE_URL")
 
 logger = configure_logging(SERVICE_NAME)
 db = PostgresPool(DATABASE_URL, logger=logger)
