@@ -33,3 +33,22 @@ class UserResponse(BaseModel):
     role: str  # Resolves database roles table lookup via SQL Join query on role_id
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class LoginRequest(BaseModel):
+    # Neither field is length-constrained, unlike registration: a 422 on a too-short
+    # password would answer "that is not our password format" before checking anything,
+    # and every rejected login must look identical. See main.login.
+    email: EmailStr
+    password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1)
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(..., description="Access token lifetime in seconds")

@@ -26,6 +26,22 @@ _SELECT_USER = """
     WHERE u.id = %s
 """
 
+# The only query that reads password_hash. Kept separate from _SELECT_USER so the hash
+# cannot reach a response model by accident — the profile endpoints use that one.
+_SELECT_CREDENTIALS = """
+    SELECT u.id, u.password_hash, r.name AS role
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.email = %s
+"""
+
+_SELECT_ROLE_FOR_USER = """
+    SELECT u.id, r.name AS role
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+    WHERE u.id = %s
+"""
+
 
 def _duplicate_account(exc: psycopg2.errors.UniqueViolation) -> HTTPException:
     """Name the field that collided so the caller knows what to change."""
@@ -63,6 +79,26 @@ class UserRepository:
         """Resolve a single profile, joining the roles lookup table for the role name."""
         with self._db.cursor() as cur:
             cur.execute(_SELECT_USER, (str(user_id),))
+            return cur.fetchone()
+
+    def find_credentials(self, email: str) -> dict | None:
+        """Fetch id, role and password_hash for a login attempt.
+
+        The only path that reads the hash. Callers must not let the result reach a
+        response — see main.login, which pulls out `id` and `role` and drops the rest.
+        """
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_CREDENTIALS, (email,))
+            return cur.fetchone()
+
+    def find_role(self, user_id: UUID) -> dict | None:
+        """Re-read a user's current role when minting a token from a refresh exchange.
+
+        Deliberately re-read rather than carried in the refresh token: a role changed
+        mid-session takes effect at the next refresh instead of lingering for days.
+        """
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_ROLE_FOR_USER, (str(user_id),))
             return cur.fetchone()
 
     @staticmethod

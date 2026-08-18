@@ -2,13 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install service dependencies (bcrypt for password hashing, email-validator via pydantic[email])
+# Install service dependencies (bcrypt for password hashing, email-validator via
+# pydantic[email], PyJWT[crypto] to sign RS256 access tokens, redis for refresh sessions)
 RUN pip install --no-cache-dir \
     fastapi==0.115.6 \
     uvicorn==0.34.0 \
     "pydantic[email]==2.10.4" \
     psycopg2-binary==2.9.10 \
-    bcrypt==4.2.1
+    bcrypt==4.2.1 \
+    "PyJWT[crypto]==2.10.1" \
+    redis==5.2.1
 
 # Build context is ./services so the shared chassis can be copied alongside this service.
 COPY common/ /app/common/

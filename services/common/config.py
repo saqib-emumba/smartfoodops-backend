@@ -1,9 +1,9 @@
 """Infrastructure configuration shared across services.
 
-Credentials are never defaulted in code. Anything carrying a secret — currently just
-DATABASE_URL — must arrive from the environment, which docker-compose builds from the
-gitignored root `.env`. A missing value fails the service at startup rather than silently
-falling back to a checked-in password.
+Credentials are never defaulted in code. Anything carrying a secret — DATABASE_URL, the
+JWT signing keys and the internal API key — must arrive from the environment, which
+docker-compose builds from the gitignored root `.env`. A missing value fails the service at
+startup rather than silently falling back to a checked-in password.
 
 The defaults that remain here are credential-free in-network addresses, so publishing them
 in source costs nothing and keeps local runs friction-free.
@@ -30,6 +30,15 @@ def required(name: str) -> str:
 # Credential-free datastore endpoints (mirrored by docker-compose.yml).
 DEFAULT_MONGO_URI = "mongodb://db-nosql:27017/smartfoodops_menus"
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
+
+# Refresh tokens live in logical database 1, keeping them clear of the Menu Service's
+# cache in database 0: an accidental FLUSHDB on one must not sign every user out.
+DEFAULT_AUTH_REDIS_URL = "redis://cache-redis:6379/1"
+
+# Token lifetimes. The access token is deliberately short because it cannot be revoked
+# before it expires — logout invalidates the refresh token, not tokens already issued.
+ACCESS_TOKEN_TTL_MINUTES = 15
+REFRESH_TOKEN_TTL_DAYS = 7
 
 # Sibling service base URLs. Calls flow payment -> order -> menu -> restaurant -> user, so
 # every service except the Payment Service is addressed by something: nothing calls into

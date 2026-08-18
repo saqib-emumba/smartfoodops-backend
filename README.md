@@ -114,7 +114,20 @@ MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
 EOF
+
+# Access token signing (RS256) plus the internal service key. Generated, never chosen:
+# the private key is the ability to mint any identity, so it must not be a memorable string.
+priv=$(openssl genrsa 2048 2>/dev/null)
+cat >> .env <<EOF
+
+JWT_PRIVATE_KEY_B64=$(printf '%s' "$priv" | openssl base64 -A)
+JWT_PUBLIC_KEY_B64=$(printf '%s' "$priv" | openssl rsa -pubout 2>/dev/null | openssl base64 -A)
+INTERNAL_API_KEY=$(openssl rand -hex 32)
+EOF
 ```
+
+`scripts/init_bootstrap.sh` writes all of this for you, keypair included; the block above is
+the manual equivalent for an existing checkout.
 
 `.env` is the **single source of truth** for credentials, and the stack no longer boots
 without it. Each password appears in exactly one place in `docker-compose.yml`: a YAML
@@ -240,6 +253,68 @@ docker compose down -v       # stop and wipe all volumes (fresh databases)
 
 ---
 
+## Authentication
+
+Every endpoint except the health probes, `register`, `login` and `refresh` requires an
+access token. **Identity is never accepted in a request body** — who you are is whatever
+your token says, so `owner_id` and `customer_id` are no longer fields a client can send.
+
+Tokens are **RS256**, signed by the User Service, which is the only container holding the
+private key (`JWT_PRIVATE_KEY_B64`). Every other service gets the public key and can verify
+a token but never mint one. Confirm that split at any time:
+
+```bash
+docker compose exec order-service printenv | grep JWT   # public key only
+```
+
+A session is a short access token plus a long refresh token:
+
+| Token | Lifetime | Stored | Revocable |
+|---|---|---|---|
+| Access (JWT) | 15 minutes | nowhere — stateless | no, expires on its own |
+| Refresh (opaque) | 7 days | Redis DB 1, SHA-256 hashed | yes — that is what logout does |
+
+Refreshing **rotates**: the presented token is consumed in the same round trip it is read
+in, so a captured token stops working the moment the real client next refreshes. Because an
+already-issued access token cannot be withdrawn, logout ends a session within one access
+token lifetime rather than instantly — which is why that lifetime is short.
+
+```bash
+# Log in
+curl -s -X POST http://localhost/api/v1/users/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","password":"Sup3rSecret!"}'
+# -> {"access_token":"eyJ…","refresh_token":"…","token_type":"bearer","expires_in":900}
+
+# Use it
+curl -s http://localhost/api/v1/users/<USER_UUID> -H "Authorization: Bearer $ACCESS"
+
+# Trade a refresh token for a fresh pair (the old one dies here)
+curl -s -X POST http://localhost/api/v1/users/refresh \
+  -H 'Content-Type: application/json' -d '{"refresh_token":"<REFRESH>"}'
+
+# End the session
+curl -s -X POST http://localhost/api/v1/users/logout \
+  -H "Authorization: Bearer $ACCESS" \
+  -H 'Content-Type: application/json' -d '{"refresh_token":"<REFRESH>"}'
+```
+
+A failed login returns the same message whether the email is unknown or the password is
+wrong, and takes the same time either way — otherwise the endpoint would answer "does this
+person have an account here?" to anyone who asks.
+
+### Service-to-service calls
+
+Two mechanisms, deliberately different:
+
+- **On behalf of a user** — the caller's bearer token is forwarded downstream unchanged, so
+  a service can never do more than the user who invoked it. The Payment Service reads an
+  order with *your* token, which is exactly why it cannot pay for someone else's.
+- **Internal only** — `POST /api/v1/menus/logs` takes `X-Internal-Key` instead. Forwarding
+  a user token there would let customers write the audit trail describing their own orders.
+
+---
+
 ## API walkthrough
 
 A full checkout, in order. Every call goes through the gateway on port 80.
@@ -256,19 +331,36 @@ curl -s -X POST http://localhost/api/v1/users/register \
 Roles are resolved against the `roles` table at request time: `customer`,
 `restaurant_admin`, `rider`, `system_admin`. Passwords are bcrypt-hashed before storage.
 
-**2 — Onboard a restaurant** (owner must resolve to `restaurant_admin`)
+**2 — Log in as each of them**
+
+```bash
+OWNER=$(curl -s -X POST http://localhost/api/v1/users/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","password":"Sup3rSecret!"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+Repeat for the customer to get `$CUSTOMER`. Every call below carries one of these.
+
+**3 — Onboard a restaurant** (the token must carry the `restaurant_admin` role)
 
 ```bash
 curl -s -X POST http://localhost/api/v1/restaurants/onboard \
+  -H "Authorization: Bearer $OWNER" \
   -H 'Content-Type: application/json' \
-  -d '{"owner_id":"<OWNER_UUID>","name":"SFO Diner","address":"12 Blue Area, Islamabad",
+  -d '{"name":"SFO Diner","address":"12 Blue Area, Islamabad",
        "latitude":33.6844,"longitude":73.0479,"capacity":40}'
 ```
 
-**3 — Publish a menu** (upsert — re-posting replaces the tree and keeps `created_at`)
+The restaurant is owned by the token's subject. There is no `owner_id` to send.
+
+**4 — Publish a menu** (upsert — re-posting replaces the tree and keeps `created_at`)
+
+Requires `restaurant_admin` **and** ownership of this particular restaurant: holding the
+role is not enough to rewrite a competitor's prices.
 
 ```bash
 curl -s -X POST http://localhost/api/v1/menus \
+  -H "Authorization: Bearer $OWNER" \
   -H 'Content-Type: application/json' \
   -d '{"restaurant_id":"<RESTAURANT_UUID>","categories":[{
         "category_id":"cat_entrees_100","category_name":"Entrees","display_order":1,
@@ -280,26 +372,31 @@ curl -s -X POST http://localhost/api/v1/menus \
                                {"name":"Smoked Bacon","extra_price":2.25}]}]}]}]}'
 ```
 
-**4 — Place an order** (the header is mandatory)
+**5 — Place an order** (the header is mandatory)
 
 ```bash
 curl -s -X POST http://localhost/api/v1/orders \
+  -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
   -H 'X-Idempotency-Key: sfo-key-0001' \
-  -d '{"customer_id":"<CUSTOMER_UUID>","restaurant_id":"<RESTAURANT_UUID>",
+  -d '{"restaurant_id":"<RESTAURANT_UUID>",
        "items":[{"item_id":"item_burger_001","quantity":2,
                  "customizations":{"grp_add_ons":["Extra Cheddar Cheese"]}}],
        "total_amount":28.98}'
 ```
 
+The order belongs to the token's subject — there is no `customer_id` to send, and therefore
+no way to place an order in someone else's name. Requires the `customer` role.
+
 The total is **recalculated server-side** from the live menu (12.99 + 1.50 × 2 = 28.98) —
 the client's `total_amount` is only checked, never trusted. Repeating the same
 `X-Idempotency-Key` returns the original order as `200` instead of creating a second one.
 
-**5 — Pay for it** (a different service, a different database)
+**6 — Pay for it** (a different service, a different database)
 
 ```bash
 curl -s -X POST http://localhost/api/v1/payments \
+  -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
   -H 'X-Idempotency-Key: sfo-pay-0001' \
   -d '{"order_id":"<ORDER_UUID>","amount":28.98,"idempotency_key":"sfo-pay-0001"}'
@@ -314,23 +411,30 @@ Replaying the same key returns the original payment as `200` and never touches t
 that is the double-charge guarantee. A *different* key against an already-paid order is a
 `409` — one payment per order is a unique constraint, not a convention.
 
+Ownership is settled by that HTTP lookup rather than by a check here: the Order Service only
+serves an order to the customer who placed it, so paying for someone else's comes back `403`
+from one place instead of being re-decided in two.
+
 ### Endpoint reference
 
-| Method | Path | Notes |
-|---|---|---|
-| `GET` | `/health` | Gateway only, does not touch services |
-| `GET` | `/api/v1/{users,restaurants,menus,orders,payments}/health` | Per-service + backing store |
-| `POST` | `/api/v1/users/register` | `201`; bcrypt hash, role resolved via DB |
-| `GET` | `/api/v1/users/{user_id}` | Joins `roles`, returns the role **name** |
-| `POST` | `/api/v1/restaurants/onboard` | `201`; verifies owner over HTTP |
-| `GET` | `/api/v1/restaurants/{restaurant_id}` | Exposes `is_active` to other services |
-| `POST` | `/api/v1/menus` | Upsert full category/item/customization tree |
-| `GET` | `/api/v1/menus/{restaurant_id}` | Used by the Order Service to price a cart |
-| `POST` | `/api/v1/menus/logs` | Appends to `order_tracking_logs.status_history` |
-| `POST` | `/api/v1/orders` | `201` new / `200` idempotent replay; verifies customer + restaurant over HTTP |
-| `GET` | `/api/v1/orders/{order_id}` | Exposes the recalculated `total_amount` to the Payment Service |
-| `POST` | `/api/v1/payments` | `201` new / `200` idempotent replay; verifies order + amount over HTTP |
-| `GET` | `/api/v1/payments/{payment_id}` | Where a payment stopped — `pending` or `authorized` |
+| Method | Path | Who may call it | Notes |
+|---|---|---|---|
+| `GET` | `/health` | anyone | Gateway only, does not touch services |
+| `GET` | `/api/v1/{users,restaurants,menus,orders,payments}/health` | anyone | Per-service + backing store |
+| `POST` | `/api/v1/users/register` | anyone | `201`; bcrypt hash, role resolved via DB |
+| `POST` | `/api/v1/users/login` | anyone | Access + refresh pair; one message for every failure |
+| `POST` | `/api/v1/users/refresh` | anyone holding a refresh token | Rotates: the presented token is consumed |
+| `POST` | `/api/v1/users/logout` | any signed-in user | `204`; revokes the refresh token |
+| `GET` | `/api/v1/users/{user_id}` | the subject, or `system_admin` | Joins `roles`, returns the role **name** |
+| `POST` | `/api/v1/restaurants/onboard` | `restaurant_admin` | `201`; owner taken from the token, verified over HTTP |
+| `GET` | `/api/v1/restaurants/{restaurant_id}` | any signed-in user | Exposes `is_active` to other services |
+| `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree |
+| `GET` | `/api/v1/menus/{restaurant_id}` | any signed-in user | Used by the Order Service to price a cart |
+| `POST` | `/api/v1/menus/logs` | services only (`X-Internal-Key`) | Appends to `order_tracking_logs.status_history` |
+| `POST` | `/api/v1/orders` | `customer` | `201` new / `200` idempotent replay; customer taken from the token |
+| `GET` | `/api/v1/orders/{order_id}` | the order's customer, or `system_admin` | Exposes the recalculated `total_amount` to the Payment Service |
+| `POST` | `/api/v1/payments` | `customer` owning the order | `201` new / `200` idempotent replay; verifies order + amount over HTTP |
+| `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending` or `authorized` |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -339,10 +443,11 @@ Interactive docs per service, once you expose a port (see below): `http://localh
 | Code | When |
 |---|---|
 | `400` | Unknown role name; missing `X-Idempotency-Key`; header disagreeing with `idempotency_key` in a payment body |
-| `403` | Owner exists but is not a `restaurant_admin` |
-| `404` | Unknown user / restaurant / menu / order / payment; inactive restaurant |
+| `401` | No bearer token, or one that is malformed, expired or badly signed; failed login; dead or already-used refresh token; internal endpoint reached without `X-Internal-Key`. Carries `WWW-Authenticate: Bearer` |
+| `403` | Authenticated, but not allowed: wrong role for the action, or someone else's user / order / payment. Also what a downstream refusal becomes when a forwarded token is rejected |
+| `404` | Unknown restaurant / menu / order / payment; inactive restaurant. **Not** an unknown user id — that is a `403`, since the ownership check runs before the lookup and must not reveal which ids exist |
 | `409` | Duplicate email (case-insensitive) or phone; an order that already has a payment |
-| `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown customer or restaurant; payment naming an unknown order or not settling it exactly |
+| `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown restaurant; payment naming an unknown order or not settling it exactly |
 | `500` | Postgres connection pool starved |
 | `502` | Unexpected response from an upstream service |
 | `503` | Upstream service unreachable; MongoDB socket timeout |
@@ -575,7 +680,11 @@ in a single-repo Compose setup; if services ever ship on independent release cyc
 | `password authentication failed` after changing `.env` | Postgres keeps the password baked into its existing volume. Reset that volume |
 | Port 5433 / 5434 / 5435 already in use | Another Postgres is bound. Stop it, or change the published port for that database |
 | `503` on menu writes | MongoDB unreachable. `docker compose ps db-nosql` |
-| `422 Unknown customer …` on a valid order | The customer exists in *your* client, not in the User Service database — orders no longer share a database with users. `GET /api/v1/users/{id}` to confirm |
+| `401` on every call that worked yesterday | The access token expired — they last 15 minutes. `POST /api/v1/users/refresh` with the refresh token, or log in again |
+| `401 Access token is invalid` right after a rebuild | `.env` was regenerated, so tokens signed by the old key no longer verify. Log in again |
+| Services refuse to start: `JWT_PUBLIC_KEY_B64 is not set` | `.env` predates authentication. Add the keypair — see [Environment file](#environment-file) |
+| `403 Not authorised to access this resource in the Order Service` | The order belongs to a different customer. Payments are refused where the order is read, not where the payment is written |
+| `401 This endpoint is internal to SmartFoodOps services` | `POST /api/v1/menus/logs` needs `X-Internal-Key`, not a bearer token — it is service-to-service only |
 | `409` on a repeated register | Working as intended — email/phone are unique |
 | `409 Order … has already been paid for` | Working as intended — `payments.order_id` is unique, so an order can be charged once. Replay the *original* idempotency key to get that payment back |
 | A payment stuck at `pending` | The gateway call failed after the row was written. Nothing was charged; Week 2's compensation workflow is what will reconcile these |

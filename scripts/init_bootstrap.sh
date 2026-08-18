@@ -11,9 +11,9 @@ mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment},se
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
-# Only the database passwords live here: docker-compose.yml builds each service's DSN from
-# them, so a password is written in exactly one place. Database and role names are not
-# secrets and stay literal in docker-compose.yml.
+# Database passwords and the JWT signing material live here: docker-compose.yml builds each
+# service's DSN from them, so a password is written in exactly one place. Database and role
+# names are not secrets and stay literal in docker-compose.yml.
 echo "📝 Generating .env configuration file..."
 cat << 'EOF' > .env
 # Database Credentials — one password per physical database (database-per-service)
@@ -31,6 +31,28 @@ RESTAURANT_SERVICE_URL=http://restaurant-service:8002
 MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
+EOF
+
+# 2b. Generate the token signing material.
+# Appended rather than written above because the heredoc there is quoted and cannot expand a
+# command. A fresh keypair per environment is the point: the private key is the ability to
+# mint any identity, so it is never a checked-in constant.
+echo "🔑 Generating RS256 signing keypair and internal service key..."
+jwt_private_pem=$(openssl genrsa 2048 2>/dev/null)
+jwt_public_pem=$(printf '%s' "$jwt_private_pem" | openssl rsa -pubout 2>/dev/null)
+
+# `base64 -A` keeps each key on one line, which is the only shape .env accepts.
+cat << EOF >> .env
+
+# Access token signing (RS256). docker-compose.yml hands the private key to the User Service
+# alone — it is the sole issuer — and the public key to everyone, who can then verify a token
+# but never forge one.
+JWT_PRIVATE_KEY_B64=$(printf '%s' "$jwt_private_pem" | openssl base64 -A)
+JWT_PUBLIC_KEY_B64=$(printf '%s' "$jwt_public_pem" | openssl base64 -A)
+
+# Shared secret for the service-to-service endpoints no end user may call directly, such as
+# the Menu Service's audit log write.
+INTERNAL_API_KEY=$(openssl rand -hex 32)
 EOF
 
 # 3. Write out one initialization migration script per physical database.
@@ -255,6 +277,14 @@ x-order-db-env: &order-db-env
 x-payment-db-env: &payment-db-env
   DATABASE_URL: postgresql://sfo_payment_admin:${PAYMENT_POSTGRES_PASSWORD:?set PAYMENT_POSTGRES_PASSWORD in the root .env}@db-payment-postgres:5432/sfo_payment_core
 
+# Every service verifies access tokens, so every service gets the public key. Only the User
+# Service gets the private key, further down: a service that cannot sign cannot mint an
+# identity, which is the whole reason the signing is asymmetric. The internal key is shared
+# because it authenticates service-to-service calls in both directions.
+x-jwt-env: &jwt-env
+  JWT_PUBLIC_KEY_B64: ${JWT_PUBLIC_KEY_B64:?set JWT_PUBLIC_KEY_B64 in the root .env - scripts/init_bootstrap.sh generates a keypair}
+  INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in the root .env}
+
 # The four Postgres containers differ only in credentials, published port, volume and
 # schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
 # variables (`$$` defers expansion to the container) so it needs no per-database copy.
@@ -385,9 +415,15 @@ services:
     container_name: sfo-user-service
     restart: always
     environment:
-      <<: *user-db-env
+      <<: [*user-db-env, *jwt-env]
+      # The one container holding the signing key. Nothing else can issue a token.
+      JWT_PRIVATE_KEY_B64: ${JWT_PRIVATE_KEY_B64:?set JWT_PRIVATE_KEY_B64 in the root .env - scripts/init_bootstrap.sh generates a keypair}
+      # Database 1, kept apart from the Menu Service's cache in database 0.
+      AUTH_REDIS_URL: redis://cache-redis:6379/1
     depends_on:
       db-user-postgres:
+        condition: service_healthy
+      cache-redis:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -399,7 +435,7 @@ services:
     container_name: sfo-restaurant-service
     restart: always
     environment:
-      <<: *restaurant-db-env
+      <<: [*restaurant-db-env, *jwt-env]
       USER_SERVICE_URL: http://user-service:8001
     depends_on:
       db-restaurant-postgres:
@@ -414,6 +450,7 @@ services:
     container_name: sfo-menu-service
     restart: always
     environment:
+      <<: *jwt-env
       MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
@@ -432,7 +469,7 @@ services:
     container_name: sfo-order-service
     restart: always
     environment:
-      <<: *order-db-env
+      <<: [*order-db-env, *jwt-env]
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
@@ -451,7 +488,7 @@ services:
     container_name: sfo-payment-service
     restart: always
     environment:
-      <<: *payment-db-env
+      <<: [*payment-db-env, *jwt-env]
       ORDER_SERVICE_URL: http://order-service:8004
     depends_on:
       db-payment-postgres:
