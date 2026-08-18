@@ -24,12 +24,14 @@ class RestaurantRepository:
     def __init__(self, db: PostgresPool):
         self._db = db
 
-    def onboard(self, payload: RestaurantOnboardRequest) -> dict:
+    def onboard(self, payload: RestaurantOnboardRequest, owner_id: UUID) -> dict:
+        """Insert a restaurant. `owner_id` is passed separately because it comes from the
+        access token rather than the request body — see main.onboard_restaurant."""
         with self._db.cursor(commit=True) as cur:
             cur.execute(
                 _INSERT_RESTAURANT,
                 (
-                    str(payload.owner_id),
+                    str(owner_id),
                     payload.name,
                     payload.address,
                     payload.latitude,

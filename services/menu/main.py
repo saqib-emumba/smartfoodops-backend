@@ -8,10 +8,11 @@ touches PostgreSQL.
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import FastAPI, status
+from fastapi import Depends, FastAPI, status
 
 from clients import RestaurantServiceClient
-from common.errors import not_found
+from common.auth import Principal, current_principal, require_internal, require_role
+from common.errors import forbidden, not_found
 from common.logging_config import configure_logging
 from datastores import DocumentStores
 from repository import MenuRepository
@@ -45,18 +46,38 @@ async def health():
 
 
 @app.post("/api/v1/menus", response_model=MenuResponse)
-async def upsert_menu(payload: MenuUpsertRequest) -> MenuResponse:
-    """Upsert the full category/item/customization tree for one restaurant."""
-    await restaurant_service.verify_active(payload.restaurant_id)
+async def upsert_menu(
+    payload: MenuUpsertRequest,
+    principal: Principal = Depends(require_role("restaurant_admin")),
+) -> MenuResponse:
+    """Upsert the full category/item/customization tree for one restaurant.
+
+    Holding the `restaurant_admin` role is not enough — the caller must own *this*
+    restaurant, or any restaurant admin could rewrite a competitor's prices.
+    """
+    restaurant = await restaurant_service.verify_active(
+        payload.restaurant_id, principal.token
+    )
+    if str(restaurant.get("owner_id")) != str(principal.user_id) and not principal.is_admin:
+        raise forbidden(f"You do not own restaurant {payload.restaurant_id}")
 
     categories = [category.model_dump() for category in payload.categories]
     document = await menus.upsert_menu(payload.restaurant_id, categories)
     return _as_response(document)
 
 
-@app.post("/api/v1/menus/logs", status_code=status.HTTP_201_CREATED)
+@app.post(
+    "/api/v1/menus/logs",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_internal)],
+)
 async def log_order_status(payload: OrderTrackingLogCreateRequest):
-    """Append a status transition to the order's `order_tracking_logs` document."""
+    """Append a status transition to the order's `order_tracking_logs` document.
+
+    Service-to-service only, on the internal key rather than a bearer token. The Order
+    Service calls this on a customer's behalf, but the customer must not be able to call
+    it themselves: the audit trail cannot be writable by the party it is about.
+    """
     entry = {
         "status": payload.status,
         "timestamp": datetime.now(timezone.utc),
@@ -76,8 +97,15 @@ async def log_order_status(payload: OrderTrackingLogCreateRequest):
 
 
 @app.get("/api/v1/menus/{restaurant_id}", response_model=MenuResponse)
-async def get_menu(restaurant_id: UUID) -> MenuResponse:
-    """Serve the active menu tree — used by the Order Service to price a checkout."""
+async def get_menu(
+    restaurant_id: UUID,
+    _: Principal = Depends(current_principal),
+) -> MenuResponse:
+    """Serve the active menu tree — used by the Order Service to price a checkout.
+
+    Any authenticated caller: customers browse it, and the Order Service reads it while
+    forwarding the customer's own token.
+    """
     document = await menus.find_menu(restaurant_id)
     if document is None:
         raise not_found(f"No menu published for restaurant {restaurant_id}")

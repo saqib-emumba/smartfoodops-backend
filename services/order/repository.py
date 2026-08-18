@@ -5,7 +5,8 @@ race to a concurrent submission is resolved here rather than by application-leve
 
 `customer_id` and `restaurant_id` are plain UUID columns: they point into other services'
 databases, where no foreign key can follow them, so main.py verifies both over HTTP before
-calling in here.
+calling in here. `customer_id` additionally never comes from the client — it is the subject
+of the verified access token.
 """
 
 from decimal import Decimal
@@ -50,16 +51,19 @@ class OrderRepository:
     def create(
         self,
         payload: OrderCreateRequest,
+        customer_id: UUID,
         items_snapshot: list[dict],
         total: Decimal,
         idempotency_key: str,
     ) -> dict:
+        """Insert an order. `customer_id` is passed separately because it comes from the
+        access token rather than the request body — see main.create_order."""
         with self._db.cursor(commit=True) as cur:
             try:
                 cur.execute(
                     _INSERT_ORDER,
                     (
-                        str(payload.customer_id),
+                        str(customer_id),
                         str(payload.restaurant_id),
                         Json(items_snapshot),
                         total,

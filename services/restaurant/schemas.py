@@ -6,7 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class RestaurantOnboardRequest(BaseModel):
-    owner_id: UUID
+    # No owner_id: the owner is the subject of the access token. Taking it from the body
+    # would let anyone onboard a restaurant under another account's name.
     name: str = Field(..., min_length=2)
     address: str = Field(..., min_length=5)
     latitude: float = Field(..., ge=-90.0, le=90.0)

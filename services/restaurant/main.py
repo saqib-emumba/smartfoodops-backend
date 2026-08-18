@@ -6,9 +6,10 @@ resolved over HTTP against the User Service, whose database this service cannot 
 
 from uuid import UUID
 
-from fastapi import FastAPI, status
+from fastapi import Depends, FastAPI, status
 
 from clients import UserServiceClient
+from common.auth import Principal, current_principal, require_role
 from common.config import required
 from common.errors import not_found
 from common.logging_config import configure_logging
@@ -42,15 +43,29 @@ def health():
     response_model=RestaurantResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def onboard_restaurant(payload: RestaurantOnboardRequest) -> RestaurantResponse:
-    """Onboard a restaurant once its owner is verified through the User Service."""
-    user_service.verify_owner(payload.owner_id)
-    return RestaurantResponse(**restaurants.onboard(payload))
+def onboard_restaurant(
+    payload: RestaurantOnboardRequest,
+    principal: Principal = Depends(require_role("restaurant_admin")),
+) -> RestaurantResponse:
+    """Onboard a restaurant once its owner is verified through the User Service.
+
+    The owner is the token's subject, so a restaurant can only ever be onboarded under the
+    account making the request.
+    """
+    user_service.verify_owner(principal.user_id, principal.token)
+    return RestaurantResponse(**restaurants.onboard(payload, principal.user_id))
 
 
 @app.get("/api/v1/restaurants/{restaurant_id}", response_model=RestaurantResponse)
-def get_restaurant(restaurant_id: UUID) -> RestaurantResponse:
-    """Expose restaurant state (including is_active) for other services to verify."""
+def get_restaurant(
+    restaurant_id: UUID,
+    _: Principal = Depends(current_principal),
+) -> RestaurantResponse:
+    """Expose restaurant state (including is_active) for other services to verify.
+
+    Any authenticated caller: customers browsing and the Order and Menu Services checking
+    a restaurant all read the same non-sensitive record.
+    """
     row = restaurants.find(restaurant_id)
     if row is None:
         raise not_found(f"Restaurant {restaurant_id} not found")

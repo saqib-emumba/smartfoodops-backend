@@ -22,7 +22,8 @@ class OrderItemSnapshot(OrderItemSelection):
 
 
 class OrderCreateRequest(BaseModel):
-    customer_id: UUID
+    # No customer_id: the customer is whoever the access token says it is. Accepting it
+    # from the body would let any caller place an order in someone else's name.
     restaurant_id: UUID
     items: List[OrderItemSelection] = Field(..., min_length=1)
     total_amount: float = Field(..., gt=0.0)

@@ -8,6 +8,7 @@ import os
 from logging import Logger
 from uuid import UUID
 
+from common.auth import bearer
 from common.config import DEFAULT_USER_SERVICE_URL
 from common.errors import forbidden
 from common.service_client import ServiceClient
@@ -26,13 +27,19 @@ class UserServiceClient:
     def base_url(self) -> str:
         return self._client.base_url
 
-    def verify_owner(self, owner_id: UUID) -> dict:
-        """Confirm the owner exists and may onboard restaurants."""
+    def verify_owner(self, owner_id: UUID, token: str) -> dict:
+        """Confirm the owner exists and may onboard restaurants.
+
+        Looks redundant now that the access token carries a role, and is not: that claim
+        was true when the token was signed. An account demoted since then still presents a
+        valid token until it expires, and only this lookup notices.
+        """
         owner = self._client.get(
             f"/api/v1/users/{owner_id}",
             missing=f"Owner {owner_id} does not exist",
             unreachable_hint="cannot verify restaurant owner",
             bad_gateway_hint="verifying owner",
+            headers=bearer(token),
         )
         if owner.get("role") != OWNER_ROLE:
             raise forbidden(

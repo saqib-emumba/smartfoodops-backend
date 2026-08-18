@@ -9,6 +9,10 @@ pricing plus the audit trail against the Menu Service.
 An unknown customer or restaurant surfaces as 422 rather than 404, which is what the
 foreign-key violation these checks replace already returned: the request is well formed and
 the order is not the thing that is missing — the entity it points at is.
+
+Every lookup here runs as the customer who placed the order, by forwarding their bearer
+token, so this service can never read more than they could. The audit write is the one
+exception: it is not something a customer may do, so it authenticates as a service instead.
 """
 
 import json
@@ -16,6 +20,7 @@ import os
 from logging import Logger
 from uuid import UUID
 
+from common.auth import bearer, internal_headers
 from common.config import (
     DEFAULT_MENU_SERVICE_URL,
     DEFAULT_RESTAURANT_SERVICE_URL,
@@ -39,14 +44,19 @@ class UserServiceClient:
     def base_url(self) -> str:
         return self._client.base_url
 
-    def verify_customer(self, customer_id: UUID) -> dict:
-        """Confirm the customer exists — the check the `customer_id` foreign key made."""
+    def verify_customer(self, customer_id: UUID, token: str) -> dict:
+        """Confirm the customer exists — the check the `customer_id` foreign key made.
+
+        `customer_id` now comes from the token being forwarded, so this is a self-read and
+        satisfies the User Service's own self-or-admin rule.
+        """
         return self._client.get(
             f"/api/v1/users/{customer_id}",
             missing=f"Unknown customer {customer_id} referenced by this order",
             missing_error=unprocessable,
             unreachable_hint="cannot verify the customer",
             bad_gateway_hint="verifying the customer",
+            headers=bearer(token),
         )
 
 
@@ -60,7 +70,7 @@ class RestaurantServiceClient:
     def base_url(self) -> str:
         return self._client.base_url
 
-    def verify_restaurant(self, restaurant_id: UUID) -> dict:
+    def verify_restaurant(self, restaurant_id: UUID, token: str) -> dict:
         """Confirm the restaurant exists — the check the `restaurant_id` foreign key made.
 
         Existence only: whether a restaurant may currently take orders is the Menu
@@ -73,6 +83,7 @@ class RestaurantServiceClient:
             missing_error=unprocessable,
             unreachable_hint="cannot verify the restaurant",
             bad_gateway_hint="verifying the restaurant",
+            headers=bearer(token),
         )
 
 
@@ -85,12 +96,13 @@ class MenuServiceClient:
     def base_url(self) -> str:
         return self._client.base_url
 
-    def fetch_menu(self, restaurant_id: UUID) -> dict:
+    def fetch_menu(self, restaurant_id: UUID, token: str) -> dict:
         """Pull the restaurant's published menu, the source of truth for pricing."""
         return self._client.get(
             f"/api/v1/menus/{restaurant_id}",
             missing=f"No active menu found for restaurant {restaurant_id}",
             unreachable_hint="cannot validate the order",
+            headers=bearer(token),
         )
 
     def write_audit_log(self, order: dict, idempotency_key: str) -> bool:
@@ -98,6 +110,10 @@ class MenuServiceClient:
 
         Best-effort: the order is already committed, so a logging failure is reported but
         does not fail the client's request.
+
+        Authenticates as a service rather than forwarding the customer's token. Forwarding
+        would mean customers can write to the audit trail themselves, which would let the
+        record of what happened be written by the party it describes.
         """
         raw_log = json.dumps(
             {
@@ -116,5 +132,8 @@ class MenuServiceClient:
             "metadata": {"idempotency_key": idempotency_key},
         }
         return self._client.post_best_effort(
-            "/api/v1/menus/logs", body, purpose="audit log"
+            "/api/v1/menus/logs",
+            body,
+            purpose="audit log",
+            headers=internal_headers(),
         )
