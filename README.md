@@ -46,6 +46,11 @@ Four rules the code enforces deliberately:
 - The Payment Service never reads the `orders` table — it calls `GET /api/v1/orders/{id}`.
 - No service holds credentials for a database it does not own.
 
+**Why any of this is the way it is** —
+[readme/key-decisions.md](readme/key-decisions.md) is the decision record: each entry gives
+the choice, the alternative it was taken over, and what it costs. Start there when the
+question is "why not the other way?".
+
 **Why payments are their own service** — [readme/payments-service-migration.md](readme/payments-service-migration.md)
 has the full rationale; in short, card handling is the one part of the platform worth
 isolating for its own sake. The compliance boundary shrinks to one container and one
@@ -635,7 +640,7 @@ smartfoodops-backend/
 │   ├── order/                 # + clients.py, pricing.py (re-pricing rules)  (:8004)
 │   └── payment/               # + clients.py, gateway.py, amounts.py         (:8005)
 ├── scripts/smoke-test.sh      # End-to-end assertions across all five services
-├── readme/                    # Week 1 blueprints and contracts
+├── readme/                    # Blueprints, contracts, and the decision record
 ├── docker-compose.yml         # Orchestration
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
 └── .env                       # Local environment variables — gitignored, create it yourself
