@@ -14,7 +14,7 @@ import os
 from logging import Logger
 from uuid import UUID
 
-from common.auth import bearer
+from common.auth import bearer, internal_headers
 from common.config import DEFAULT_ORDER_SERVICE_URL
 from common.errors import unprocessable
 from common.service_client import ServiceClient
@@ -47,4 +47,25 @@ class OrderServiceClient:
             unreachable_hint="cannot verify the order",
             bad_gateway_hint="verifying the order",
             headers=bearer(token),
+        )
+
+    def fetch_order_internally(self, order_id: UUID) -> dict:
+        """Read an order on the internal key, for calls that have no user behind them.
+
+        The saga's payment activity needs the same authoritative `total_amount` that
+        `fetch_order` returns, but it holds no bearer token to forward: a workflow is not a
+        user, and a token placed in a workflow argument would be written into durable,
+        UI-visible history and would expire mid-saga anyway (D26).
+
+        The ownership check `fetch_order` gets for free is not lost, only moved. The saga
+        did not choose this order — it was started by an already-authorised
+        POST /api/v1/orders whose handler verified the caller owns it.
+        """
+        return self._client.get(
+            f"/api/v1/orders/{order_id}/internal",
+            missing=f"Unknown order {order_id} referenced by this payment",
+            missing_error=unprocessable,
+            unreachable_hint="cannot verify the order",
+            bad_gateway_hint="verifying the order",
+            headers=internal_headers(),
         )

@@ -16,14 +16,19 @@ from fastapi import Depends, FastAPI, Header, Response, status
 
 from amounts import assert_settles_order, to_cents
 from clients import OrderServiceClient
-from common.auth import Principal, require_role
+from common.auth import Principal, require_internal, require_role
 from common.config import required
-from common.errors import bad_request, not_found
+from common.errors import bad_request, not_found, unprocessable
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
 from gateway import MockPaymentGateway
 from repository import PaymentRepository
-from schemas import PaymentCreateRequest, PaymentResponse
+from schemas import (
+    PaymentAuthorizeRequest,
+    PaymentCreateRequest,
+    PaymentRefundRequest,
+    PaymentResponse,
+)
 
 SERVICE_NAME = "payment-service"
 DATABASE_URL = required("DATABASE_URL")
@@ -109,6 +114,107 @@ def process_payment(
     authorized = payments.mark_authorized(payment["id"], authorization.reference)
 
     return PaymentResponse(**authorized)
+
+
+@app.post(
+    "/api/v1/payments/authorize",
+    response_model=PaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_internal)],
+)
+def authorize_for_saga(
+    payload: PaymentAuthorizeRequest, response: Response
+) -> PaymentResponse:
+    """Authorise a payment on behalf of the order saga.
+
+    The same steps as `process_payment`, on the internal key instead of a customer token.
+    Since Week 2 this is how an order actually gets paid: the workflow authorises, and the
+    customer-facing endpoint above is left for direct and manual use (D30).
+
+    Dropping `require_role("customer")` does not drop the ownership guarantee, it relocates
+    it. The workflow did not choose this order — it was started by an already-authorised
+    `POST /api/v1/orders` whose handler had already established that the caller owns it. By
+    the time an activity runs there is no user in the request at all, which is exactly why
+    a forwarded bearer token could not have worked here (D26).
+
+    Idempotency needs no header: the key is derived from the order id by the workflow, so a
+    retried activity presents the same key and collides on the unique index rather than
+    charging a second time.
+    """
+    # (a) Replay protection first, so a retry never reaches the gateway.
+    existing = payments.find_by_idempotency_key(payload.idempotency_key)
+    if existing is not None:
+        response.status_code = status.HTTP_200_OK
+        logger.info("Idempotent saga replay for key %s", payload.idempotency_key)
+        return PaymentResponse(**existing)
+
+    # (b) The amount arrives as a string so it can be an exact Decimal here, and is then
+    # checked against the total the Order Service recalculated from the live menu (D07).
+    amount = to_cents(payload.amount)
+    order = order_service.fetch_order_internally(payload.order_id)
+    assert_settles_order(order, amount)
+
+    # (c) Claim the key with a `pending` row before charging, so a concurrent retry is
+    # rejected by the index rather than at the gateway.
+    payment = payments.create_pending(payload, amount)
+
+    authorization = gateway.authorize(
+        order_id=payload.order_id,
+        amount=amount,
+        idempotency_key=payload.idempotency_key,
+    )
+    return PaymentResponse(
+        **payments.mark_authorized(payment["id"], authorization.reference)
+    )
+
+
+@app.post(
+    "/api/v1/payments/refund",
+    response_model=PaymentResponse,
+    dependencies=[Depends(require_internal)],
+)
+def refund_for_saga(payload: PaymentRefundRequest) -> PaymentResponse:
+    """Release a hold the saga can no longer honour — its compensating action.
+
+    Idempotent by status rather than by key, and that distinction matters: Temporal retries
+    this until it succeeds, and a second refund is real money leaving. A payment already
+    `refunded` is returned unchanged without touching the gateway.
+
+    A payment still `pending` is refunded too. Those are the rows stranded when a gateway
+    call failed after the intent was recorded — the ones D10 knowingly accepted and nothing
+    in the platform has ever cleaned up. This is what sweeps them.
+
+    An order with no payment at all is `422`: the saga is compensating a step that never
+    completed, which is not an error in the request but is worth naming rather than
+    silently reporting success.
+    """
+    # Read first, so the gateway is told the real amount and so the two "nothing to do"
+    # cases are separated before any side effect rather than inferred after one.
+    existing = payments.find_by_order(payload.order_id)
+    if existing is None:
+        raise unprocessable(f"Order {payload.order_id} has no payment to refund")
+    if existing["status"] == "refunded":
+        logger.info("Payment for order %s was already refunded", payload.order_id)
+        return PaymentResponse(**existing)
+
+    refund = gateway.refund(
+        order_id=payload.order_id,
+        amount=to_cents(existing["amount"]),
+        idempotency_key=f"wf-refund-{payload.order_id}",
+    )
+    refunded = payments.mark_refunded(payload.order_id, refund.reference)
+    if refunded is None:
+        # A concurrent refund won the race between the read above and this update. Its
+        # result is the correct answer, so return that rather than failing the activity.
+        logger.info("Concurrent refund resolved order %s", payload.order_id)
+        return PaymentResponse(**payments.find_by_order(payload.order_id))
+
+    logger.info(
+        "Refunded payment for order %s (%s)",
+        payload.order_id,
+        payload.reason or "no reason given",
+    )
+    return PaymentResponse(**refunded)
 
 
 @app.get("/api/v1/payments/{payment_id}", response_model=PaymentResponse)

@@ -36,7 +36,7 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
 | :--- | :--- | :--- |
 | **Backend Framework** | Python, FastAPI | High-performance, async web services and API gateways. |
 | **Transactional Database** | PostgreSQL | ACID-compliant, relational storage for strict schemas (Users, Payments, Orders). |
-| **Flexible Storage** | NoSQL Database | Low-latency, hierarchical storage for highly dynamic schemas (Menus, Audit Logs). |
+| **Flexible Storage** | PostgreSQL `JSONB` | Hierarchical storage for dynamic schemas (Menus). Originally a separate NoSQL engine; dropped in favour of `JSONB` because the document shape was never the reason to run a second engine — see D22. Audit logs moved to a relational table beside the orders they describe (D24). |
 | **Caching Layer** | Redis | High-speed cache for menu-reads and user sessions to bypass database hits. |
 | **State Orchestration** | Temporal | Fault-tolerant workflow engine for complex multi-service transactions. |
 | **Asynchronous Workers** | Celery + RabbitMQ | Offloads heavy non-blocking background jobs (e.g., generating notifications, processing data). |
@@ -54,16 +54,22 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
 ```
   [Customer/Admin] -> [API Gateway (Nginx)]
                             |
-         +------------------+------------------+
-         |                  |                  |
-   [User Service]   [Restaurant/Menu]   [Orders Service]
-         |                  |                  |
-     (Postgres)          (NoSQL)       (Temporal Workflow)
-                                               |
-                                        +------+------+
-                                        |             |
-                                     (Kafka)      (Celery)
+    +----------+------------+------------+-----------+
+    |          |            |            |           |
+ [User]  [Restaurant]   [Menu]      [Orders]   [Payment] [Rider]
+    |          |            |            |           |       |
+(Postgres) (Postgres)  (Postgres    (Postgres +  (Postgres)(Postgres)
+                        JSONB           Temporal
+                        + Redis)        Workflow)
+                                             |
+                                      +------+------+
+                                      |             |
+                                   (Kafka)      (Celery)
 ```
+
+*Every service owns one physical database with its own credentials (D01). Redis serves the
+Menu Service as a cache (db 0) and the User Service as a session store (db 1). Kafka and
+Celery arrive in Week 3.*
 
 ### 3.1 Week 1 — Foundation & Core Services
 *   **Operational Goal:** Set up the modular directory layout, relational/non-relational schemas, and establish the API gateway and basic services.
@@ -96,12 +102,12 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
     *   If payment fails $\rightarrow$ Rollback order state and notify user.
     *   If restaurant rejects $\rightarrow$ Refund payment, cancel order.
     *   If rider assignment fails or times out $\rightarrow$ Reassign rider or execute compensation flow.
-*   **Week 2 Deliverables:**
-    *   [x] End-to-end functional Order workflow.
-    *   [x] Operational delivery assignment (rider dispatch) system.
-    *   [x] Enforced distributed order state machine.
-    *   [x] Integrated Temporal workflow engine.
-    *   [x] Basic failure handling (retries and rolling rollback/refund mechanisms).
+*   **Week 2 Deliverables:** *(in progress — see [week2-temporal-orchestration-blueprint.md](week2-temporal-orchestration-blueprint.md))*
+    *   [ ] End-to-end functional Order workflow.
+    *   [ ] Operational delivery assignment (rider dispatch) system.
+    *   [ ] Enforced distributed order state machine.
+    *   [ ] Integrated Temporal workflow engine.
+    *   [ ] Basic failure handling (retries and rolling rollback/refund mechanisms).
 
 ### 3.3 Week 3 — Event-Driven System & Observability
 *   **Operational Goal:** Transition the platform to use decoupled event streams, scale background tasks, and achieve telemetry-level system visibility.
@@ -112,12 +118,12 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
     *   Building real-time SMS/Email notification dispatchers triggered via event handlers.
     *   Constructing a background analytics event-pipeline to continuously harvest telemetry data.
     *   Enabling **Distributed Tracing** (Jaeger + OpenTelemetry) and **Metrics** (Prometheus + Grafana dashboards).
-*   **Week 3 Deliverables:**
-    *   [x] Fully decoupled, asynchronous event-driven core architecture.
-    *   [x] Operational Celery background processing worker pipeline.
-    *   [x] Functional analytics telemetry stream.
-    *   [x] Active Prometheus metric scraping and Grafana dashboard visualization.
-    *   [x] Deep distributed tracing showing end-to-end system flows.
+*   **Week 3 Deliverables:** *(not started)*
+    *   [ ] Fully decoupled, asynchronous event-driven core architecture.
+    *   [ ] Operational Celery background processing worker pipeline.
+    *   [ ] Functional analytics telemetry stream.
+    *   [ ] Active Prometheus metric scraping and Grafana dashboard visualization.
+    *   [ ] Deep distributed tracing showing end-to-end system flows.
 
 ---
 
@@ -141,11 +147,11 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
     *   Partitioning text and menu schemas into optimized chunks, generating vector representations using embeddings, and storing them in a **Vector Database**.
     *   Implementing **Semantic Search** engines allowing users to search across food items, specific cuisines, and relative dining attributes without relying on direct string-matching.
     *   Creating a multi-source retrieval pipeline that serves context directly to the LLM-powered recommendation engine.
-*   **Week 4 Deliverables:**
-    *   [x] Robust, active menu embedding data pipeline.
-    *   [x] Populated and queryable Vector Database.
-    *   [x] Functional semantic search API over restaurants, cuisines, and menus.
-    *   [x] High-performance retrieval APIs feeding contextual system prompts.
+*   **Week 4 Deliverables:** *(not started)*
+    *   [ ] Robust, active menu embedding data pipeline.
+    *   [ ] Populated and queryable Vector Database.
+    *   [ ] Functional semantic search API over restaurants, cuisines, and menus.
+    *   [ ] High-performance retrieval APIs feeding contextual system prompts.
 
 ### 4.2 Week 5 — AI Assistant & Streaming Response Engine
 *   **Operational Goal:** Deliver a real-time, context-aware, low-latency Conversational Assistant to users.
@@ -155,11 +161,11 @@ SmartFoodOps utilizes a decoupled, modern backend and observability stack design
     *   Designing generative **Restaurant Support Tools** to auto-generate menu descriptions, promotional offers, and customer engagement emails.
     *   Implementing **Streaming Response API** protocols (e.g., SSE) to handle conversational outputs smoothly and bypass long blocking latencies.
     *   Using advanced **Prompt Engineering** and Guardrails to mitigate hallucinations and restrict responses strictly to grounded menus.
-*   **Week 5 Deliverables:**
-    *   [x] Fully functional conversational AI Food Assistant.
-    *   [x] Context-aware meal recommendation and support engines.
-    *   [x] Implemented streaming outputs for real-time customer UX.
-    *   [x] End-to-end integration combining Core Orchestration with LLM intelligence.
+*   **Week 5 Deliverables:** *(not started)*
+    *   [ ] Fully functional conversational AI Food Assistant.
+    *   [ ] Context-aware meal recommendation and support engines.
+    *   [ ] Implemented streaming outputs for real-time customer UX.
+    *   [ ] End-to-end integration combining Core Orchestration with LLM intelligence.
 
 ---
 

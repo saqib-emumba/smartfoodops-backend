@@ -1,7 +1,7 @@
 """Pydantic v2 validation schemas for the SmartFoodOps Order Service."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -37,6 +37,10 @@ class OrderResponse(BaseModel):
     id: UUID
     customer_id: UUID
     restaurant_id: UUID
+    # Written by the saga when a rider is assigned. The column has existed since Week 1 and
+    # nothing ever set it; the dispatch step is the first thing that does. Additive, so the
+    # Payment Service and the smoke test read the same shape they always did.
+    rider_id: Optional[UUID] = None
     items: List[OrderItemSnapshot]
     total_amount: float
     status: str
@@ -60,6 +64,18 @@ class OrderTrackingLogCreateRequest(BaseModel):
     raw_log: str
     updated_by: Optional[str] = "system"
     metadata: Optional[dict] = None
+
+
+class WorkflowSignalRequest(BaseModel):
+    """One event reported by a sibling service, on its way into the order's workflow.
+
+    `signal` is constrained to the three the workflow actually handles, so a typo is a 422
+    here rather than a signal Temporal accepts and nothing ever reads — an unhandled signal
+    name is silently dropped by the SDK, which would be an event that vanishes.
+    """
+
+    signal: Literal["restaurant_decision", "rider_pickup", "rider_delivery"]
+    payload: dict = {}
 
 
 class OrderTrackingLogResponse(BaseModel):

@@ -7,7 +7,7 @@ echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
 echo "📂 Creating services, gateway and per-service database directories..."
-mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu},services/{common,user,restaurant,menu,order,payment}}
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu,rider},services/{common,user,restaurant,menu,order,payment,rider}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
@@ -22,6 +22,12 @@ RESTAURANT_POSTGRES_PASSWORD=sfo_restaurant_password_123
 ORDER_POSTGRES_PASSWORD=sfo_order_password_123
 PAYMENT_POSTGRES_PASSWORD=sfo_payment_password_123
 MENU_POSTGRES_PASSWORD=sfo_menu_password_123
+RIDER_POSTGRES_PASSWORD=sfo_rider_password_123
+
+# Redis. docker-compose.yml sets the per-service URL literally (database 0 for the Menu
+# Service's cache, database 1 for the User Service's sessions), so this is only read by
+# tooling run outside Compose.
+REDIS_URL=redis://cache-redis:6379/0
 
 # Services Endpoints (Within Docker Network)
 USER_SERVICE_URL=http://user-service:8001
@@ -29,6 +35,11 @@ RESTAURANT_SERVICE_URL=http://restaurant-service:8002
 MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
+RIDER_SERVICE_URL=http://rider-service:8006
+
+# Temporal dev server. docker-compose.yml sets this per-container as well; it is here so
+# scripts and a worker run outside Compose read the same address.
+TEMPORAL_ADDRESS=temporal-server:7233
 EOF
 
 # 2b. Generate the token signing material.
@@ -61,9 +72,17 @@ cat << 'EOF' > db/user/init.sql
 -- ============================================================================
 -- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
 --
--- Owns identity: `roles`, `users` and the `riders` profile extension. Only the
--- User Service connects here; every other service reads a profile through
+-- Owns identity and nothing else: `roles` and `users`. Only the User Service
+-- connects here; every other service reads a profile through
 -- GET /api/v1/users/{user_id}.
+--
+-- `riders` used to live here too, on the argument that a rider is an extension of
+-- a user identity and the foreign key to `users` was worth keeping. Week 2 moved it
+-- to sfo_rider_core (D28): the Rider Service needs to write availability and
+-- location on every dispatch, and under D01 a service may not write another
+-- service's tables. The foreign key was the cost of that move — `riders.user_id`
+-- is now a plain UUID verified over HTTP, like every other cross-service
+-- reference (D02).
 -- ============================================================================
 
 -- Enable UUID extension for secure, non-sequential IDs
@@ -99,23 +118,6 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Case-insensitive unique constraint index for emails (prevent duplicate registrations)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
-
--- 2. Riders Table
--- A rider is an extension of a user identity, so it stays in this database where the
--- foreign key to `users` is still enforceable. Orders reference a rider by id only.
-CREATE TABLE IF NOT EXISTS riders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    vehicle_type VARCHAR(100) NOT NULL,
-    vehicle_number VARCHAR(100) UNIQUE NOT NULL,
-    is_available BOOLEAN NOT NULL DEFAULT TRUE,
-    current_latitude DECIMAL(9, 6),
-    current_longitude DECIMAL(9, 6),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_riders_availability ON riders(is_available);
 EOF
 
 cat << 'EOF' > db/restaurant/init.sql
@@ -123,8 +125,9 @@ cat << 'EOF' > db/restaurant/init.sql
 -- Restaurant Service database — sfo_restaurant_core
 -- (container sfo-restaurant-db, host port 5433)
 --
--- Owns `restaurants`. Only the Restaurant Service connects here; every other
--- service reads a restaurant through GET /api/v1/restaurants/{restaurant_id}.
+-- Owns `restaurants` and the `order_tickets` kitchen queue. Only the Restaurant
+-- Service connects here; every other service reads a restaurant through
+-- GET /api/v1/restaurants/{restaurant_id}.
 -- ============================================================================
 
 -- Enable UUID extension for secure, non-sequential IDs
@@ -151,6 +154,41 @@ CREATE INDEX IF NOT EXISTS idx_restaurants_geo ON restaurants(latitude, longitud
 
 -- Owner lookups ("list my restaurants") scan by owner, so index the reference.
 CREATE INDEX IF NOT EXISTS idx_restaurants_owner ON restaurants(owner_id);
+
+-- 2. Order Tickets (the kitchen queue) — added in Week 2.
+--
+-- A ticket is one order presented to one kitchen, and its status is the kitchen's
+-- answer. It exists because the order saga has to wait for a human to accept or
+-- decline: the Week 2 blueprint originally modelled acceptance as a synchronous
+-- HTTP call that returned the decision, which no real kitchen can do (D27).
+CREATE TYPE ticket_status AS ENUM ('pending', 'accepted', 'rejected', 'expired');
+
+CREATE TABLE IF NOT EXISTS order_tickets (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- orders.id, in sfo_order_core. UNIQUE rather than merely indexed: the workflow
+    -- activity that creates a ticket is retried on any transport failure, and the
+    -- second attempt must collide here instead of queueing the order twice.
+    order_id UUID UNIQUE NOT NULL,
+    -- Both ends of this reference live in this database, so unlike every other
+    -- cross-service reference in the platform it gets a real foreign key — the same
+    -- argument D24 made for moving the tracking trail beside the orders it
+    -- describes. A ticket for a restaurant that does not exist is refused by the
+    -- engine, and deleting a restaurant takes its queue with it.
+    restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+    -- The lines as priced by the Order Service, so the kitchen sees what was bought
+    -- without a call back. A snapshot, not a live reference.
+    items JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status ticket_status NOT NULL DEFAULT 'pending',
+    decided_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Serves both reads that matter: the admin's queue ("my pending tickets, oldest
+-- first") and the capacity check that counts them. Both filter on
+-- (restaurant_id, status) and order by arrival, so one index covers them.
+CREATE INDEX IF NOT EXISTS idx_tickets_queue
+    ON order_tickets (restaurant_id, status, created_at);
 EOF
 
 cat << 'EOF' > db/order/init.sql
@@ -307,6 +345,86 @@ CREATE TABLE IF NOT EXISTS menus (
 -- then it is a write cost on every publish for a query nobody issues.
 EOF
 
+cat << 'EOF' > db/rider/init.sql
+-- ============================================================================
+-- Rider Service database — sfo_rider_core (container sfo-rider-db, host port 5437)
+--
+-- Owns the delivery fleet: who the riders are, where they are, and which order
+-- each is carrying. Only the Rider Service connects here.
+--
+-- This table lived in sfo_user_core through Week 1, where a rider was treated as
+-- an extension of a user identity and got a real foreign key to `users`. Week 2
+-- moved it (D28): dispatch writes `is_available` and `current_order_id` on every
+-- assignment, and under D01 a service may not write another service's tables.
+-- The foreign key was the price of the move — `user_id` is now a plain UUID
+-- verified over HTTP before the insert, like every other cross-service reference
+-- in the platform (D02).
+-- ============================================================================
+
+-- Enable UUID extension for secure, non-sequential IDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Great-circle distance in kilometres between two coordinate pairs.
+--
+-- This is the platform's first database function, and it exists because distance
+-- is needed inside the dispatch query's ORDER BY. Computing it in Python instead
+-- would mean reading every available rider into the service to sort them, which
+-- is what makes the row-level lock in that query impossible to express.
+--
+-- Plain `LANGUAGE sql` rather than PL/pgSQL so the planner can inline it, and
+-- IMMUTABLE so a functional index on it stays available if the fleet ever
+-- outgrows a sequential scan over the partial index below.
+CREATE OR REPLACE FUNCTION haversine_km(
+    lat1 DOUBLE PRECISION, lon1 DOUBLE PRECISION,
+    lat2 DOUBLE PRECISION, lon2 DOUBLE PRECISION
+) RETURNS DOUBLE PRECISION AS $$
+    SELECT 6371.0 * 2 * asin(sqrt(
+        power(sin(radians(lat2 - lat1) / 2), 2)
+        + cos(radians(lat1)) * cos(radians(lat2))
+        * power(sin(radians(lon2 - lon1) / 2), 2)
+    ));
+$$ LANGUAGE sql IMMUTABLE PARALLEL SAFE;
+
+-- 1. Riders Table (the delivery fleet)
+CREATE TABLE IF NOT EXISTS riders (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- Points at users(id) in sfo_user_core. No foreign key can follow it across a
+    -- database boundary, so the Rider Service verifies the account exists and
+    -- currently holds the `rider` role over HTTP before inserting (D02, D18).
+    user_id UUID UNIQUE NOT NULL,
+    vehicle_type VARCHAR(100) NOT NULL,
+    vehicle_number VARCHAR(100) UNIQUE NOT NULL,
+    is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    current_latitude DECIMAL(9, 6),
+    current_longitude DECIMAL(9, 6),
+    -- The order this rider is currently carrying, in sfo_order_core. Two things
+    -- depend on it: a retried dispatch activity finds the order already held and
+    -- returns the same rider instead of claiming a second one, and pickup and
+    -- delivery are authorised from this row rather than by asking the Order
+    -- Service who was assigned (D16 — one place decides).
+    current_order_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Only the rows dispatch can actually choose from. Partial, because a rider who
+-- is busy or has never reported a location is never a candidate and does not
+-- belong in the index at all — on a fleet where most riders are mid-delivery at
+-- peak hour, that is most of the table.
+CREATE INDEX IF NOT EXISTS idx_riders_dispatchable
+    ON riders (is_available)
+    WHERE is_available AND current_latitude IS NOT NULL AND current_longitude IS NOT NULL;
+
+-- At most one rider per order, enforced by the engine rather than by a check in
+-- Python. This is what makes a retried dispatch activity unable to strand a rider:
+-- claiming a second one for an order that already has one is refused here, the
+-- same argument D24 made for putting the tracking trail where its foreign key
+-- could be enforced.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_riders_current_order
+    ON riders (current_order_id)
+    WHERE current_order_id IS NOT NULL;
+EOF
+
 # 4. Write out the Docker Compose orchestration configuration
 echo "🐳 Generating docker-compose.yml..."
 cat << 'EOF' > docker-compose.yml
@@ -322,7 +440,9 @@ volumes:
   order_postgres_data:
   payment_postgres_data:
   menu_postgres_data:
+  rider_postgres_data:
   redis_data:
+  temporal_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
 # its own credentials, so no service can reach another's tables even by accident.
@@ -350,6 +470,11 @@ x-payment-db-env: &payment-db-env
 # credential like everybody else — the one service that used to be exempt.
 x-menu-db-env: &menu-db-env
   DATABASE_URL: postgresql://sfo_menu_admin:${MENU_POSTGRES_PASSWORD:?set MENU_POSTGRES_PASSWORD in the root .env}@db-menu-postgres:5432/sfo_menu_core
+
+# The `riders` table moved out of sfo_user_core in Week 2: dispatch writes availability and
+# location on every assignment, and a service may not write another service's tables.
+x-rider-db-env: &rider-db-env
+  DATABASE_URL: postgresql://sfo_rider_admin:${RIDER_POSTGRES_PASSWORD:?set RIDER_POSTGRES_PASSWORD in the root .env}@db-rider-postgres:5432/sfo_rider_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -444,6 +569,21 @@ services:
       - menu_postgres_data:/var/lib/postgresql/data
       - ./db/menu/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
+  # The delivery fleet. Its `riders` table shipped inside sfo_user_core in Week 1 with no
+  # code behind it; Week 2 gave it a service that writes to it, and therefore a database.
+  db-rider-postgres:
+    <<: *postgres-base
+    container_name: sfo-rider-db
+    environment:
+      POSTGRES_DB: sfo_rider_core
+      POSTGRES_USER: sfo_rider_admin
+      POSTGRES_PASSWORD: ${RIDER_POSTGRES_PASSWORD}
+    ports:
+      - "5437:5432" # Maps host 5437 to container 5432
+    volumes:
+      - rider_postgres_data:/var/lib/postgresql/data
+      - ./db/rider/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
   cache-redis:
     image: redis:7.0-alpine
     container_name: sfo-redis
@@ -460,6 +600,55 @@ services:
       timeout: 5s
       retries: 5
 
+  # --- 1b. WORKFLOW ORCHESTRATOR ---
+  # The all-in-one development server: gRPC API, Web UI and SQLite persistence in one
+  # container. `temporalio/temporal` is the CLI image and its entrypoint is the `temporal`
+  # binary, so the server is configured by flags below — not by environment variables.
+  #
+  # Three details are load-bearing and were each confirmed by running the container:
+  #
+  #   --ip defaults to "localhost", which is unreachable from sibling containers, so
+  #   0.0.0.0 is mandatory. --ui-ip defaults to --ip, so one flag covers both.
+  #
+  #   --db-filename lives under /home/temporal, not /var/lib/temporal. The image runs as
+  #   non-root uid 1000, and a named volume mounted where the image has no directory is
+  #   created root-owned, which fails with SQLite's CANTOPEN. /home/temporal is owned by
+  #   uid 1000 in the image, so the fresh volume inherits that owner.
+  #
+  #   --metrics-port is pinned rather than left to a random free port, so Week 3's
+  #   Prometheus has a stable scrape target.
+  temporal-server:
+    image: temporalio/temporal:1.8.2
+    container_name: sfo-temporal-server
+    restart: always
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "7233"
+      - --ui-port
+      - "8233"
+      - --metrics-port
+      - "9233"
+      - --db-filename
+      - /home/temporal/temporal.db
+    ports:
+      - "7233:7233" # gRPC workflow API, used by the order service and its worker
+      - "8233:8233" # Web UI. Deliberately not behind the gateway: it has no auth.
+      - "9233:9233" # Prometheus metrics (Week 3)
+    volumes:
+      - temporal_data:/home/temporal
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      # `nc` is not in this image, but the `temporal` CLI is — it is the entrypoint.
+      test: ["CMD", "temporal", "operator", "namespace", "list", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # --- 2. API GATEWAY (NGINX REVERSE PROXY) ---
   api-gateway:
     image: nginx:alpine
@@ -475,6 +664,7 @@ services:
       - menu-service
       - order-service
       - payment-service
+      - rider-service
     networks:
       - smartfoodops-network
 
@@ -547,8 +737,13 @@ services:
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
+      # This service starts the saga and relays signals into it. It runs no activities —
+      # that is order-worker's job, below.
+      TEMPORAL_ADDRESS: temporal-server:7233
     depends_on:
       db-order-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -566,6 +761,53 @@ services:
       ORDER_SERVICE_URL: http://order-service:8004
     depends_on:
       db-payment-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # Owns the delivery fleet. It reads the User Service to confirm an account really holds
+  # the `rider` role, and the Restaurant Service for the coordinates dispatch measures
+  # from; it reaches the Order Service only to relay pickup and delivery signals.
+  rider-service:
+    build:
+      context: ./services
+      dockerfile: rider/Dockerfile
+    container_name: sfo-rider-service
+    restart: always
+    environment:
+      <<: [*rider-db-env, *jwt-env]
+      USER_SERVICE_URL: http://user-service:8001
+      ORDER_SERVICE_URL: http://order-service:8004
+    depends_on:
+      db-rider-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 4. TEMPORAL WORKER ---
+  # Executes the workflow and its activities. It shares the Order Service's image because
+  # the order lifecycle is that service's code and its fact; only the command differs.
+  #
+  # It needs every sibling URL that order-service does not, because the activities are what
+  # actually call payments, restaurants and riders — and it needs the order database
+  # directly, since a status transition and its trail entry are one local transaction.
+  order-worker:
+    build:
+      context: ./services
+      dockerfile: order/Dockerfile
+    container_name: sfo-order-worker
+    restart: always
+    command: ["python", "worker.py"]
+    environment:
+      <<: [*order-db-env, *jwt-env]
+      TEMPORAL_ADDRESS: temporal-server:7233
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8005
+      RIDER_SERVICE_URL: http://rider-service:8006
+    depends_on:
+      db-order-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -633,6 +875,19 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         }
+
+        # 🛵 Route Rider service requests
+        location /api/v1/riders {
+            proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        # The Temporal Web UI (localhost:8233) is deliberately absent. It is an operator
+        # tool with no authentication of its own, so proxying it through the public gateway
+        # would publish every workflow's history — including the arguments each was started
+        # with. Reach it directly on the host instead.
 
         # Global health check endpoint
         location /health {

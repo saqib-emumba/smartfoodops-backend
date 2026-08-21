@@ -4,11 +4,19 @@ Copy-pasteable `curl` commands for exercising every service by hand, grouped by 
 ordered so that IDs captured early feed the calls that follow.
 
 For an automated pass instead, run [`scripts/smoke-test.sh`](../scripts/smoke-test.sh) — it
-covers everything below with assertions and an exit code. Use this document when you want to
-poke at one endpoint, see a raw response, or demo the flow.
+covers everything below with assertions and an exit code, and
+[`scripts/saga-resilience-test.sh`](../scripts/saga-resilience-test.sh) adds the concurrency
+and worker-restart cases. Use this document when you want to poke at one endpoint, see a raw
+response, or demo the flow.
 
 All traffic goes through the Nginx gateway on port **80**; no service port is published by
-default.
+default. The one exception is the **Temporal Web UI** on <http://localhost:8233>, which is
+reached directly — it has no authentication of its own, so putting it behind the public
+gateway would publish every workflow's history.
+
+Sections 1–7 are Week 1: one request at a time. **Section 8 is the order saga**, where the
+lifecycle is driven by a durable workflow rather than by the caller — which is also where the
+Week 1 payment flow changed (see the note at section 5).
 
 ---
 
@@ -70,14 +78,19 @@ Health endpoints stay public — a probe must not need a credential.
 Every service exposes a health endpoint that also round-trips its datastore.
 
 ```bash
-for p in users restaurants menus orders payments; do
+for p in users restaurants menus orders payments riders; do
   printf '%-14s ' "$p"
   curl -s -w ' [%{http_code}]\n' "$BASE/api/v1/$p/health"
 done
 ```
 
-All five return `200`. A `200` carrying `"database_reachable": false` means the app is up but
+All six return `200`. A `200` carrying `"database_reachable": false` means the app is up but
 its store is not — check `docker compose ps`.
+
+Two flags are softer than the rest, deliberately. The Menu Service's
+`"cache_reachable": false` still serves menus, straight from Postgres, because the cache is a
+copy and never the source of truth. The Order Service's `"temporal_reachable": false` still
+accepts and serves orders; what stops is sagas *advancing* them.
 
 ---
 
@@ -593,47 +606,60 @@ Order Service.
 The card gateway is simulated in Week 1 — an authorised payment comes back with a
 `ch_mock_…` reference rather than a real charge id.
 
-### 5.1 Authorise a payment → `201`
+> **This section changed in Week 2.** The saga now authorises payment as its first step, so
+> there is normally nothing to call here. `POST /api/v1/payments` still exists for direct and
+> manual use, but for an order the saga owns it returns `409` — `payments.order_id` is
+> `UNIQUE`, and the workflow got there first. D30 records why.
 
-`X-Idempotency-Key` is mandatory **and** must equal the `idempotency_key` in the body:
+### 5.1 Watch the saga authorise it
 
 ```bash
-export PAY_IDEM="pay-$RUN"
+sleep 3
+curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | pretty
+# -> "status": "confirmed"
+```
 
-export PAYMENT_ID=$(curl -s -X POST "$BASE/api/v1/payments" \
-  -H "Authorization: Bearer $CUSTOMER" \
-  -H 'Content-Type: application/json' \
-  -H "X-Idempotency-Key: $PAY_IDEM" \
-  -d "{
-    \"order_id\": \"$ORDER_ID\",
-    \"amount\": 27.00,
-    \"idempotency_key\": \"$PAY_IDEM\"
-  }" | field "['id']")
+The stored payment reads `"status": "authorized"` with a `ch_mock_…`
+`transaction_reference`, and its idempotency key is `wf-pay-$ORDER_ID` — derived from the
+order rather than client-chosen, which is what makes a retried activity collide on the unique
+index instead of charging twice. The row is written `pending` *before* the gateway is called
+and moved to `authorized` after it answers, so a gateway failure leaves a `pending` row and
+nothing charged. Since Week 2 those stranded rows are swept: the compensation path refunds
+`pending` as well as `authorized`.
+
+The customer no longer learns the payment id from any response, so read it from the database
+when you need it by hand:
+
+```bash
+export PAYMENT_ID=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core \
+  -tA -c "SELECT id FROM payments WHERE order_id = '$ORDER_ID';" | tr -d '[:space:]')
 echo "PAYMENT_ID=$PAYMENT_ID"
 ```
 
-The response reads `"status": "authorized"` with a `transaction_reference`. The row is
-written as `pending` *before* the gateway is called and moved to `authorized` after it
-answers, so a gateway failure leaves a `pending` row and nothing charged.
-
-### 5.2 Replay the same key → `200`
+### 5.2 Paying by hand for a saga-owned order → `409`
 
 ```bash
+export PAY_IDEM="pay-$RUN"
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
   -H "X-Idempotency-Key: $PAY_IDEM" \
   -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM\"}"
+# -> 409 {"detail":"Order ... has already been paid for"}
 ```
 
-Same id, status `200`, and the gateway is never called a second time — that is the
-double-charge protection.
+One payment per order is a unique constraint, not a convention. `X-Idempotency-Key` is still
+mandatory here **and** must equal the `idempotency_key` in the body, so the two `400`s in the
+edge-case table below are unchanged.
 
 ### 5.3 Fetch a payment → `200`
 
 ```bash
 curl -s "$BASE/api/v1/payments/$PAYMENT_ID" -H "Authorization: Bearer $CUSTOMER" | pretty
 ```
+
+Ownership is settled by reading the order as the caller, so this answers `403` for someone
+else's payment without the Payment Service holding an opinion about who owns what.
 
 ### Edge cases
 
@@ -809,18 +835,236 @@ docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core \
 
 ---
 
+## 8. The order saga (Week 2)
+
+Everything above is one request at a time. This section drives a *process*: a Temporal
+workflow that starts when the order commits and runs until the food arrives. It waits on
+real people, so the commands below are interleaved with waiting — and every status check
+needs a moment, because a saga is eventually consistent by design.
+
+Watch it visually while you go: <http://localhost:8233>, workflow id `order-$ORDER_ID`. Every
+activity, retry, timer and signal is in the history.
+
+### 8.1 Set up a rider
+
+A rider is a user with the `rider` role who then enrols in the fleet. Both steps take
+identity from the token, so neither takes an id:
+
+```bash
+export RIDER_EMAIL="rider_$RUN@example.com"
+
+curl -s -X POST "$BASE/api/v1/users/register" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$RIDER_EMAIL\",\"password\":\"Passw0rd!\",\"full_name\":\"Test Rider\",
+       \"phone\":\"+1777$RANDOM\",\"role\":\"rider\"}" | pretty
+
+export RIDER=$(curl -s -X POST "$BASE/api/v1/users/login" -H 'Content-Type: application/json' \
+  -d "{\"email\":\"$RIDER_EMAIL\",\"password\":\"Passw0rd!\"}" | field "['access_token']")
+
+# Coordinates matter: dispatch measures distance from the restaurant, and a 10km radius
+# applies. Use the same lat/long the restaurant was onboarded with.
+export RIDER_ID=$(curl -s -X POST "$BASE/api/v1/riders" \
+  -H "Authorization: Bearer $RIDER" -H 'Content-Type: application/json' \
+  -d '{"vehicle_type":"motorbike","vehicle_number":"ISB-'$RANDOM'",
+       "current_latitude":33.68,"current_longitude":73.04}' | field "['id']")
+echo "RIDER_ID=$RIDER_ID"
+```
+
+| Scenario | Expected |
+|---|---|
+| A `customer` calling `POST /api/v1/riders` | `403` — wrong role in a valid token |
+| The same account enrolling twice | `409` — names the account, not the vehicle |
+| A duplicate `vehicle_number` | `409` — names the vehicle |
+| `current_latitude` of `120` | `422` |
+| Registering with no coordinates | `201`, but invisible to dispatch until a location is reported |
+
+A rider who has never reported a location cannot be dispatched: the partial index behind the
+search excludes null coordinates, because a rider whose position is unknown cannot be
+measured against a restaurant.
+
+```bash
+curl -s -X PATCH "$BASE/api/v1/riders/me/location" \
+  -H "Authorization: Bearer $RIDER" -H 'Content-Type: application/json' \
+  -d '{"current_latitude":33.68,"current_longitude":73.04}' | pretty
+
+curl -s "$BASE/api/v1/riders/me" -H "Authorization: Bearer $RIDER" | pretty
+```
+
+### 8.2 The kitchen's rail
+
+Placing an order (section 4) puts a ticket on the restaurant's rail and parks the saga on a
+durable timer. The owner reads their queue:
+
+```bash
+curl -s "$BASE/api/v1/restaurants/$REST_ID/tickets" -H "Authorization: Bearer $OWNER" | pretty
+```
+
+```bash
+# Accept -> the saga starts looking for a rider
+curl -s -X POST "$BASE/api/v1/restaurants/tickets/$ORDER_ID/accept" \
+  -H "Authorization: Bearer $OWNER" | pretty
+
+sleep 5
+curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | pretty
+# -> "status": "assigned", "rider_id": "..."
+```
+
+| Scenario | Expected |
+|---|---|
+| A `customer` accepting a ticket | `403` |
+| An owner accepting *another* owner's ticket | `403` — checked before anything is revealed |
+| Accepting twice | `200`, status unchanged, and the saga is **not** signalled again |
+| Accepting after the 120s window | `200` on the ticket, but the order is already `cancelled` |
+| A ticket for an unknown order | `404` |
+
+**Capacity.** `restaurants.capacity` is a count of *pending* tickets, and it is finally read
+by something. Onboard a restaurant with `"capacity": 1`, place two orders against it, and the
+second saga cancels with the kitchen never seeing it.
+
+### 8.3 Riding it out
+
+Only the rider whose own row records this order may report on it, which is why neither
+endpoint takes a rider id:
+
+```bash
+curl -s -w '[%{http_code}]\n' -X POST "$BASE/api/v1/riders/me/orders/$ORDER_ID/picked-up" \
+  -H "Authorization: Bearer $RIDER"          # -> 204
+
+sleep 3
+curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | field "['status']"
+# -> picked_up
+
+curl -s -w '[%{http_code}]\n' -X POST "$BASE/api/v1/riders/me/orders/$ORDER_ID/delivered" \
+  -H "Authorization: Bearer $RIDER"          # -> 204
+
+sleep 3
+curl -s "$BASE/api/v1/orders/$ORDER_ID/logs" -H "Authorization: Bearer $CUSTOMER" | pretty
+```
+
+The trail shows the whole lifecycle, with each `previous_status` derived from the entry
+before it rather than reported by anyone:
+
+```
+created -> confirmed -> assigned -> picked_up -> delivered
+```
+
+| Scenario | Expected |
+|---|---|
+| A different rider reporting this delivery | `403` — "you are not carrying order …" |
+| Going off shift while carrying an order | `409` |
+| Reporting on an order whose saga already finished | `404` from the signal relay |
+
+The rider is released by the *saga*, in the same step that records `delivered` — not by the
+delivery endpoint. That way availability and order state can never disagree:
+
+```bash
+docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core \
+  -c "SELECT vehicle_number, is_available, current_order_id FROM riders WHERE id = '$RIDER_ID';"
+```
+
+### 8.4 Making it fail on purpose
+
+The compensation paths are the interesting half. Each ends `cancelled` with the payment
+`refunded`, the rider released and the ticket retired.
+
+```bash
+# Place a fresh order first (section 4), then:
+
+# (a) The kitchen declines
+curl -s -X POST "$BASE/api/v1/restaurants/tickets/$ORDER_ID/reject" \
+  -H "Authorization: Bearer $OWNER" | pretty
+
+# (b) The kitchen says nothing — wait out the 120s window and do nothing at all
+
+# (c) Nobody is free to deliver: ground the fleet, then accept the ticket
+docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core \
+  -c "UPDATE riders SET is_available = FALSE;"
+# ...the saga tries 6 times, 10s apart, then gives up (~60s)
+```
+
+Check the outcome of any of them:
+
+```bash
+curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | field "['status']"
+# -> cancelled
+
+docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core \
+  -c "SELECT status, transaction_reference FROM payments WHERE order_id = '$ORDER_ID';"
+# -> refunded, re_mock_...   (a distinct prefix, so a refund is never read as a charge)
+
+docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core \
+  -c "SELECT count(*) FROM riders WHERE current_order_id IS NOT NULL;"
+# -> 0. A non-zero count after every saga has finished means a rider leaked.
+```
+
+Remember to put the fleet back after (c):
+
+```bash
+docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core \
+  -c "UPDATE riders SET is_available = TRUE WHERE current_order_id IS NULL;"
+```
+
+### 8.5 The internal boundary
+
+The saga's endpoints take `X-Internal-Key`, never a bearer token — a workflow has no user
+behind it, and a token in a workflow argument would be written into durable, UI-visible
+history (D26). Every one of these answers `401` with a user token, however privileged:
+
+```bash
+for p in "riders/dispatch" "riders/release" "payments/refund" "payments/authorize" \
+         "restaurants/tickets" "orders/$ORDER_ID/signals"; do
+  printf '%-34s ' "$p"
+  curl -s -o /dev/null -w '[%{http_code}]\n' -X POST "$BASE/api/v1/$p" \
+    -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' -d '{}'
+done
+```
+
+With the key, the signal relay is the one door into a running saga:
+
+```bash
+export INTERNAL_KEY=$(grep -m1 '^INTERNAL_API_KEY=' .env | cut -d= -f2-)
+
+# An invented signal name -> 422, rather than a signal Temporal accepts and nothing reads
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" \
+  -H "X-Internal-Key: $INTERNAL_KEY" -H 'Content-Type: application/json' \
+  -d '{"signal":"teleported","payload":{}}'
+
+# An order whose saga has finished -> 404, distinct from "no such order"
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" \
+  -H "X-Internal-Key: $INTERNAL_KEY" -H 'Content-Type: application/json' \
+  -d '{"signal":"rider_pickup","payload":{}}'
+```
+
+### 8.6 Asking the saga where it is
+
+A workflow query reads live state without touching the database — useful for "why is this
+order stuck?":
+
+```bash
+docker exec sfo-temporal-server temporal workflow query \
+  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID" --type stage
+# -> {"stage":"awaiting_kitchen","rider_id":null,...}
+
+# The full history, including every retry and timer
+docker exec sfo-temporal-server temporal workflow show \
+  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID"
+```
+
+---
+
 ## Status code reference
 
 | Code | Meaning in this system |
 |---|---|
-| `200` | Read succeeded, or an idempotent replay returned the stored order or payment |
+| `200` | Read succeeded, or an idempotent replay returned the stored order or payment. Also a *business* answer the saga acts on rather than retries — a full kitchen (`queued: false`) or an empty fleet (`assigned: false`) |
 | `201` | Resource created |
+| `202` | A signal was delivered to a running saga — told, not necessarily acted on |
+| `204` | Done, nothing to return: logout, and a rider reporting a pickup or delivery |
 | `400` | Missing required header, or a role name absent from the `roles` table |
 | `401` | No usable identity: no bearer token, or one malformed, expired or badly signed; a failed login; a spent refresh token; an internal endpoint reached without `X-Internal-Key`. Carries `WWW-Authenticate: Bearer` |
-| `403` | Authenticated, but not permitted: the wrong role for the action, or someone else's user, order or payment. Also what a downstream refusal becomes when a forwarded token is rejected |
-| `404` | Resource does not exist, or a restaurant is inactive |
-| `409` | Unique constraint hit — duplicate email or phone, an idempotency key race, or an order that already has a payment |
-| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item, payment that does not settle its order |
+| `403` | Authenticated, but not permitted: the wrong role for the action, or someone else's user, order, payment, restaurant queue or delivery. Also what a downstream refusal becomes when a forwarded token is rejected |
+| `404` | Resource does not exist, a restaurant is inactive, or an order has no running saga to signal |
+| `409` | Unique constraint or state conflict — duplicate email, phone or vehicle number; an idempotency key race; an order that already has a payment (including one the saga paid for); a rider trying to go off shift mid-delivery |
+| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item, payment that does not settle its order, an undefined order status, or an invented signal name |
 | `500` | This service failed its own job (e.g. connection pool starved) |
 | `502` | A dependency replied with something unusable |
 | `503` | A dependency is unreachable — safe to retry |

@@ -19,9 +19,19 @@ from uuid import UUID, uuid4
 _REFERENCE_PREFIX = "ch_mock"
 
 
+_REFUND_PREFIX = "re_mock"
+
+
 @dataclass(frozen=True)
 class Authorization:
     """What the gateway hands back once it has put a hold on the card."""
+
+    reference: str
+
+
+@dataclass(frozen=True)
+class Refund:
+    """What the gateway hands back once it has released a hold."""
 
     reference: str
 
@@ -47,3 +57,27 @@ class MockPaymentGateway:
             idempotency_key,
         )
         return Authorization(reference=reference)
+
+    def refund(
+        self, *, order_id: UUID, amount: Decimal, idempotency_key: str
+    ) -> Refund:
+        """Release a hold the saga can no longer honour.
+
+        Added in Week 2 for the compensation path. It belongs here for the same reason
+        `authorize` does: this is the one file that changes when a live gateway is wired
+        in, and keeping it away from the database means a gateway failure can never leave
+        a half-written row.
+
+        A distinct `re_` prefix rather than another `ch_`, so a refund and the charge it
+        reverses are never confused for each other in a log.
+        """
+        reference = f"{_REFUND_PREFIX}_{uuid4().hex[:24]}"
+        self._logger.info(
+            "Refunded %s for order %s via %s (reference %s, key %s)",
+            amount,
+            order_id,
+            self.name,
+            reference,
+            idempotency_key,
+        )
+        return Refund(reference=reference)

@@ -10,7 +10,9 @@ volumes:
   order_postgres_data:
   payment_postgres_data:
   menu_postgres_data:
+  rider_postgres_data:
   redis_data:
+  temporal_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
 # its own credentials, so no service can reach another's tables even by accident.
@@ -38,6 +40,11 @@ x-payment-db-env: &payment-db-env
 # credential like everybody else — the one service that used to be exempt.
 x-menu-db-env: &menu-db-env
   DATABASE_URL: postgresql://sfo_menu_admin:${MENU_POSTGRES_PASSWORD:?set MENU_POSTGRES_PASSWORD in the root .env}@db-menu-postgres:5432/sfo_menu_core
+
+# The `riders` table moved out of sfo_user_core in Week 2: dispatch writes availability and
+# location on every assignment, and a service may not write another service's tables.
+x-rider-db-env: &rider-db-env
+  DATABASE_URL: postgresql://sfo_rider_admin:${RIDER_POSTGRES_PASSWORD:?set RIDER_POSTGRES_PASSWORD in the root .env}@db-rider-postgres:5432/sfo_rider_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -132,6 +139,21 @@ services:
       - menu_postgres_data:/var/lib/postgresql/data
       - ./db/menu/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
+  # The delivery fleet. Its `riders` table shipped inside sfo_user_core in Week 1 with no
+  # code behind it; Week 2 gave it a service that writes to it, and therefore a database.
+  db-rider-postgres:
+    <<: *postgres-base
+    container_name: sfo-rider-db
+    environment:
+      POSTGRES_DB: sfo_rider_core
+      POSTGRES_USER: sfo_rider_admin
+      POSTGRES_PASSWORD: ${RIDER_POSTGRES_PASSWORD}
+    ports:
+      - "5437:5432" # Maps host 5437 to container 5432
+    volumes:
+      - rider_postgres_data:/var/lib/postgresql/data
+      - ./db/rider/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
   cache-redis:
     image: redis:7.0-alpine
     container_name: sfo-redis
@@ -148,6 +170,55 @@ services:
       timeout: 5s
       retries: 5
 
+  # --- 1b. WORKFLOW ORCHESTRATOR ---
+  # The all-in-one development server: gRPC API, Web UI and SQLite persistence in one
+  # container. `temporalio/temporal` is the CLI image and its entrypoint is the `temporal`
+  # binary, so the server is configured by flags below — not by environment variables.
+  #
+  # Three details are load-bearing and were each confirmed by running the container:
+  #
+  #   --ip defaults to "localhost", which is unreachable from sibling containers, so
+  #   0.0.0.0 is mandatory. --ui-ip defaults to --ip, so one flag covers both.
+  #
+  #   --db-filename lives under /home/temporal, not /var/lib/temporal. The image runs as
+  #   non-root uid 1000, and a named volume mounted where the image has no directory is
+  #   created root-owned, which fails with SQLite's CANTOPEN. /home/temporal is owned by
+  #   uid 1000 in the image, so the fresh volume inherits that owner.
+  #
+  #   --metrics-port is pinned rather than left to a random free port, so Week 3's
+  #   Prometheus has a stable scrape target.
+  temporal-server:
+    image: temporalio/temporal:1.8.2
+    container_name: sfo-temporal-server
+    restart: always
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --port
+      - "7233"
+      - --ui-port
+      - "8233"
+      - --metrics-port
+      - "9233"
+      - --db-filename
+      - /home/temporal/temporal.db
+    ports:
+      - "7233:7233" # gRPC workflow API, used by the order service and its worker
+      - "8233:8233" # Web UI. Deliberately not behind the gateway: it has no auth.
+      - "9233:9233" # Prometheus metrics (Week 3)
+    volumes:
+      - temporal_data:/home/temporal
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      # `nc` is not in this image, but the `temporal` CLI is — it is the entrypoint.
+      test: ["CMD", "temporal", "operator", "namespace", "list", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   # --- 2. API GATEWAY (NGINX REVERSE PROXY) ---
   api-gateway:
     image: nginx:alpine
@@ -163,6 +234,7 @@ services:
       - menu-service
       - order-service
       - payment-service
+      - rider-service
     networks:
       - smartfoodops-network
 
@@ -235,8 +307,13 @@ services:
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
+      # This service starts the saga and relays signals into it. It runs no activities —
+      # that is order-worker's job, below.
+      TEMPORAL_ADDRESS: temporal-server:7233
     depends_on:
       db-order-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -254,6 +331,53 @@ services:
       ORDER_SERVICE_URL: http://order-service:8004
     depends_on:
       db-payment-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # Owns the delivery fleet. It reads the User Service to confirm an account really holds
+  # the `rider` role, and the Restaurant Service for the coordinates dispatch measures
+  # from; it reaches the Order Service only to relay pickup and delivery signals.
+  rider-service:
+    build:
+      context: ./services
+      dockerfile: rider/Dockerfile
+    container_name: sfo-rider-service
+    restart: always
+    environment:
+      <<: [*rider-db-env, *jwt-env]
+      USER_SERVICE_URL: http://user-service:8001
+      ORDER_SERVICE_URL: http://order-service:8004
+    depends_on:
+      db-rider-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 4. TEMPORAL WORKER ---
+  # Executes the workflow and its activities. It shares the Order Service's image because
+  # the order lifecycle is that service's code and its fact; only the command differs.
+  #
+  # It needs every sibling URL that order-service does not, because the activities are what
+  # actually call payments, restaurants and riders — and it needs the order database
+  # directly, since a status transition and its trail entry are one local transaction.
+  order-worker:
+    build:
+      context: ./services
+      dockerfile: order/Dockerfile
+    container_name: sfo-order-worker
+    restart: always
+    command: ["python", "worker.py"]
+    environment:
+      <<: [*order-db-env, *jwt-env]
+      TEMPORAL_ADDRESS: temporal-server:7233
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      PAYMENT_SERVICE_URL: http://payment-service:8005
+      RIDER_SERVICE_URL: http://rider-service:8006
+    depends_on:
+      db-order-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network

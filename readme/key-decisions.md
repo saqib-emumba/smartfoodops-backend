@@ -41,6 +41,13 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) | MongoDB dropped; menus are JSONB in Postgres | 2026-08-21 | Accepted |
 | [D23](#d23--menus-are-read-through-a-redis-cache-aside-layer) | Menus are read through a Redis cache-aside layer | 2026-08-21 | Accepted |
 | [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) | The tracking trail moved into the order database | 2026-08-21 | Accepted |
+| [D25](#d25--temporal-orchestrates-the-order-lifecycle-and-the-workflow-id-is-the-order-id) | Temporal orchestrates; the workflow id is the order id | 2026-08-21 | Accepted |
+| [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) | The worker uses the internal key, never a bearer token | 2026-08-21 | Accepted |
+| [D27](#d27--restaurant-acceptance-is-a-signal-and-a-timer-not-a-synchronous-call) | Restaurant acceptance is a signal and a timer | 2026-08-21 | Accepted |
+| [D28](#d28--riders-got-their-own-service-and-database) | Riders got their own service and database | 2026-08-21 | Accepted |
+| [D29](#d29--dispatch-prevents-the-race-rather-than-detecting-it) | Dispatch prevents the race rather than detecting it | 2026-08-21 | Accepted |
+| [D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409) | The saga owns payment authorisation | 2026-08-21 | Accepted |
+| [D31](#d31--a-status-transition-is-a-compare-and-set-and-the-enum-supplies-the-ordering) | A status transition is a compare-and-set | 2026-08-21 | Accepted |
 
 ---
 
@@ -201,6 +208,11 @@ written `pending` first and moved to `authorized` after, which is exactly what m
 **Costs:** payments can strand at `pending` if the gateway call fails. Deliberate — that is
 the state the saga will reconcile — but nothing sweeps them today.
 
+> **Resolved 2026-08-21 by [D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409).** `POST /api/v1/payments/refund` moves `pending` rows as
+> well as `authorized` ones, so the saga's compensation path is what finally reconciles
+> them. `gateway.refund()` joined `authorize()` in the same seam, with `re_mock_` references
+> so a refund is never mistaken for the charge it reverses.
+
 ---
 
 ## Authentication and authorisation
@@ -287,6 +299,10 @@ different credential, not a different check.
 Justified only because it grants one narrow endpoint rather than the ability to mint
 identities. If internal-only endpoints multiply, per-service keypairs become the better
 answer.
+
+> **That condition was met on 2026-08-21.** [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) took the internal key from one endpoint to
+> eight, because the saga's worker has no user to forward. The reasoning above is unchanged
+> and the conclusion it warned about is now due.
 
 ### D16 — Each authorisation decision lives in exactly one place
 
@@ -486,6 +502,210 @@ sort of was — the write simply vanished.
 
 ---
 
+## The Week 2 saga
+
+Added 2026-08-21, implementing
+[week2-temporal-orchestration-blueprint.md](week2-temporal-orchestration-blueprint.md) —
+whose first revision would have regressed six of the decisions above, and whose Section 0
+records every departure from it.
+
+Before this, an order was `created` and stayed there. Nothing advanced it, the customer paid
+by calling the Payment Service themselves, `orders.rider_id` had never been written by any
+code, and `restaurants.capacity` had never been read.
+
+### D25 — Temporal orchestrates the order lifecycle, and the workflow id *is* the order id
+
+**Decided:** `POST /api/v1/orders` keeps every step it had — idempotency, server-side
+re-pricing, both HTTP verifications, the transactional insert of the order with the opening
+entry of its trail — and then starts an `OrderWorkflow` whose id is `order-{order_id}`,
+with `WorkflowIDConflictPolicy.USE_EXISTING`.
+
+**Instead of:** a status-poller or a cron sweeping `created` orders, or a queue message.
+
+**Why:** the lifecycle is a long-lived, failure-prone conversation with three other services
+that has to survive process death, and that is exactly the thing a workflow engine is for.
+The specific choice worth explaining is the *derived* id. Nothing records which workflow
+belongs to which order, because the id is a pure function of the order — which makes
+starting one idempotent for free, and makes the signal relay able to find a running saga
+from nothing but the order id in the URL.
+
+**Costs:** the start happens *after* the commit, and Temporal cannot enlist in a Postgres
+transaction, so "the order exists" and "its saga started" are not one atomic fact. Given
+the choice the order wins: it is what the customer was told about. A failed start leaves an
+order sitting at `created`, logged at error, repaired by a retry with the same idempotency
+key — the replay branch starts the saga too. This is D09's old argument resurfacing in a new
+place, and it resolves the same way: a write that already succeeded must not be reported as
+a failure.
+
+Also: `create_order` became `async def`, so its repository calls now run on the event loop
+rather than in FastAPI's threadpool.
+
+### D26 — The worker authenticates with the internal key, never a forwarded bearer
+
+**Decided:** activities call internal-key-guarded endpoints —
+`POST /api/v1/payments/authorize`, `/payments/refund`, `/restaurants/tickets`,
+`/riders/dispatch`, `/riders/release`, plus internal read paths on
+`GET /api/v1/orders/{id}/internal` and `/restaurants/{id}/internal`.
+
+**Instead of:** forwarding the customer's access token into the workflow, which is what
+every other cross-service call in the platform does (D15).
+
+**Why:** two independent reasons, either of which is decisive.
+
+* **A workflow argument is durable history.** Anything passed to `start_workflow` is
+  persisted by Temporal and rendered in its Web UI. Putting a bearer token there writes a
+  live credential into a log.
+* **Access tokens live 15 minutes.** A saga that waits on a kitchen and then searches for a
+  rider routinely outlives that, and a workflow has no refresh path.
+
+The ownership guarantee forwarding provided is not lost, only relocated: the saga did not
+choose its order, it was started by an already-authorised `POST /api/v1/orders` whose
+handler had established that the caller owns it.
+
+**Costs:** **this is the moment D15's own caveat fires.** D15 justified a shared symmetric
+secret on the grounds that it granted "one narrow endpoint rather than the ability to mint
+identities", and noted that "if internal-only endpoints multiply, per-service keypairs
+become the better answer". They have now multiplied — from one to eight. The debt is
+recorded rather than absorbed: per-service keypairs, or a signed service assertion, is the
+right answer before this list grows again.
+
+### D27 — Restaurant acceptance is a signal and a timer, not a synchronous call
+
+**Decided:** the saga posts a ticket to `order_tickets` and then waits on
+`workflow.wait_condition` with a 120-second timeout. A restaurant admin accepts or rejects
+at their own pace, and the Restaurant Service relays the decision through
+`POST /api/v1/orders/{id}/signals`. Rejection *and* silence both compensate.
+
+**Instead of:** the blueprint's synchronous `POST` returning `{"accepted": bool}`.
+
+**Why:** a real kitchen accepts when a human presses a button, which no HTTP response can
+wait for. And the synchronous version had a concrete bug: the rejection was raised as a
+plain exception inside a 3-attempt retry policy, so an order a restaurant had declined was
+re-sent to them twice more before the saga gave up. Temporal retries every exception except
+`ApplicationError(non_retryable=True)`, so the distinction between "the kitchen said no" and
+"the kitchen's service is down" has to be made explicit — and it is now made once, in the
+activity, rather than inferred from a status code at each call site.
+
+Waiting on a timer rather than a connection is the other half. A saga parked in
+`wait_condition` holds no thread, no connection and no memory in any service, and survives
+a worker restart — which the resilience test asserts by restarting the worker while an
+order sits there.
+
+**Costs:** a decision can be lost in flight. The Restaurant Service commits the ticket
+before relaying the signal and does not roll the decision back if the relay fails — the
+kitchen should not see an error for something they did successfully. The saga's own timeout
+is the backstop, which means a lost acceptance eventually reads as a refusal. That is the
+one hole this design keeps, and it is the remaining half of the open question D24 left.
+
+The timeout also created a second-order leak that had to be closed with it: capacity is a
+count of `pending` tickets, so a saga that gave up waiting left its ticket pending forever
+and permanently consumed a slot in that kitchen's queue. Compensation therefore expires the
+ticket (`POST /api/v1/restaurants/tickets/{order_id}/expire`, internal-key, `pending`-only
+so it can never overwrite a real decision) — which is what the `expired` member of
+`ticket_status` had been declared for since the table was created and nothing set.
+
+### D28 — Riders got their own service and database
+
+**Decided:** a Rider Service on 8006 with `sfo_rider_core`. The `riders` table moved out of
+`sfo_user_core`, and `riders.user_id` lost its foreign key to `users`.
+
+**Instead of:** adding rider endpoints to the User Service, which already owned the table —
+or the blueprint's version, which put a *new* service on port 8004 (colliding with the Order
+Service) and had it connect to `sfo_user_core` using the User Service's own credentials.
+
+**Why:** that last part is a direct violation of D01, and D01 is the decision the whole data
+layer rests on. Dispatch writes `is_available` and `current_order_id` on every assignment,
+so somebody has to own those columns; a service that writes another service's tables makes
+the credential boundary decorative. Keeping the table in `sfo_user_core` and putting the
+endpoints on the User Service would have been legal, but it makes the identity service also
+the logistics service, and the two have nothing to do with each other beyond a shared id.
+
+**Costs:** the foreign key from `riders.user_id` to `users.id` was the price. It is now a
+plain UUID verified over HTTP before the insert, with the same weakening D02 already
+describes: enforced becomes checked. One more container, one more database, one more
+password. And moving a table out of an initialised database means `docker compose down -v` —
+`init.sql` only runs on an empty data directory.
+
+### D29 — Dispatch prevents the race rather than detecting it
+
+**Decided:** claiming a rider is one statement — `UPDATE riders SET … WHERE id = (SELECT …
+ORDER BY haversine_km(…) LIMIT 1 FOR UPDATE SKIP LOCKED)` — preceded in the same
+transaction by a check for a rider already carrying this order.
+
+**Instead of:** the blueprint's read-all-riders-into-Python, sort, claim, and return `409`
+when a concurrent workflow got there first.
+
+**Why:** `SKIP LOCKED` makes the collision impossible rather than reportable. Two
+simultaneous dispatches for different orders skip each other's locked row and each claim the
+next-nearest rider, so both succeed on the first attempt; the blueprint's version made one
+of them fail and re-run the whole search. Distance is computed in SQL — the platform's first
+database function, `haversine_km`, plain `LANGUAGE sql` and `IMMUTABLE` — because it is
+needed inside the `ORDER BY`, and computing it in Python is what forces the read-everything
+approach that makes the row lock impossible to express.
+
+The prior-claim check is not an optimisation, and this was confirmed rather than assumed: a
+retried dispatch that skips it hits `duplicate key value violates unique constraint
+"idx_riders_current_order"`, so the retry *fails* while the first rider stays held by a saga
+that believes it has none.
+
+**Costs:** the search is a sequential scan over a partial index, which is right for a fleet
+this size and wrong for a large one — the `IMMUTABLE` marking is what keeps a functional or
+PostGIS index available later. `haversine_km` is also the first function in any of these
+schemas, so it is a new kind of thing to maintain.
+
+### D30 — The saga owns payment authorisation, so `POST /api/v1/payments` now answers `409`
+
+**Decided:** the workflow authorises payment through an internal endpoint, with an
+idempotency key derived from the order id (`wf-pay-{order_id}`). The customer-facing
+`POST /api/v1/payments` remains, but for an orchestrated order it now collides on
+`UNIQUE (order_id)` and returns `409 "Order X has already been paid for"`.
+
+**Instead of:** leaving payment client-driven and having the workflow wait for a signal
+saying it happened.
+
+**Why:** Week 2 asks for payment to be a compensatable step *inside* the transaction
+boundary the saga controls. A client-initiated payment the workflow merely observes cannot
+be refunded by the workflow without the workflow having authorised it, and leaves the order
+stuck whenever a customer abandons checkout after the order is created.
+
+**Costs:** a **behaviour change to a Week 1 contract**, which is why it is written down
+rather than absorbed. The smoke test changed from *creating* a payment to *observing* the
+one the saga made and asserting the `409` — deliberately, so a future change that re-enables
+client-driven payment trips a failing test. The customer also no longer learns their payment
+id from any response, which is why that assertion now reads it from the database.
+
+This closes D10's "nothing sweeps them today": `POST /api/v1/payments/refund` resolves
+`pending` rows as well as `authorized` ones, so a payment stranded by a failed gateway call
+is finally reconciled by the compensation path.
+
+### D31 — A status transition is a compare-and-set, and the enum supplies the ordering
+
+**Decided:** `OrderRepository.transition` updates and appends the trail entry in one
+transaction, guarded by `status <> new AND status NOT IN ('delivered','cancelled') AND (new
+= 'cancelled' OR new > status)`. When the guard matches nothing, **no trail entry is
+written**.
+
+**Instead of:** the blueprint's unguarded `UPDATE orders SET status = :status`.
+
+**Why:** Temporal guarantees activities run *at least* once. A worker that dies after
+writing but before reporting will run the same activity again, so an unguarded update lets a
+retry walk `delivered` back to `assigned`, and lets a five-times-retried activity write five
+identical audit entries. Each clause answers one of those: the inequality makes a replay a
+no-op, the terminal-state exclusion stops a late signal resurrecting a cancelled order, and
+the last clause allows only forward movement except into `cancelled`.
+
+The ordering comes from the schema rather than a lookup table, because a Postgres enum
+compares by declaration order and `order_status` was declared in lifecycle order — so
+`'delivered' > 'assigned'` is simply true. That is a dependency on how the type was written,
+so it is worth knowing before anyone reorders it.
+
+**Costs:** the guard is a real constraint on the state machine, not a safety net — adding a
+status that is legitimately reachable backwards, or a second terminal state, means revisiting
+this statement. And it leans on an enum's declaration order being stable, which is a
+property no comment in `db/order/init.sql` previously depended on.
+
+---
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -496,8 +716,26 @@ Not yet decided, and worth settling before the code forces an answer:
   anything shared; a secrets manager or mounted key file is the Week 3 answer.
 - **Whether `system_admin` should bypass ownership checks.** It currently does, everywhere,
   via `require_role` and `require_self_or_admin`. Convenient, and unaudited.
-- **Sweeping payments stranded at `pending`** (D10). Week 2's compensation workflow is the
-  intended answer; nothing does it today.
-- ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24: the opening
-  entry now commits with the order. Transitions reported by *other* services still arrive
-  over HTTP and can still be lost in flight — that half is open.
+- ~~**Sweeping payments stranded at `pending`** (D10).~~ Settled by D30: the saga's refund
+  endpoint resolves `pending` as well as `authorized`.
+- ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24 for the opening
+  entry and by D31 for the saga's own transitions, which now commit with the status change
+  they describe. **The remaining half is real and is now the platform's main gap:** a
+  decision or delivery reported by the Restaurant or Rider Service is committed locally and
+  *then* relayed as a signal, and a failed relay is logged rather than retried. The saga's
+  timeout turns a lost acceptance into a refusal. An outbox table in each reporting service
+  is the standard answer; Week 3's Kafka work is the natural place for it.
+- **Per-service credentials for internal calls** (D15, D26). The shared `INTERNAL_API_KEY`
+  now unlocks eight endpoints across four services, including refunds. D15 named this
+  threshold in advance; crossing it is a decision that should be made deliberately rather
+  than by accretion.
+- **Whether the rider search window belongs in config or per-restaurant.**
+  `RIDER_SEARCH_ATTEMPTS × RIDER_SEARCH_INTERVAL_SECONDS` is one platform-wide number, so a
+  dense city centre and a rural outpost get the same 60 seconds before an order is refunded.
+- **Nothing reclaims capacity from an *accepted* order that never completes.** The
+  compensation path expires `pending` tickets (see D27's cost note), but a ticket the kitchen
+  accepted before the saga failed stays `accepted` — correctly, since the kitchen did accept
+  it — and `accepted` rows are excluded from the capacity count, so nothing leaks today.
+  What is unresolved is that no state ever marks an accepted order *finished*: `capacity` is
+  a count of pending tickets rather than of food actually being cooked, which is a thinner
+  model of a kitchen than the name suggests.

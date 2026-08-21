@@ -1,9 +1,17 @@
 -- ============================================================================
 -- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
 --
--- Owns identity: `roles`, `users` and the `riders` profile extension. Only the
--- User Service connects here; every other service reads a profile through
+-- Owns identity and nothing else: `roles` and `users`. Only the User Service
+-- connects here; every other service reads a profile through
 -- GET /api/v1/users/{user_id}.
+--
+-- `riders` used to live here too, on the argument that a rider is an extension of
+-- a user identity and the foreign key to `users` was worth keeping. Week 2 moved it
+-- to sfo_rider_core (D28): the Rider Service needs to write availability and
+-- location on every dispatch, and under D01 a service may not write another
+-- service's tables. The foreign key was the cost of that move — `riders.user_id`
+-- is now a plain UUID verified over HTTP, like every other cross-service
+-- reference (D02).
 -- ============================================================================
 
 -- Enable UUID extension for secure, non-sequential IDs
@@ -39,20 +47,3 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Case-insensitive unique constraint index for emails (prevent duplicate registrations)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
-
--- 2. Riders Table
--- A rider is an extension of a user identity, so it stays in this database where the
--- foreign key to `users` is still enforceable. Orders reference a rider by id only.
-CREATE TABLE IF NOT EXISTS riders (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    vehicle_type VARCHAR(100) NOT NULL,
-    vehicle_number VARCHAR(100) UNIQUE NOT NULL,
-    is_available BOOLEAN NOT NULL DEFAULT TRUE,
-    current_latitude DECIMAL(9, 6),
-    current_longitude DECIMAL(9, 6),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_riders_availability ON riders(is_available);

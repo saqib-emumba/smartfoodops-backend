@@ -18,13 +18,15 @@ from fastapi import HTTPException
 
 from common.errors import conflict
 from common.postgres import PostgresPool
-from schemas import PaymentCreateRequest
+from schemas import PaymentAuthorizeRequest, PaymentCreateRequest
 
 _COLUMNS = "id, order_id, amount, status, transaction_reference, idempotency_key"
 
 _SELECT_BY_ID = f"SELECT {_COLUMNS} FROM payments WHERE id = %s"
 
 _SELECT_BY_KEY = f"SELECT {_COLUMNS} FROM payments WHERE idempotency_key = %s"
+
+_SELECT_BY_ORDER = f"SELECT {_COLUMNS} FROM payments WHERE order_id = %s"
 
 _INSERT_PENDING = f"""
     INSERT INTO payments (order_id, amount, status, idempotency_key)
@@ -38,6 +40,23 @@ _MARK_AUTHORIZED = f"""
            transaction_reference = %s,
            updated_at = CURRENT_TIMESTAMP
      WHERE id = %s
+    RETURNING {_COLUMNS}
+"""
+
+# Guarded on status rather than blind, because Temporal retries the compensating activity
+# and a second refund is real money. A row already `refunded` matches nothing here, so the
+# caller reads the existing row instead of issuing another gateway call.
+#
+# `pending` is included alongside `authorized` on purpose: a payment whose gateway call
+# failed is exactly the stranded row D10 accepted and nothing has ever swept. The saga's
+# refund is what finally resolves them.
+_MARK_REFUNDED = f"""
+    UPDATE payments
+       SET status = 'refunded',
+           transaction_reference = %s,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE order_id = %s
+       AND status IN ('pending', 'authorized', 'captured')
     RETURNING {_COLUMNS}
 """
 
@@ -57,8 +76,22 @@ class PaymentRepository:
             cur.execute(_SELECT_BY_KEY, (key,))
             return cur.fetchone()
 
-    def create_pending(self, payload: PaymentCreateRequest, amount: Decimal) -> dict:
-        """Claim the idempotency key with a `pending` row, before the card is charged."""
+    def find_by_order(self, order_id: UUID) -> dict | None:
+        """The one payment for an order, if any. `order_id` is UNIQUE, so at most one."""
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_BY_ORDER, (str(order_id),))
+            return cur.fetchone()
+
+    def create_pending(
+        self, payload: PaymentCreateRequest | PaymentAuthorizeRequest, amount: Decimal
+    ) -> dict:
+        """Claim the idempotency key with a `pending` row, before the card is charged.
+
+        Takes either request shape: the customer-facing endpoint and the saga's authorise
+        endpoint differ in how they are authenticated and in how `amount` arrives on the
+        wire, but both carry an `order_id` and an `idempotency_key`, which is all the
+        insert needs.
+        """
         with self._db.cursor(commit=True) as cur:
             try:
                 cur.execute(
@@ -75,8 +108,21 @@ class PaymentRepository:
             cur.execute(_MARK_AUTHORIZED, (reference, str(payment_id)))
             return cur.fetchone()
 
+    def mark_refunded(self, order_id: UUID, reference: str) -> dict | None:
+        """Move an order's payment to `refunded`, if it is in a state that can be.
+
+        Returns None when nothing was refundable — either there is no payment, or it is
+        already `refunded`. The caller distinguishes those, because the second is success
+        for a compensating action and the first is worth saying out loud.
+        """
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(_MARK_REFUNDED, (reference, str(order_id)))
+            return cur.fetchone()
+
     def _duplicate(
-        self, exc: psycopg2.errors.UniqueViolation, payload: PaymentCreateRequest
+        self,
+        exc: psycopg2.errors.UniqueViolation,
+        payload: PaymentCreateRequest | PaymentAuthorizeRequest,
     ) -> HTTPException:
         """Turn a unique-index violation into the 409 that describes what actually clashed.
 

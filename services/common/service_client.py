@@ -1,12 +1,14 @@
 """HTTP transport to sibling services.
 
-Services must not read each other's databases, so every cross-boundary lookup goes over
-HTTP through this client. It exists to make the failure contract identical everywhere:
+Services must not touch each other's databases, so every cross-boundary read *and* write
+goes over HTTP through this client. It exists to make the failure contract identical
+everywhere:
 
-    dependency unreachable    -> 503   (caller may retry)
-    dependency returns 404    -> 404   (worded by the calling service)
+    dependency unreachable     -> 503  (caller may retry)
+    dependency returns 404     -> 404  (worded by the calling service)
     dependency returns 401/403 -> 403  (the forwarded caller may not have this)
-    dependency returns 5xx    -> 502   (we got an answer we cannot use)
+    dependency returns 2xx     -> the decoded body, or {} when there is no body
+    anything else              -> 502  (we got an answer we cannot use)
 
 The client carries the downstream service's display name so error text and log lines read
 the same regardless of which service is calling.
@@ -74,7 +76,12 @@ class ServiceClient:
                 response.status_code,
             )
             raise forbidden(f"Not authorised to access this resource in the {self.name}")
-        if response.status_code != status.HTTP_200_OK:
+        # Any 2xx is success. This was originally `!= 200`, which was true while every
+        # cross-service call was a GET; the moment writes came through here it turned a
+        # `201` from a creating endpoint — and a `202` from the signal relay — into a `502`
+        # reported to a caller whose request had in fact succeeded. Matching the class
+        # rather than enumerating members is what stops that recurring with the next code.
+        if not 200 <= response.status_code < 300:
             self._logger.error(
                 "Unexpected %s response %s: %s",
                 self.name,
@@ -83,6 +90,10 @@ class ServiceClient:
             )
             suffix = f" while {bad_gateway_hint}" if bad_gateway_hint else ""
             raise bad_gateway(f"Unexpected response from {self.name}{suffix}")
+        # 204 has no body to decode. Nothing returns one through this client today, but a
+        # signal relay is an obvious future caller and `.json()` would raise on it.
+        if response.status_code == status.HTTP_204_NO_CONTENT or not response.content:
+            return {}
         return response.json()
 
     def get(
@@ -130,6 +141,65 @@ class ServiceClient:
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.get(url, headers=headers)
+        except httpx.RequestError as exc:
+            raise self._unreachable(url, exc, unreachable_hint) from exc
+        return self._payload(
+            response,
+            missing=missing,
+            missing_error=missing_error,
+            bad_gateway_hint=bad_gateway_hint,
+        )
+
+    def post(
+        self,
+        path: str,
+        *,
+        json: dict,
+        missing: str,
+        unreachable_hint: str,
+        bad_gateway_hint: str | None = None,
+        missing_error: MissingError = not_found,
+        headers: dict | None = None,
+    ) -> dict:
+        """Blocking POST returning the decoded JSON body.
+
+        Added for the Week 2 saga, which is the first thing in the platform to *write*
+        across a service boundary — until then every cross-boundary call was a lookup.
+
+        Writes route through here rather than calling httpx directly so the mapping above
+        stays the only place that decides what a failure looks like. An activity that
+        hand-rolled its own client would be a second answer to "is a refused refund a 403
+        or a 502?", and the two would drift.
+        """
+        url = self._url(path)
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.post(url, json=json, headers=headers)
+        except httpx.RequestError as exc:
+            raise self._unreachable(url, exc, unreachable_hint) from exc
+        return self._payload(
+            response,
+            missing=missing,
+            missing_error=missing_error,
+            bad_gateway_hint=bad_gateway_hint,
+        )
+
+    async def apost(
+        self,
+        path: str,
+        *,
+        json: dict,
+        missing: str,
+        unreachable_hint: str,
+        bad_gateway_hint: str | None = None,
+        missing_error: MissingError = not_found,
+        headers: dict | None = None,
+    ) -> dict:
+        """Async counterpart to :meth:`post`, for services with async route handlers."""
+        url = self._url(path)
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(url, json=json, headers=headers)
         except httpx.RequestError as exc:
             raise self._unreachable(url, exc, unreachable_hint) from exc
         return self._payload(

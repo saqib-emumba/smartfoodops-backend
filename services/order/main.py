@@ -10,9 +10,13 @@ The customer and restaurant an order names live in other services' databases, so
 verified over HTTP before the insert — see clients.py.
 """
 
+import os
+from contextlib import AsyncExitStack, asynccontextmanager
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, Response, status
+from temporalio.common import WorkflowIDConflictPolicy
+from temporalio.service import RPCError, RPCStatusCode
 
 from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
 from common.auth import (
@@ -22,10 +26,11 @@ from common.auth import (
     require_role,
     require_self_or_admin,
 )
-from common.config import required
-from common.errors import bad_request, not_found
+from common.config import DEFAULT_TEMPORAL_ADDRESS, ORDER_TASK_QUEUE, required
+from common.errors import bad_request, conflict, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
+from common.temporal import TemporalGateway, workflow_id_for
 from pricing import build_order_snapshot
 from repository import OrderRepository, OrderTrackingRepository
 from schemas import (
@@ -33,10 +38,13 @@ from schemas import (
     OrderResponse,
     OrderTrackingLogCreateRequest,
     OrderTrackingLogResponse,
+    WorkflowSignalRequest,
 )
+from workflows import OrderWorkflow
 
 SERVICE_NAME = "order-service"
 DATABASE_URL = required("DATABASE_URL")
+TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
 
 logger = configure_logging(SERVICE_NAME)
 db = PostgresPool(
@@ -49,16 +57,37 @@ tracking = OrderTrackingRepository(db)
 menu_service = MenuServiceClient(logger)
 user_service = UserServiceClient(logger)
 restaurant_service = RestaurantServiceClient(logger)
+temporal = TemporalGateway(TEMPORAL_ADDRESS, logger=logger)
 
-app = FastAPI(title="SmartFoodOps Order Service", lifespan=db.lifespan)
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    """Open the database pool and the Temporal connection together.
+
+    FastAPI takes a single lifespan, and this service now has two dependencies that need
+    one. AsyncExitStack composes them without either having to know about the other, so
+    `PostgresPool` stays reusable by the five services that need no orchestrator.
+    """
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(db.lifespan(app_))
+        await stack.enter_async_context(temporal.lifespan(app_))
+        yield
+
+
+app = FastAPI(title="SmartFoodOps Order Service", lifespan=lifespan)
 
 
 @app.get("/api/v1/orders/health")
-def health():
+async def health():
     return {
         "status": "Orders Service operational",
         "service": SERVICE_NAME,
         "database_reachable": db.is_reachable(),
+        # Unlike `database_reachable`, this being false does not mean the service is
+        # degraded for reads: orders can still be placed and fetched. What stops is the
+        # saga advancing them, which a retry repairs once the orchestrator returns.
+        "temporal_reachable": await temporal.is_reachable(),
+        "temporal_address": temporal.address,
         "user_service_url": user_service.base_url,
         "restaurant_service_url": restaurant_service.base_url,
         "menu_service_url": menu_service.base_url,
@@ -70,7 +99,7 @@ def health():
     response_model=OrderResponse,
     status_code=status.HTTP_201_CREATED,
 )
-def create_order(
+async def create_order(
     payload: OrderCreateRequest,
     response: Response,
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
@@ -80,6 +109,9 @@ def create_order(
 
     The order is placed for the token's subject. There is no way to place one for anybody
     else — `customer_id` is not a field a client can send.
+
+    Since Week 2 this also hands the committed order to the saga, which is what carries it
+    from `created` to `delivered`. Everything before that step is unchanged.
     """
     if not x_idempotency_key:
         raise bad_request("X-Idempotency-Key header is required")
@@ -92,6 +124,10 @@ def create_order(
         require_self_or_admin(principal, existing["customer_id"])
         response.status_code = status.HTTP_200_OK
         logger.info("Idempotent replay for key %s", x_idempotency_key)
+        # A replay also re-attempts the saga. This is what repairs an order whose workflow
+        # failed to start the first time: the workflow id is derived from the order id, so
+        # a saga that is already running is left alone, and one that never began now does.
+        await _start_saga(existing)
         return OrderResponse(**existing)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
@@ -113,7 +149,60 @@ def create_order(
         payload, principal.user_id, items_snapshot, total, x_idempotency_key
     )
 
+    # (f) The order exists; the saga runs it from here.
+    await _start_saga(order)
+
     return OrderResponse(**order)
+
+
+async def _start_saga(order: dict) -> None:
+    """Hand a committed order to the orchestrator.
+
+    Deliberately after the commit, and deliberately not fatal.
+
+    Temporal cannot enlist in a Postgres transaction, so "the order exists" and "its saga
+    started" cannot be made one atomic fact. Given the choice, the order wins: it is what
+    the customer was told about, and it is recoverable — a retry with the same idempotency
+    key takes the replay branch above, which calls this again.
+
+    That is D09's old argument reappearing in a new place, and it resolves the same way: a
+    write that already succeeded must not be reported to the client as a failure.
+
+    `USE_EXISTING` is what makes this safe to call more than once. The workflow id is
+    derived from the order id, so a second attempt for one order names the same workflow
+    and Temporal hands back the running one rather than raising — which is why there is no
+    `except WorkflowAlreadyStartedError` here. (That exception lives in
+    `temporalio.exceptions`, not `temporalio.client`, if it is ever needed.)
+    """
+    order_id = order["id"]
+    if not temporal.connected:
+        logger.error(
+            "Temporal is not connected; order %s will sit at 'created' until retried",
+            order_id,
+        )
+        return
+
+    try:
+        handle = await temporal.client.start_workflow(
+            OrderWorkflow.run,
+            {
+                "order_id": str(order_id),
+                "restaurant_id": str(order["restaurant_id"]),
+                # A string, not a float: an exact decimal has to survive the JSON boundary
+                # into workflow history, and D07's guarantee stops at that boundary.
+                "amount": str(order["total_amount"]),
+                "items": order["items"],
+            },
+            id=workflow_id_for(order_id),
+            task_queue=ORDER_TASK_QUEUE,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+        logger.info("Saga %s running for order %s", handle.id, order_id)
+    except Exception as exc:  # noqa: BLE001 - the order is committed; never fail on this
+        # Error rather than warning: an order with no saga stays at `created` forever
+        # until something retries it, which is worth an alert even though it is not worth
+        # a 500 to a client whose order was in fact created.
+        logger.error("Could not start the saga for order %s: %s", order_id, exc)
 
 
 @app.get("/api/v1/orders/{order_id}", response_model=OrderResponse)
@@ -137,6 +226,70 @@ def get_order(
 
     require_self_or_admin(principal, row["customer_id"])
     return OrderResponse(**row)
+
+
+@app.get(
+    "/api/v1/orders/{order_id}/internal",
+    response_model=OrderResponse,
+    dependencies=[Depends(require_internal)],
+)
+def get_order_internally(order_id: UUID) -> OrderResponse:
+    """The same order as the endpoint above, for callers with no user behind them.
+
+    The Payment Service's saga path needs the authoritative `total_amount` but holds no
+    bearer token to forward — a workflow is not a user (D26). The ownership check the
+    bearer version performs is not lost, only relocated: the saga did not choose this
+    order, it was started by an already-authorised `POST /api/v1/orders` whose handler had
+    established that the caller owns it.
+
+    Internal-key only, because without the token there is no ownership check left here, so
+    this must not be reachable by anyone who could guess an order id.
+    """
+    row = orders.find(order_id)
+    if row is None:
+        raise not_found(f"Order {order_id} not found")
+    return OrderResponse(**row)
+
+
+@app.post(
+    "/api/v1/orders/{order_id}/signals",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_internal)],
+)
+async def signal_workflow(order_id: UUID, payload: WorkflowSignalRequest) -> dict:
+    """Relay an event from a sibling service into this order's workflow.
+
+    One endpoint rather than one per event, and internal-key only. Two consequences worth
+    stating: a Temporal client exists in exactly two processes in this platform — this
+    service and its worker — and the Restaurant and Rider Services stay unaware that an
+    orchestrator exists at all. They report what they observed to the service that owns the
+    order lifecycle, exactly as they would report any other status transition.
+
+    No handle is stored anywhere. The workflow id is derived from the order id, so finding
+    the running saga is a pure function of the thing the caller already named.
+
+    `202`, not `200`: a signal is delivered to the workflow, not executed by it. By the time
+    this returns the saga has been told, not necessarily acted.
+    """
+    handle = temporal.client.get_workflow_handle(workflow_id_for(order_id))
+    try:
+        await handle.signal(payload.signal, payload.payload)
+    except RPCError as exc:
+        # NOT_FOUND covers both "no such workflow" and "it already finished", and the two
+        # are worth separating for the caller: a rider marking a cancelled order delivered
+        # is a different problem from an order that never existed.
+        if exc.status is RPCStatusCode.NOT_FOUND:
+            raise not_found(
+                f"Order {order_id} has no running saga to signal; it may have already "
+                "finished or been cancelled"
+            ) from exc
+        logger.error("Could not signal saga for order %s: %s", order_id, exc)
+        raise conflict(
+            f"The saga for order {order_id} would not accept signal '{payload.signal}'"
+        ) from exc
+
+    logger.info("Signalled '%s' to the saga for order %s", payload.signal, order_id)
+    return {"signalled": payload.signal, "order_id": str(order_id)}
 
 
 @app.post(

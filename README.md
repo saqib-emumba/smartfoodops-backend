@@ -1,8 +1,9 @@
-# SmartFoodOps — Backend (Week 1)
+# SmartFoodOps — Backend (Weeks 1–2)
 
-A containerised, five-service food-ordering backend fronted by an Nginx API gateway.
-Everything runs locally through Docker Compose: five PostgreSQL databases, Redis, the
-gateway, and the five FastAPI services.
+A containerised, six-service food-ordering backend fronted by an Nginx API gateway, with the
+order lifecycle driven by a durable Temporal workflow. Everything runs locally through Docker
+Compose: six PostgreSQL databases, Redis, the Temporal dev server, the gateway, six FastAPI
+services and one workflow worker.
 
 ---
 
@@ -17,35 +18,83 @@ would need does not exist.
      http://localhost:80  │   Nginx API Gateway   │
      ────────────────────▶│  (path-based routing) │
                           └───────────┬───────────┘
-      ┌───────────────┬───────────────┴───────────────┬───────────────┐
-      ▼               ▼               ▼               ▼               ▼
-┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐   ┌───────────┐
-│   User    │   │Restaurant │   │   Menu    │   │   Order   │   │  Payment  │
-│   :8001   │◀──│   :8002   │◀──│   :8003   │◀──│   :8004   │◀──│   :8005   │
-└─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
-      │               │           ┌───┴───┐           │               │
-      ▼               ▼           ▼       ▼           ▼               ▼
-   Postgres        Postgres   Postgres  Redis      Postgres        Postgres
-    :5432           :5433       :5436   :6379       :5434           :5435
-                               (menus)  (cache)   (+ tracking)
+   ┌──────────┬──────────┬────────────┴───┬──────────┬──────────┐
+   ▼          ▼          ▼                ▼          ▼          ▼
+┌────────┐┌────────┐┌────────┐      ┌────────┐┌────────┐┌────────┐
+│  User  ││Restaur.││  Menu  │      │ Order  ││Payment ││ Rider  │
+│ :8001  ││ :8002  ││ :8003  │      │ :8004  ││ :8005  ││ :8006  │
+└───┬────┘└───┬────┘└───┬────┘      └───┬────┘└───┬────┘└───┬────┘
+    │         │      ┌──┴──┐            │         │         │
+    ▼         ▼      ▼     ▼            ▼         ▼         ▼
+ Postgres  Postgres  PG  Redis       Postgres  Postgres  Postgres
+  :5432     :5433  :5436 :6379        :5434     :5435     :5437
+                  (menus)(cache)   (+ tracking)         (fleet)
+                                        │
+                          ┌─────────────┴──────────────┐
+                          │   Temporal dev server      │
+                          │   :7233 gRPC  :8233 UI     │
+                          │   :9233 /metrics           │
+                          └─────────────┬──────────────┘
+                                        │ polls "order-tasks"
+                                 ┌──────┴───────┐
+                                 │ order-worker │  ← runs the saga
+                                 └──────────────┘
 ```
 
 Arrows between services are **HTTP calls, not shared tables**. Each service owns its data:
 
 | Service | Port | Owns | Its database (host port) | Reaches out to |
 |---|---|---|---|---|
-| `user-service` | 8001 | `roles`, `users`, `riders` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
-| `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
+| `user-service` | 8001 | `roles`, `users` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
+| `restaurant-service` | 8002 | `restaurants`, `order_tickets` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check), Order Service (signal relay) |
 | `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
-| `order-service` | 8004 | `orders`, `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant checks) |
+| `order-service` | 8004 | `orders`, `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant checks), Temporal |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
+| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (signal relay) |
+| `order-worker` | — | nothing | reads/writes `sfo_order_core` | Payment, Restaurant and Rider Services (saga activities) |
 
-Four rules the code enforces deliberately:
+Rules the code enforces deliberately:
 
 - The Restaurant Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
 - The Order Service never reads the `menus` table — it calls `GET /api/v1/menus/{id}`.
 - The Payment Service never reads the `orders` table — it calls `GET /api/v1/orders/{id}`.
+- The Rider Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
 - No service holds credentials for a database it does not own.
+- Only two processes hold a Temporal client: `order-service` (starts sagas, relays signals)
+  and `order-worker` (runs them). Every other service reports what it observed over HTTP and
+  is unaware an orchestrator exists.
+
+### The order saga
+
+`POST /api/v1/orders` still does everything it did in Week 1 — re-prices the cart, verifies
+the customer and restaurant over HTTP, and commits the order with the opening entry of its
+audit trail in one transaction. It then starts a workflow whose id is derived from the order
+id, so starting one twice is a no-op.
+
+```
+created ──payment authorised──▶ confirmed
+                                    │  ticket on the kitchen's rail,
+                                    │  durable timer (120s)
+                    ┌───────────────┴───────────────┐
+              accepted                      rejected / silence
+                    │                               │
+          rider search (6 × 10s)                    │
+                    │                               │
+       ┌────────────┴────────────┐                  │
+   assigned                 nobody free             │
+       │                         │                  │
+ rider signals               ────┴──────────────────┴────▶ COMPENSATE
+ picked_up ──▶ delivered                                   refund payment
+       │                                                   release rider
+ release rider                                             expire ticket
+                                                           ──▶ cancelled
+```
+
+Every step is idempotent and every wait is a durable timer, so the worker can be killed
+mid-saga and the order still completes. `scripts/saga-resilience-test.sh` asserts exactly
+that. The full design, and the ten places the original Week 2 blueprint was wrong, are in
+[readme/week2-temporal-orchestration-blueprint.md](readme/week2-temporal-orchestration-blueprint.md);
+D25–D31 in the decision record cover what shipped and why.
 
 **MongoDB is gone.** The `menus` collection became a JSONB table in the Menu Service's own
 Postgres database, read through a Redis cache-aside layer; `order_tracking_logs` became a
@@ -83,14 +132,17 @@ the owning service does, over HTTP, immediately before the write:
 Those status codes are unchanged from the single-database version, where the same failures
 arrived as foreign-key violations.
 
-One reference stays inside a single database and keeps a real foreign key: `riders.user_id`,
-because a rider is an extension of a user identity. `payments.order_id` was the other one
-until the Payment Service split out, which is why `GET /api/v1/orders/{order_id}` now exists
-— an HTTP call is what replaced that constraint.
+Two references keep a real foreign key, because both of their ends live in one database:
+`order_tracking_logs.order_id` (which is why that table moved out of MongoDB — D24) and
+`order_tickets.restaurant_id`. `riders.user_id` used to be a third, until the fleet moved
+into its own database in Week 2 and it became a checked reference like the others (D28).
+`payments.order_id` lost its key when the Payment Service split out, which is why
+`GET /api/v1/orders/{order_id}` exists at all — an HTTP call is what replaced that
+constraint.
 
 The trade-off is eventual, not immediate, integrity: a user deleted between verification and
-insert leaves an order pointing at nobody. Week 2's outbox/compensation work is where that
-gets reconciled — a single Postgres instance was hiding the problem, not solving it.
+insert leaves an order pointing at nobody. A single Postgres instance was hiding that
+problem, not solving it.
 
 ---
 
@@ -117,6 +169,9 @@ RESTAURANT_POSTGRES_PASSWORD=<choose one>
 ORDER_POSTGRES_PASSWORD=<choose one>
 PAYMENT_POSTGRES_PASSWORD=<choose one>
 MENU_POSTGRES_PASSWORD=<choose one>
+RIDER_POSTGRES_PASSWORD=<choose one>
+
+REDIS_URL=redis://cache-redis:6379/0
 
 # Service endpoints (within the Docker network)
 USER_SERVICE_URL=http://user-service:8001
@@ -124,6 +179,11 @@ RESTAURANT_SERVICE_URL=http://restaurant-service:8002
 MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
+RIDER_SERVICE_URL=http://rider-service:8006
+
+# Workflow orchestrator (gRPC, so no scheme). docker-compose.yml also sets this
+# per-container; it is here for scripts and for a worker run outside Compose.
+TEMPORAL_ADDRESS=temporal-server:7233
 EOF
 
 # Access token signing (RS256) plus the internal service key. Generated, never chosen:
@@ -185,47 +245,64 @@ in a secrets manager, not in this file.
 ## Quick start
 
 ```bash
-docker compose up --build -d      # build images and start all 12 containers
+docker compose up --build -d      # build images and start all 16 containers
 docker compose ps                 # all should read "Up" / "healthy"
 ```
 
 First boot takes a few minutes while the Python images build. Each Postgres container runs
 its own schema — [db/user/init.sql](db/user/init.sql),
 [db/restaurant/init.sql](db/restaurant/init.sql), [db/order/init.sql](db/order/init.sql),
-[db/payment/init.sql](db/payment/init.sql) — automatically on the **first** boot of its
-volume. See
-[Resetting the databases](#resetting-the-databases) if you change one.
+[db/payment/init.sql](db/payment/init.sql), [db/menu/init.sql](db/menu/init.sql),
+[db/rider/init.sql](db/rider/init.sql) — automatically on the **first** boot of its volume.
+See [Resetting the databases](#resetting-the-databases) if you change one.
 
-> **Upgrading an existing checkout?** The single `sfo-postgres` container is gone, and so is
-> the `payments` table inside `sfo_order_core`. Add the four password keys to `.env`, then
-> `docker compose down -v && docker compose up --build -d`. Volumes are not migrated — there
-> is no data to keep in a local sandbox, and the smoke test recreates everything it needs.
-> Skipping the `-v` leaves the old `payments` table sitting unused in the order database,
-> because `init.sql` only runs on an empty volume.
+Two things to look at once it is up: `docker compose logs order-worker` should show
+`Worker polling task queue 'order-tasks'`, and the **Temporal Web UI** is at
+<http://localhost:8233>, where every order's workflow history is browsable. The UI is
+deliberately *not* behind the gateway — it has no authentication of its own, so proxying it
+would publish every workflow's history, including the arguments each was started with.
+
+> **Upgrading a Week 1 checkout? `-v` is mandatory.** The `riders` table moved out of
+> `sfo_user_core` into its own database (D28), and `init.sql` only runs on an empty volume —
+> so without wiping, the user database keeps a stale `riders` table and the rider database is
+> never created. Add `RIDER_POSTGRES_PASSWORD`, `RIDER_SERVICE_URL` and `TEMPORAL_ADDRESS`
+> to `.env`, then:
+>
+> ```bash
+> docker compose down -v && docker compose up --build -d
+> ```
+>
+> There is no data to keep in a local sandbox, and the smoke test recreates everything it
+> needs.
 
 ### Verify everything routes
 
 ```bash
-for p in /health /api/v1/users/health /api/v1/restaurants/health \
-         /api/v1/menus/health /api/v1/orders/health /api/v1/payments/health; do
-  printf '%-30s ' "$p"; curl -s -w ' [%{http_code}]\n' "http://localhost$p"
+for p in /health /api/v1/users/health /api/v1/restaurants/health /api/v1/menus/health \
+         /api/v1/orders/health /api/v1/payments/health /api/v1/riders/health; do
+  printf '%-32s ' "$p"; curl -s -w ' [%{http_code}]\n' "http://localhost$p"
 done
 ```
 
-All six must return `200`. The service health endpoints also report whether their
-backing stores actually round-trip (`database_reachable`, `cache_reachable`) — a `200` with
-`"database_reachable": false` means the app is up but the DB is not. The Menu Service's
-`"cache_reachable": false` is different in kind: menus still serve, straight from Postgres,
-because the cache is a copy and never the source of truth.
+All seven must return `200`. The service health endpoints also report whether their backing
+stores actually round-trip (`database_reachable`, `cache_reachable`, `temporal_reachable`) —
+a `200` with `"database_reachable": false` means the app is up but the DB is not.
+
+Two of those flags mean something softer than the others, and the difference is deliberate.
+The Menu Service's `"cache_reachable": false` still serves menus, straight from Postgres,
+because the cache is a copy and never the source of truth. The Order Service's
+`"temporal_reachable": false` still accepts and serves orders; what stops is sagas
+*advancing* them, and a retry with the same idempotency key repairs that once the
+orchestrator returns.
 
 ### Run the test suite
 
-[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all five services through the gateway
-exactly as a client would — the full checkout chain plus every edge case in the Week 1
-contract — and asserts status codes and response fields:
+[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all six services through the gateway
+exactly as a client would — the full checkout chain, the whole order lifecycle, and every
+edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 72 assertions against http://localhost
+./scripts/smoke-test.sh            # 174 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -236,24 +313,50 @@ as a pre-commit check or a CI step. Colour is suppressed when the output is pipe
 
 What it covers beyond status codes:
 
-- **Idempotency** — a replayed `X-Idempotency-Key` returns the *same* order (and the *same*
-  payment) id, not a duplicate
+- **The whole lifecycle** — `created → confirmed → assigned → picked_up → delivered`, read
+  back out of the tracking trail with each `previous_status` derived rather than asserted
+- **Both compensation paths** — a kitchen rejection and an empty fleet each reach
+  `cancelled` with the payment `refunded` and **no rider left claimed**
+- **Idempotency** — a replayed `X-Idempotency-Key` returns the *same* order, and the saga's
+  payment key is derived from the order id so a retried activity cannot double-charge
 - **Server-side pricing** — asserts the recalculated unit price and total, not just a `201`
-- **Where each table landed** — that the menu tree is JSONB in `sfo_menu_core` and the
-  tracking trail is relational rows in `sfo_order_core`, read back out of each database
+- **The internal boundary** — every one of the saga's eight endpoints answers `401` without
+  `X-Internal-Key`, and a customer token does not substitute for it
+- **Where each table landed** — that the menu tree is JSONB in `sfo_menu_core`, the tracking
+  trail is relational rows in `sfo_order_core`, and the fleet is in `sfo_rider_core`
 - **Referential integrity** — that an entry written against a nonexistent order is refused
   by the foreign key, which the MongoDB collection had no way to do
 - **Cache-aside** — that a read populates `menu:<restaurant_id>` in Redis, that publishing
   invalidates it, and that the menu still serves with the cache cold
-- **The payments split** — that the authorised payment landed in `sfo_payment_core` and that
-  `sfo_order_core` has no `payments` table at all
 
-Each run generates unique emails, phone numbers, and idempotency keys, so it is safe to run
-repeatedly against the same database without tripping unique constraints. It only ever
-creates data — nothing is deleted — so use `docker compose down -v` when you want a clean
-slate.
+Because the lifecycle is now driven by a workflow, every post-checkout status assertion
+**polls**. Asserting immediately would be a race that passes on an idle laptop and fails
+under load.
+
+[scripts/saga-resilience-test.sh](scripts/saga-resilience-test.sh) is separate, and slower
+(a few minutes), because it is destructive and because it waits out real timeouts. It holds
+the two checks that actually justify running a workflow engine — everything in the smoke test
+could be passed by a synchronous implementation with a retry loop; neither of these could:
+
+```bash
+./scripts/saga-resilience-test.sh
+```
+
+- **Concurrency** — four orders against a fleet of one. Exactly one is assigned; the other
+  three cancel and refund rather than double-booking. This is what proves the
+  `FOR UPDATE SKIP LOCKED` claim in the dispatch query.
+- **Durability** — the worker is restarted *twice* mid-saga. The order still reaches
+  `delivered`, and the trail has one entry per transition, proving the replayed activities
+  were idempotent.
+- **Kitchen timeout** — nobody answers the ticket. The order cancels, the payment is
+  refunded, and the abandoned ticket is expired so it stops occupying a capacity slot.
+
+Each run generates unique emails, phone numbers, and idempotency keys, so both are safe to
+run repeatedly against the same database. They only ever create data — nothing is deleted —
+so use `docker compose down -v` when you want a clean slate.
 
 Requires `bash`, `curl`, and `python3` on the host; nothing is installed into the containers.
+The resilience script additionally needs `docker` access to the local stack.
 
 For poking at a single endpoint by hand, see
 [readme/api-testing-guide.md](readme/api-testing-guide.md) — the same scenarios as
@@ -407,35 +510,79 @@ The total is **recalculated server-side** from the live menu (12.99 + 1.50 × 2 
 the client's `total_amount` is only checked, never trusted. Repeating the same
 `X-Idempotency-Key` returns the original order as `200` instead of creating a second one.
 
-**6 — Pay for it** (a different service, a different database)
+**6 — Payment happens on its own** (the saga's first step)
+
+Nothing to call. The workflow authorises the payment within a second or so, and the order
+moves to `confirmed`:
 
 ```bash
-curl -s -X POST http://localhost/api/v1/payments \
-  -H "Authorization: Bearer $CUSTOMER" \
-  -H 'Content-Type: application/json' \
-  -H 'X-Idempotency-Key: sfo-pay-0001' \
-  -d '{"order_id":"<ORDER_UUID>","amount":28.98,"idempotency_key":"sfo-pay-0001"}'
+curl -s http://localhost/api/v1/orders/<ORDER_UUID> -H "Authorization: Bearer $CUSTOMER"
+# -> {"status":"confirmed", ...}
 ```
 
-The Payment Service cannot read the `orders` table, so it fetches the order over HTTP and
-refuses to charge an `amount` that does not equal the total the Order Service recalculated —
-`422`, with both figures in the message. The reply carries `status: "authorized"` and the
-gateway's `transaction_reference` (`ch_mock_…`, since Week 1 simulates the gateway).
+The Payment Service still cannot read the `orders` table, so it fetches the order over HTTP
+and refuses an `amount` that does not equal the recalculated total — `422`, with both figures
+in the message. The stored payment carries `status: "authorized"` and a `ch_mock_…`
+`transaction_reference`, and its idempotency key is `wf-pay-<order_id>`: derived from the
+order rather than client-chosen, so a retried activity collides on the unique index instead
+of charging twice.
 
-Replaying the same key returns the original payment as `200` and never touches the gateway:
-that is the double-charge guarantee. A *different* key against an already-paid order is a
-`409` — one payment per order is a unique constraint, not a convention.
+Since the saga owns this step, calling `POST /api/v1/payments` yourself for an orchestrated
+order now returns `409 "Order … has already been paid for"` — one payment per order is a
+unique constraint, not a convention. That is a deliberate change to the Week 1 contract; the
+endpoint remains for direct and manual use, and D30 records why.
 
-Ownership is settled by that HTTP lookup rather than by a check here: the Order Service only
-serves an order to the customer who placed it, so paying for someone else's comes back `403`
-from one place instead of being re-decided in two.
+**7 — The kitchen decides**
+
+The saga is now parked on a durable timer waiting for a human. The restaurant reads its rail
+and answers:
+
+```bash
+curl -s http://localhost/api/v1/restaurants/<RESTAURANT_UUID>/tickets \
+  -H "Authorization: Bearer $OWNER"
+
+curl -s -X POST http://localhost/api/v1/restaurants/tickets/<ORDER_UUID>/accept \
+  -H "Authorization: Bearer $OWNER"
+```
+
+Accepting releases the saga to search for a rider; rejecting — or saying nothing for 120
+seconds — refunds the customer, expires the ticket and cancels the order.
+
+**8 — A rider carries it**
+
+```bash
+# The rider joins the fleet once, then reports where they are.
+curl -s -X POST http://localhost/api/v1/riders \
+  -H "Authorization: Bearer $RIDER" -H 'Content-Type: application/json' \
+  -d '{"vehicle_type":"motorbike","vehicle_number":"ISB-1234",
+       "current_latitude":33.68,"current_longitude":73.04}'
+
+# Dispatch is automatic. Once assigned, the rider reports progress.
+curl -s -X POST http://localhost/api/v1/riders/me/orders/<ORDER_UUID>/picked-up \
+  -H "Authorization: Bearer $RIDER"
+curl -s -X POST http://localhost/api/v1/riders/me/orders/<ORDER_UUID>/delivered \
+  -H "Authorization: Bearer $RIDER"
+```
+
+The rider is chosen by proximity to the restaurant in a single claim statement, so two
+simultaneous dispatches can never take the same rider. Only the rider whose own row records
+this order may report on it — which is why neither endpoint takes a rider id.
+
+The whole run is readable end to end:
+
+```bash
+curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bearer $CUSTOMER"
+```
+
+…or visually, with each activity, retry and timer, in the Temporal UI at
+<http://localhost:8233> under workflow id `order-<ORDER_UUID>`.
 
 ### Endpoint reference
 
 | Method | Path | Who may call it | Notes |
 |---|---|---|---|
 | `GET` | `/health` | anyone | Gateway only, does not touch services |
-| `GET` | `/api/v1/{users,restaurants,menus,orders,payments}/health` | anyone | Per-service + backing store |
+| `GET` | `/api/v1/{users,restaurants,menus,orders,payments,riders}/health` | anyone | Per-service + backing store |
 | `POST` | `/api/v1/users/register` | anyone | `201`; bcrypt hash, role resolved via DB |
 | `POST` | `/api/v1/users/login` | anyone | Access + refresh pair; one message for every failure |
 | `POST` | `/api/v1/users/refresh` | anyone holding a refresh token | Rotates: the presented token is consumed |
@@ -449,8 +596,32 @@ from one place instead of being re-decided in two.
 | `GET` | `/api/v1/orders/{order_id}` | the order's customer, or `system_admin` | Exposes the recalculated `total_amount` to the Payment Service |
 | `POST` | `/api/v1/orders/logs` | services only (`X-Internal-Key`) | Appends one row to `order_tracking_logs`; `422` on an unknown order or an undefined status |
 | `GET` | `/api/v1/orders/{order_id}/logs` | the order's customer, or `system_admin` | The full transition timeline, oldest first |
-| `POST` | `/api/v1/payments` | `customer` owning the order | `201` new / `200` idempotent replay; verifies order + amount over HTTP |
-| `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending` or `authorized` |
+| `POST` | `/api/v1/payments` | `customer` owning the order | `409` for a saga-owned order (D30); otherwise `201`/`200` idempotent replay |
+| `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending`, `authorized` or `refunded` |
+| `GET` | `/api/v1/restaurants/{restaurant_id}/tickets` | `restaurant_admin` owning it | The kitchen's rail, oldest first; `?ticket_status=` to filter |
+| `POST` | `/api/v1/restaurants/tickets/{order_id}/accept` | `restaurant_admin` owning it | Releases the saga to dispatch a rider; second call is a no-op |
+| `POST` | `/api/v1/restaurants/tickets/{order_id}/reject` | `restaurant_admin` owning it | Triggers refund + cancel |
+| `POST` | `/api/v1/riders` | `rider` | `201`; rider taken from the token, live role re-checked over HTTP |
+| `GET` | `/api/v1/riders/me` | `rider` | Own profile — availability, location, current order |
+| `PATCH` | `/api/v1/riders/me/location` | `rider` | Until a location is reported, the rider is invisible to dispatch |
+| `PATCH` | `/api/v1/riders/me/availability` | `rider` | `409` while carrying an order |
+| `POST` | `/api/v1/riders/me/orders/{order_id}/picked-up` | the rider carrying it | `204`; signals the saga |
+| `POST` | `/api/v1/riders/me/orders/{order_id}/delivered` | the rider carrying it | `204`; signals the saga, which then releases the rider |
+
+**Service-to-service only** (`X-Internal-Key`, never reachable with a user token — D26):
+
+| Method | Path | Called by | Notes |
+|---|---|---|---|
+| `POST` | `/api/v1/orders/logs` | any service | Appends one reported transition; `422` on an unknown order or undefined status |
+| `POST` | `/api/v1/orders/{order_id}/signals` | Restaurant, Rider | The one door into a running saga; `404` if it has finished |
+| `GET` | `/api/v1/orders/{order_id}/internal` | Payment, worker | Same order as the bearer path, for callers with no user |
+| `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | worker | Coordinates for proximity dispatch |
+| `POST` | `/api/v1/restaurants/tickets` | worker | Idempotent on `order_id`; `{"queued": false}` when at capacity |
+| `POST` | `/api/v1/restaurants/tickets/{order_id}/expire` | worker | Compensation; `pending`-only, so it cannot overwrite a decision |
+| `POST` | `/api/v1/payments/authorize` | worker | Amount as a **string** so the decimal stays exact (D07) |
+| `POST` | `/api/v1/payments/refund` | worker | Compensation; idempotent by status, and sweeps stranded `pending` rows |
+| `POST` | `/api/v1/riders/dispatch` | worker | Claims the nearest rider; `{"assigned": false}` is a `200`, not an error |
+| `POST` | `/api/v1/riders/release` | worker | Compensation; releasing an unheld order is success |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -569,17 +740,21 @@ Each database is a separate container, so pick the one that owns the table you w
 in any of them is a quick proof of the split — only that service's tables are there.
 
 ```bash
-# User database — roles, users, riders
+# User database — roles, users (riders moved out in Week 2 — see below)
 docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core
 #   \dt              list tables
 #   SELECT u.email, r.name FROM users u JOIN roles r ON r.id = u.role_id;
 
-# Restaurant database — restaurants
+# Restaurant database — restaurants and the kitchen queue
 docker exec -it sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core
+#   SELECT order_id, status, created_at FROM order_tickets ORDER BY created_at DESC LIMIT 5;
+#   -- capacity is a count of *pending* tickets, so this is what a full kitchen looks like:
+#   SELECT r.name, r.capacity, count(t.id) FILTER (WHERE t.status = 'pending') AS on_rail
+#     FROM restaurants r LEFT JOIN order_tickets t ON t.restaurant_id = r.id GROUP BY 1, 2;
 
 # Order database — orders (payments are NOT here any more)
 docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core
-#   SELECT id, status, total_amount FROM orders ORDER BY created_at DESC LIMIT 5;
+#   SELECT id, status, rider_id, total_amount FROM orders ORDER BY created_at DESC LIMIT 5;
 
 # Payment database — payments
 docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core
@@ -592,6 +767,17 @@ docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core
 # Menu database — menus (the JSONB tree that replaced the MongoDB collection)
 docker exec -it sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core
 #   SELECT restaurant_id, jsonb_pretty(categories) FROM menus;
+
+# Rider database — the delivery fleet (moved out of sfo_user_core in Week 2, D28)
+docker exec -it sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core
+#   SELECT vehicle_number, is_available, current_order_id FROM riders;
+#   -- distance from a point, using the schema's own haversine_km():
+#   SELECT vehicle_number,
+#          round(haversine_km(current_latitude::float, current_longitude::float,
+#                             33.68, 73.04)::numeric, 2) AS km
+#     FROM riders WHERE is_available ORDER BY km;
+#   -- a non-zero count here after every saga has finished means a rider leaked:
+#   SELECT count(*) FROM riders WHERE current_order_id IS NOT NULL;
 
 # Redis — the menu cache (database 0) and refresh tokens (database 1)
 docker exec -it sfo-redis redis-cli ping

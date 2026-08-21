@@ -26,7 +26,10 @@ from common.errors import conflict, unprocessable
 from common.postgres import PostgresPool
 from schemas import OrderCreateRequest, OrderTrackingLogCreateRequest
 
-_COLUMNS = "id, customer_id, restaurant_id, items, total_amount, status, idempotency_key"
+_COLUMNS = (
+    "id, customer_id, restaurant_id, rider_id, items, total_amount, status, "
+    "idempotency_key"
+)
 
 _SELECT_BY_ID = f"SELECT {_COLUMNS} FROM orders WHERE id = %s"
 
@@ -65,6 +68,40 @@ _INSERT_LOG = f"""
 
 _SELECT_TIMELINE = f"""
     SELECT {_LOG_COLUMNS} FROM order_tracking_logs WHERE order_id = %s ORDER BY seq
+"""
+
+# A compare-and-set, not a blind UPDATE, and every clause earns its place.
+#
+# Temporal guarantees activities run *at least* once, so this statement is executed more
+# than once for a single logical transition whenever a worker dies mid-activity or a
+# response is lost. Three things follow from that:
+#
+#   `status <> new` makes a replay a no-op instead of a second identical transition, which
+#   is what keeps the audit trail from growing an entry per retry.
+#
+#   `status NOT IN ('delivered','cancelled')` makes the terminal states final. A late
+#   signal for an order that has already been cancelled cannot resurrect it.
+#
+#   The last clause only allows forward movement, except into 'cancelled', which is
+#   reachable from anywhere still in flight. It leans on a property of the schema worth
+#   knowing: a Postgres enum compares by *declaration order*, and `order_status` was
+#   declared in lifecycle order, so `'delivered' > 'assigned'` is simply true. That is why
+#   no separate ordering table is needed here.
+#
+# `rider_id` is COALESCEd so a later transition never clears an assignment made earlier.
+_TRANSITION_ORDER = f"""
+    UPDATE orders
+       SET status = %(new_status)s::order_status,
+           rider_id = COALESCE(%(rider_id)s::uuid, rider_id),
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = %(order_id)s::uuid
+       AND status <> %(new_status)s::order_status
+       AND status NOT IN ('delivered', 'cancelled')
+       AND (
+             %(new_status)s::order_status = 'cancelled'
+             OR %(new_status)s::order_status > status
+           )
+    RETURNING {_COLUMNS}
 """
 
 
@@ -156,6 +193,68 @@ class OrderRepository:
                 },
             )
             return order
+
+    def transition(
+        self,
+        *,
+        order_id: UUID | str,
+        new_status: str,
+        updated_by: str = "system",
+        event: dict | None = None,
+        metadata: dict | None = None,
+        rider_id: UUID | str | None = None,
+    ) -> tuple[dict | None, bool]:
+        """Advance an order and record the transition, in one transaction.
+
+        Returns `(order, changed)`. `changed` is False when the compare-and-set matched
+        nothing — the order is already in that state, or has reached a terminal one — and
+        in that case **no trail entry is written**. That is the whole reason the two writes
+        are guarded together rather than separately: an activity retried five times must
+        leave one entry, not five.
+
+        `old_status` is deliberately not a parameter. It is derived from the preceding entry
+        by the insert itself, so the chain cannot disagree with itself (D24). The first
+        revision of the Week 2 blueprint let the workflow assert a previous status, which a
+        retry or a reordered activity could contradict.
+
+        Returns `(None, False)` when the order does not exist at all, which the caller
+        distinguishes from a no-op because they mean different things to a saga.
+        """
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(
+                _TRANSITION_ORDER,
+                {
+                    "order_id": str(order_id),
+                    "new_status": new_status,
+                    "rider_id": str(rider_id) if rider_id else None,
+                },
+            )
+            updated = cur.fetchone()
+
+            if updated is None:
+                cur.execute(_SELECT_BY_ID, (str(order_id),))
+                current = cur.fetchone()
+                if current is not None:
+                    self._logger.info(
+                        "Order %s is %s; transition to %s is a no-op",
+                        order_id,
+                        current["status"],
+                        new_status,
+                    )
+                return current, False
+
+            _append_log(
+                cur,
+                {
+                    "order_id": str(order_id),
+                    "new_status": new_status,
+                    "service": self._service_name,
+                    "updated_by": updated_by,
+                    "raw_log": json.dumps(event or {"event": f"order_{new_status}"}),
+                    "metadata": Json(metadata or {}),
+                },
+            )
+            return updated, True
 
 
 class OrderTrackingRepository:

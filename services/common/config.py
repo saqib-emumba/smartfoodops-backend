@@ -39,13 +39,23 @@ DEFAULT_AUTH_REDIS_URL = "redis://cache-redis:6379/1"
 ACCESS_TOKEN_TTL_MINUTES = 15
 REFRESH_TOKEN_TTL_DAYS = 7
 
-# Sibling service base URLs. Calls flow payment -> order -> menu -> restaurant -> user, so
-# every service except the Payment Service is addressed by something: nothing calls into
-# payments yet — the Temporal workflow that will is Week 2 work.
+# Sibling service base URLs. Calls used to flow one way only — payment -> order -> menu ->
+# restaurant -> user — with nothing addressing the Payment Service. The Week 2 saga closed
+# that loop: the worker calls payments, restaurants and riders, and the Rider and Restaurant
+# Services call back into orders to relay signals.
 DEFAULT_USER_SERVICE_URL = "http://user-service:8001"
 DEFAULT_RESTAURANT_SERVICE_URL = "http://restaurant-service:8002"
 DEFAULT_MENU_SERVICE_URL = "http://menu-service:8003"
 DEFAULT_ORDER_SERVICE_URL = "http://order-service:8004"
+DEFAULT_PAYMENT_SERVICE_URL = "http://payment-service:8005"
+DEFAULT_RIDER_SERVICE_URL = "http://rider-service:8006"
+
+# The workflow orchestrator. gRPC, so no scheme.
+DEFAULT_TEMPORAL_ADDRESS = "temporal-server:7233"
+
+# One task queue for the order saga. Named here rather than in the workflow so the service
+# that starts a workflow and the worker that runs it cannot disagree about where it goes.
+ORDER_TASK_QUEUE = "order-tasks"
 
 # Ceiling on a single inter-service HTTP round trip. Kept well below the client-facing
 # timeout so a slow dependency surfaces as a 503 rather than hanging the caller.
@@ -63,3 +73,27 @@ MENU_CACHE_TTL_SECONDS = 3600
 # Bounds on each service's PostgreSQL connection pool.
 POOL_MIN_CONNECTIONS = 1
 POOL_MAX_CONNECTIONS = 10
+
+# --- Order saga timings -----------------------------------------------------------------
+#
+# These are workflow-level waits, not HTTP timeouts, and the difference matters: a workflow
+# waiting here holds no thread, no connection and no memory in any service. It is a durable
+# timer in Temporal, so the numbers can be generous in a way an HTTP_TIMEOUT never can.
+
+# How long a kitchen has to accept or decline before the order is cancelled and refunded.
+# Generous on purpose: the alternative is cancelling orders a busy restaurant would have
+# taken, which costs a real sale to save a few seconds.
+RESTAURANT_DECISION_TIMEOUT_SECONDS = 120
+
+# Rider search. Repeated short attempts separated by durable timers rather than one long
+# call, because "no rider free right now" is a condition that resolves with time, and a
+# single blocking attempt cannot wait for it. Total window is attempts x interval.
+RIDER_SEARCH_ATTEMPTS = 6
+RIDER_SEARCH_INTERVAL_SECONDS = 10
+
+# Nothing beyond this is offered the order; a rider 30km away is not a delivery.
+RIDER_MAX_DISTANCE_KM = 10.0
+
+# The one leg with a human walking around in it, so its bound is an hour rather than
+# seconds. Exceeding it means something went wrong that no retry will fix.
+DELIVERY_TIMEOUT_SECONDS = 3600
