@@ -35,6 +35,7 @@ from common.config import (
     DEFAULT_RESTAURANT_SERVICE_URL,
     DEFAULT_RIDER_SERVICE_URL,
     DEFAULT_USER_SERVICE_URL,
+    PAYMENT_HTTP_TIMEOUT,
 )
 from common.errors import unprocessable
 from common.service_client import ServiceClient
@@ -190,8 +191,14 @@ class SagaRestaurantClient:
 
 class SagaPaymentClient:
     def __init__(self, logger: Logger):
+        # The only client here with a non-default timeout. Authorising a card is a round
+        # trip to an external processor and takes seconds, so the platform-wide 5s
+        # HTTP_TIMEOUT would abort a call that was going to succeed.
         self._client = ServiceClient(
-            "Payment Service", PAYMENT_SERVICE_URL, logger=logger
+            "Payment Service",
+            PAYMENT_SERVICE_URL,
+            logger=logger,
+            timeout=PAYMENT_HTTP_TIMEOUT,
         )
 
     def authorize(self, order_id: UUID, amount: str, idempotency_key: str) -> dict:

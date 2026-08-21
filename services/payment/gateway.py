@@ -9,10 +9,13 @@ The idempotency key is forwarded rather than ignored because every real gateway 
 one, and that is what makes a retried charge safe on their side as well as ours.
 """
 
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from logging import Logger
 from uuid import UUID, uuid4
+
+from common.config import MOCK_GATEWAY_LATENCY_SECONDS
 
 # Prefix mirrors Stripe's `ch_` charge ids, with `mock` in the middle so a simulated
 # reference is never mistaken for a real one in a log or a database dump.
@@ -47,6 +50,23 @@ class MockPaymentGateway:
     def authorize(
         self, *, order_id: UUID, amount: Decimal, idempotency_key: str
     ) -> Authorization:
+        # Stand in for the round trip to a real processor, which takes seconds. Returning
+        # instantly made every timeout downstream of here untested: the saga's payment
+        # activity, its retry policy and the HTTP ceiling on the call into this service were
+        # all sized for a latency that never happened.
+        #
+        # A blocking sleep is correct rather than lazy. This method is called from a sync
+        # FastAPI handler, which runs in the threadpool, so the event loop keeps serving
+        # other requests; and the seam deliberately holds no database connection while it
+        # waits (see the module docstring), so the delay costs a thread and nothing else.
+        self._logger.info(
+            "Contacting %s for order %s (%.1fs)",
+            self.name,
+            order_id,
+            MOCK_GATEWAY_LATENCY_SECONDS,
+        )
+        time.sleep(MOCK_GATEWAY_LATENCY_SECONDS)
+
         reference = f"{_REFERENCE_PREFIX}_{uuid4().hex[:24]}"
         self._logger.info(
             "Authorised %s for order %s via %s (reference %s, key %s)",

@@ -61,6 +61,18 @@ ORDER_TASK_QUEUE = "order-tasks"
 # timeout so a slow dependency surfaces as a 503 rather than hanging the caller.
 HTTP_TIMEOUT = 5.0
 
+# How long the mock card gateway pretends to take. A real authorisation is a round trip to
+# an external processor and takes seconds, not milliseconds, and every timeout downstream of
+# it should be sized for that rather than for a function call that returns instantly.
+MOCK_GATEWAY_LATENCY_SECONDS = 5.0
+
+# Calls to the Payment Service get their own, longer ceiling: HTTP_TIMEOUT is 5s, which the
+# gateway latency above would race against and lose. Deliberately still *under* the payment
+# activity's 20s start_to_close_timeout, so a genuinely hung gateway surfaces as a `503`
+# from ServiceClient — a retryable error naming the dependency — rather than as a Temporal
+# activity timeout, which says only that something took too long.
+PAYMENT_HTTP_TIMEOUT = 15.0
+
 # Ceiling on a Redis round trip. Well under HTTP_TIMEOUT: the cache sits inside a request
 # that has its own deadline, and a slow cache must fall back to Postgres rather than spend
 # the whole budget waiting for the copy.
