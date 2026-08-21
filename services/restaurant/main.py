@@ -18,7 +18,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, status
 
 from clients import UserServiceClient
-from common.auth import Principal, current_principal, require_role
+from common.auth import CurrentUser, get_current_user, require_role
 from common.config import required
 from common.errors import not_found
 from common.logging_config import configure_logging
@@ -54,21 +54,21 @@ def health():
 )
 def onboard_restaurant(
     payload: RestaurantOnboardRequest,
-    principal: Principal = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
 ) -> RestaurantResponse:
     """Onboard a restaurant once its owner is verified through the User Service.
 
     The owner is the token's subject, so a restaurant can only ever be onboarded under the
     account making the request.
     """
-    user_service.verify_owner(principal.user_id, principal.token)
-    return RestaurantResponse(**restaurants.onboard(payload, principal.user_id))
+    user_service.verify_owner(current_user.user_id, current_user.token)
+    return RestaurantResponse(**restaurants.onboard(payload, current_user.user_id))
 
 
 @app.get("/api/v1/restaurants/{restaurant_id}", response_model=RestaurantResponse)
 def get_restaurant(
     restaurant_id: UUID,
-    _: Principal = Depends(current_principal),
+    _: CurrentUser = Depends(get_current_user),
 ) -> RestaurantResponse:
     """Expose restaurant state (including is_active) for other services to verify.
 

@@ -22,7 +22,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, status
 
 from clients import OrderServiceClient, UserServiceClient
-from common.auth import Principal, require_internal, require_role
+from common.auth import CurrentUser, require_internal, require_role
 from common.config import RIDER_MAX_DISTANCE_KM, required
 from common.errors import conflict, forbidden, not_found
 from common.logging_config import configure_logging
@@ -70,14 +70,14 @@ def _eta_minutes(distance_km: float | None) -> int:
     return max(MINIMUM_ETA_MINUTES, int(travel) + KITCHEN_PREP_PADDING_MINUTES)
 
 
-def _own_profile(principal: Principal) -> dict:
+def _own_profile(current_user: CurrentUser) -> dict:
     """The calling rider's own row, or 404.
 
     Every rider-facing endpoint below starts here, which is what makes `user_id` from the
     token the only way to address a profile — there is no path that takes a rider id from
     the caller.
     """
-    rider = riders.find_by_user(principal.user_id)
+    rider = riders.find_by_user(current_user.user_id)
     if rider is None:
         raise not_found(
             "You have no rider profile; register one with POST /api/v1/riders first"
@@ -116,28 +116,28 @@ def health():
 )
 def register_rider(
     payload: RiderRegisterRequest,
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> RiderResponse:
     """Enrol the calling account into the delivery fleet.
 
     The rider is the token's subject. There is no way to enrol anybody else — `user_id` is
     not a field a client can send (D13).
     """
-    user_service.verify_rider(principal.user_id, principal.token)
-    return RiderResponse(**riders.register(payload, principal.user_id))
+    user_service.verify_rider(current_user.user_id, current_user.token)
+    return RiderResponse(**riders.register(payload, current_user.user_id))
 
 
 @app.get("/api/v1/riders/me", response_model=RiderResponse)
 def get_own_profile(
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> RiderResponse:
-    return RiderResponse(**_own_profile(principal))
+    return RiderResponse(**_own_profile(current_user))
 
 
 @app.patch("/api/v1/riders/me/location", response_model=RiderResponse)
 def update_location(
     payload: RiderLocationRequest,
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> RiderResponse:
     """Report the rider's current position.
 
@@ -146,7 +146,7 @@ def update_location(
     is unknown cannot be measured against a restaurant.
     """
     updated = riders.update_location(
-        principal.user_id, payload.current_latitude, payload.current_longitude
+        current_user.user_id, payload.current_latitude, payload.current_longitude
     )
     if updated is None:
         raise not_found(
@@ -158,7 +158,7 @@ def update_location(
 @app.patch("/api/v1/riders/me/availability", response_model=RiderResponse)
 def set_availability(
     payload: RiderAvailabilityRequest,
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> RiderResponse:
     """Go on or off shift.
 
@@ -166,14 +166,14 @@ def set_availability(
     dinner. The saga is what releases them, on delivery or on compensation — which is also
     why this returning nothing has two possible causes, separated below.
     """
-    updated = riders.set_availability(principal.user_id, payload.is_available)
+    updated = riders.set_availability(current_user.user_id, payload.is_available)
     if updated is not None:
         return RiderResponse(**updated)
 
     # The UPDATE matched no row. Either there is no profile, or there is one mid-delivery.
     # Distinguishing them costs one read and is the difference between "register first"
     # and "finish your delivery first".
-    rider = _own_profile(principal)
+    rider = _own_profile(current_user)
     raise conflict(
         f"You are carrying order {rider['current_order_id']}; "
         "complete or cancel the delivery before changing availability"
@@ -183,16 +183,16 @@ def set_availability(
 @app.post("/api/v1/riders/me/orders/{order_id}/picked-up", status_code=status.HTTP_204_NO_CONTENT)
 def mark_picked_up(
     order_id: UUID,
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> None:
     """Report collecting an order from the kitchen."""
-    _report(_own_profile(principal), order_id, "rider_pickup")
+    _report(_own_profile(current_user), order_id, "rider_pickup")
 
 
 @app.post("/api/v1/riders/me/orders/{order_id}/delivered", status_code=status.HTTP_204_NO_CONTENT)
 def mark_delivered(
     order_id: UUID,
-    principal: Principal = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_role("rider")),
 ) -> None:
     """Report handing an order to the customer.
 
@@ -201,7 +201,7 @@ def mark_delivered(
     a delivery reported for a workflow that has already been cancelled does not hand a rider
     back twice.
     """
-    _report(_own_profile(principal), order_id, "rider_delivery")
+    _report(_own_profile(current_user), order_id, "rider_delivery")
 
 
 @app.post(

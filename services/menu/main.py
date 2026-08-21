@@ -21,7 +21,7 @@ from pydantic import ValidationError
 
 from cache import MenuCache
 from clients import RestaurantServiceClient
-from common.auth import Principal, current_principal, require_role
+from common.auth import CurrentUser, get_current_user, require_role
 from common.config import DEFAULT_REDIS_URL, required
 from common.errors import forbidden, not_found
 from common.logging_config import configure_logging
@@ -78,7 +78,7 @@ def health():
 @app.post("/api/v1/menus", response_model=MenuResponse)
 async def upsert_menu(
     payload: MenuUpsertRequest,
-    principal: Principal = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
 ) -> MenuResponse:
     """Upsert the full category/item/customization tree for one restaurant.
 
@@ -89,9 +89,9 @@ async def upsert_menu(
     below is blocking and brief, which is the same trade the write path always made.
     """
     restaurant = await restaurant_service.verify_active(
-        payload.restaurant_id, principal.token
+        payload.restaurant_id, current_user.token
     )
-    if str(restaurant.get("owner_id")) != str(principal.user_id) and not principal.is_admin:
+    if str(restaurant.get("owner_id")) != str(current_user.user_id) and not current_user.is_admin:
         raise forbidden(f"You do not own restaurant {payload.restaurant_id}")
 
     categories = [category.model_dump() for category in payload.categories]
@@ -107,7 +107,7 @@ async def upsert_menu(
 @app.get("/api/v1/menus/{restaurant_id}", response_model=MenuResponse)
 def get_menu(
     restaurant_id: UUID,
-    _: Principal = Depends(current_principal),
+    _: CurrentUser = Depends(get_current_user),
 ) -> MenuResponse:
     """Serve the active menu tree — used by the Order Service to price a checkout.
 

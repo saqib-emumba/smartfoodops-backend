@@ -700,14 +700,14 @@ subject.
 
 ```python
 @app.post("/api/v1/riders/me/orders/{order_id}/picked-up", status_code=204)
-def mark_picked_up(order_id: UUID, principal: Principal = Depends(require_role("rider"))):
+def mark_picked_up(order_id: UUID, current_user: CurrentUser = Depends(require_role("rider"))):
     """Report a pickup, and signal the workflow waiting on it.
 
     Authorisation is settled entirely inside this service: the rider row already records
     which order this rider holds, so there is no need to ask the Order Service who was
     assigned — and therefore no second place that could disagree about it (D16).
     """
-    rider = riders.find_by_user(principal.user_id)
+    rider = riders.find_by_user(current_user.user_id)
     if rider is None:
         raise not_found("You have no rider profile")
     if str(rider["current_order_id"]) != str(order_id):

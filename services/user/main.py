@@ -18,8 +18,8 @@ import bcrypt
 from fastapi import Depends, FastAPI, status
 
 from common.auth import (
-    Principal,
-    current_principal,
+    CurrentUser,
+    get_current_user,
     generate_refresh_token,
     issue_access_token,
     require_self_or_admin,
@@ -157,14 +157,14 @@ def refresh_session(payload: RefreshRequest) -> TokenResponse:
 @app.post("/api/v1/users/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(
     payload: RefreshRequest,
-    principal: Principal = Depends(current_principal),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> None:
     """End a session by revoking its refresh token.
 
     The access token already issued stays valid until it expires — that is the trade the
     stateless design makes, and why ACCESS_TOKEN_TTL_MINUTES is short.
     """
-    revoked = refresh_tokens.revoke_owned(payload.refresh_token, principal.user_id)
+    revoked = refresh_tokens.revoke_owned(payload.refresh_token, current_user.user_id)
     if not revoked:
         logger.info("Logout presented a token that was not live for this user")
 
@@ -172,7 +172,7 @@ def logout(
 @app.get("/api/v1/users/{user_id}", response_model=UserResponse)
 def get_user(
     user_id: UUID,
-    principal: Principal = Depends(current_principal),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> UserResponse:
     """Resolve a single profile — the boundary other services read instead of `users`.
 
@@ -181,7 +181,7 @@ def get_user(
     Restaurant Service verifies an owner using that owner's token, the Order Service
     verifies a customer using that customer's.
     """
-    require_self_or_admin(principal, user_id)
+    require_self_or_admin(current_user, user_id)
 
     row = users.find(user_id)
     if row is None:

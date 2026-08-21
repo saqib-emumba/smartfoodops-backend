@@ -446,7 +446,7 @@ expect "no menu published -> 404" 404 GET /api/v1/menus/11111111-1111-1111-1111-
 
 # -------------------------------------------------------- order service
 section "Order Service edge cases"
-expect "missing idempotency key -> 400" 400 POST /api/v1/orders "$ORDER" "${CUST_AUTH[@]}"
+expect "missing idempotency key -> 422" 422 POST /api/v1/orders "$ORDER" "${CUST_AUTH[@]}"
 expect "total_amount mismatch -> 422" 422 POST /api/v1/orders \
   "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"cheddar\"}}],\"total_amount\":1.00}" \
   -H "X-Idempotency-Key: $IDEM-mismatch" "${CUST_AUTH[@]}"

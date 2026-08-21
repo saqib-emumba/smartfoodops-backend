@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, Header, Response, status
 
 from amounts import assert_settles_order, to_cents
 from clients import OrderServiceClient
-from common.auth import Principal, require_internal, require_role
+from common.auth import CurrentUser, require_internal, require_role
 from common.config import required
 from common.errors import bad_request, not_found, unprocessable
 from common.logging_config import configure_logging
@@ -66,7 +66,7 @@ def process_payment(
     payload: PaymentCreateRequest,
     response: Response,
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
-    principal: Principal = Depends(require_role("customer")),
+    current_user: CurrentUser = Depends(require_role("customer")),
 ) -> PaymentResponse:
     """Authorise a payment for an order, at most once per idempotency key.
 
@@ -89,7 +89,7 @@ def process_payment(
     if existing is not None:
         # Confirm the replay comes from whoever owns the order before handing back a
         # payment record; idempotency keys are client-chosen and therefore guessable.
-        order_service.fetch_order(existing["order_id"], principal.token)
+        order_service.fetch_order(existing["order_id"], current_user.token)
         response.status_code = status.HTTP_200_OK
         logger.info("Idempotent replay for key %s", x_idempotency_key)
         return PaymentResponse(**existing)
@@ -98,7 +98,7 @@ def process_payment(
     # Service's database. The HTTP check that replaces it sits here, immediately before the
     # write, and doubles as the guard that the amount settles the order exactly.
     amount = to_cents(payload.amount)
-    order = order_service.fetch_order(payload.order_id, principal.token)
+    order = order_service.fetch_order(payload.order_id, current_user.token)
     assert_settles_order(order, amount)
 
     # (d) Record the intent first: the insert claims the idempotency key, so a concurrent
@@ -220,7 +220,7 @@ def refund_for_saga(payload: PaymentRefundRequest) -> PaymentResponse:
 @app.get("/api/v1/payments/{payment_id}", response_model=PaymentResponse)
 def get_payment(
     payment_id: UUID,
-    principal: Principal = Depends(require_role("customer")),
+    current_user: CurrentUser = Depends(require_role("customer")),
 ) -> PaymentResponse:
     """Expose a payment's state so a saga (or an operator) can see where it stopped.
 
@@ -232,7 +232,7 @@ def get_payment(
     if row is None:
         raise not_found(f"Payment {payment_id} not found")
 
-    order_service.fetch_order(row["order_id"], principal.token)
+    order_service.fetch_order(row["order_id"], current_user.token)
     return PaymentResponse(**row)
 
 

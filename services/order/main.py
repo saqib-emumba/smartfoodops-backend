@@ -20,14 +20,14 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
 from common.auth import (
-    Principal,
-    current_principal,
+    CurrentUser,
+    get_current_user,
     require_internal,
     require_role,
     require_self_or_admin,
 )
 from common.config import DEFAULT_TEMPORAL_ADDRESS, ORDER_TASK_QUEUE, required
-from common.errors import bad_request, conflict, not_found
+from common.errors import conflict, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
 from common.temporal import TemporalGateway, workflow_id_for
@@ -104,8 +104,8 @@ async def health():
 async def create_order(
     payload: OrderCreateRequest,
     response: Response,
-    x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
-    principal: Principal = Depends(require_role("customer")),
+    x_idempotency_key: str = Header(..., alias="X-Idempotency-Key"),
+    current_user: CurrentUser = Depends(require_role("customer")),
 ) -> OrderResponse:
     """Create an order idempotently after re-pricing it against the live menu.
 
@@ -115,15 +115,12 @@ async def create_order(
     Since Week 2 this also hands the committed order to the saga, which is what carries it
     from `created` to `delivered`. Everything before that step is unchanged.
     """
-    if not x_idempotency_key:
-        raise bad_request("X-Idempotency-Key header is required")
-
     # (b) Replay protection — an already-seen key returns the stored order untouched.
     # Scoped to the caller: idempotency keys are client-chosen, so without this check a
     # guessed key would hand back somebody else's order.
     existing = orders.find_by_idempotency_key(x_idempotency_key)
     if existing is not None:
-        require_self_or_admin(principal, existing["customer_id"])
+        require_self_or_admin(current_user, existing["customer_id"])
         response.status_code = status.HTTP_200_OK
         logger.info("Idempotent replay for key %s", x_idempotency_key)
         # A replay also re-attempts the saga. This is what repairs an order whose workflow
@@ -134,13 +131,13 @@ async def create_order(
         await _start_saga(
             existing,
             restaurant_service.verify_restaurant(
-                existing["restaurant_id"], principal.token
+                existing["restaurant_id"], current_user.token
             ),
         )
         return OrderResponse(**existing)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
-    menu = menu_service.fetch_menu(payload.restaurant_id, principal.token)
+    menu = menu_service.fetch_menu(payload.restaurant_id, current_user.token)
     items_snapshot, total = build_order_snapshot(menu, payload)
 
     # (d) Both participants live in other services' databases, so the foreign keys that
@@ -148,20 +145,20 @@ async def create_order(
     # them sit here, immediately before the write, for the same reason. The customer check
     # also outlives the token's role claim: a demoted account fails here even while holding
     # a token minted before the change.
-    user_service.verify_customer(principal.user_id, principal.token)
+    user_service.verify_customer(current_user.user_id, current_user.token)
     # The response is kept, not discarded: `capacity`, `latitude` and `longitude` are on it,
     # and handing them to the saga in its payload is what removed the saga's four HTTP calls
     # to the Restaurant Service (D32). Captured here, at checkout, from a lookup that was
     # already happening.
     restaurant = restaurant_service.verify_restaurant(
-        payload.restaurant_id, principal.token
+        payload.restaurant_id, current_user.token
     )
 
     # (e) The order and the opening 'created' entry of its audit trail commit together —
     # same database, one transaction. There is no window in which one exists without the
     # other, which is what the cross-service HTTP log call could never promise.
     order = orders.create(
-        payload, principal.user_id, items_snapshot, total, x_idempotency_key
+        payload, current_user.user_id, items_snapshot, total, x_idempotency_key
     )
 
     # (f) The order exists; the saga runs it from here.
@@ -229,7 +226,7 @@ async def _start_saga(order: dict, restaurant: dict) -> None:
 @app.get("/api/v1/orders/{order_id}", response_model=OrderResponse)
 def get_order(
     order_id: UUID,
-    principal: Principal = Depends(current_principal),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> OrderResponse:
     """Expose an order — including its server-recalculated `total_amount`.
 
@@ -245,7 +242,7 @@ def get_order(
     if row is None:
         raise not_found(f"Order {order_id} not found")
 
-    require_self_or_admin(principal, row["customer_id"])
+    require_self_or_admin(current_user, row["customer_id"])
     return OrderResponse(**row)
 
 
@@ -255,7 +252,7 @@ def get_order(
 )
 def kitchen_queue(
     restaurant_id: UUID,
-    principal: Principal = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
 ) -> list[KitchenOrderResponse]:
     """The kitchen's rail: this restaurant's orders awaiting a decision, oldest first.
 
@@ -267,7 +264,7 @@ def kitchen_queue(
     what the customer paid. Widening the queue onto `orders` deliberately did not widen what
     a restaurant can read.
     """
-    restaurant_service.verify_owner(restaurant_id, principal.user_id, principal.token)
+    restaurant_service.verify_owner(restaurant_id, current_user.user_id, current_user.token)
     return [
         KitchenOrderResponse(**row) for row in orders.kitchen_queue(restaurant_id)
     ]
@@ -298,7 +295,7 @@ async def _signal_saga_best_effort(order_id: UUID, signal: str, body: dict) -> N
 
 
 async def _decide_kitchen(
-    order_id: UUID, principal: Principal, decision: str
+    order_id: UUID, current_user: CurrentUser, decision: str
 ) -> KitchenDecisionResponse:
     """Record a kitchen decision and tell the saga about it, exactly once.
 
@@ -319,7 +316,7 @@ async def _decide_kitchen(
     if order is None:
         raise not_found(f"Order {order_id} not found")
     restaurant_service.verify_owner(
-        order["restaurant_id"], principal.user_id, principal.token
+        order["restaurant_id"], current_user.user_id, current_user.token
     )
 
     decided, changed = orders.decide_kitchen(order_id, decision)
@@ -354,10 +351,10 @@ async def _decide_kitchen(
 )
 async def accept_order(
     order_id: UUID,
-    principal: Principal = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
 ) -> KitchenDecisionResponse:
     """Accept an order into the kitchen, releasing the saga to find a rider."""
-    return await _decide_kitchen(order_id, principal, "accepted")
+    return await _decide_kitchen(order_id, current_user, "accepted")
 
 
 @app.post(
@@ -366,10 +363,10 @@ async def accept_order(
 )
 async def reject_order(
     order_id: UUID,
-    principal: Principal = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
 ) -> KitchenDecisionResponse:
     """Decline an order, which makes the saga refund the customer and cancel it."""
-    return await _decide_kitchen(order_id, principal, "rejected")
+    return await _decide_kitchen(order_id, current_user, "rejected")
 
 
 @app.get(
@@ -465,7 +462,7 @@ def log_order_status(payload: OrderTrackingLogCreateRequest) -> OrderTrackingLog
 )
 def get_order_timeline(
     order_id: UUID,
-    principal: Principal = Depends(current_principal),
+    current_user: CurrentUser = Depends(get_current_user),
 ) -> list[OrderTrackingLogResponse]:
     """Return every recorded transition for one order, oldest first.
 
@@ -478,7 +475,7 @@ def get_order_timeline(
     if order is None:
         raise not_found(f"Order {order_id} not found")
 
-    require_self_or_admin(principal, order["customer_id"])
+    require_self_or_admin(current_user, order["customer_id"])
     return [OrderTrackingLogResponse(**row) for row in tracking.timeline(order_id)]
 
 
