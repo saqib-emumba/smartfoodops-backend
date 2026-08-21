@@ -1,9 +1,10 @@
 """SmartFoodOps Order Service — idempotent checkout (Port 8004).
 
-Owns the `orders` table in its own PostgreSQL database — payments moved out to the Payment
-Service (Port 8005) along with their table. Prices are always recalculated server-side from
-the Menu Service's published menu, and audit logs are written through the Menu Service so
-that this service never talks to MongoDB directly.
+Owns the `orders` table in its own PostgreSQL database, and the `order_tracking_logs`
+trail beside it — payments moved out to the Payment Service (Port 8005) along with their
+table, while the trail moved in from the Menu Service's MongoDB, because which state an
+order is in is this service's fact. Prices are always recalculated server-side from the
+Menu Service's published menu.
 
 The customer and restaurant an order names live in other services' databases, so they are
 verified over HTTP before the insert — see clients.py.
@@ -14,14 +15,25 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, Header, Response, status
 
 from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
-from common.auth import Principal, current_principal, require_role, require_self_or_admin
+from common.auth import (
+    Principal,
+    current_principal,
+    require_internal,
+    require_role,
+    require_self_or_admin,
+)
 from common.config import required
 from common.errors import bad_request, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
 from pricing import build_order_snapshot
-from repository import OrderRepository
-from schemas import OrderCreateRequest, OrderResponse
+from repository import OrderRepository, OrderTrackingRepository
+from schemas import (
+    OrderCreateRequest,
+    OrderResponse,
+    OrderTrackingLogCreateRequest,
+    OrderTrackingLogResponse,
+)
 
 SERVICE_NAME = "order-service"
 DATABASE_URL = required("DATABASE_URL")
@@ -32,8 +44,9 @@ db = PostgresPool(
     logger=logger,
     exhausted_detail="Database connection pool exhausted; order was not created",
 )
-orders = OrderRepository(db, logger=logger)
-menu_service = MenuServiceClient(logger, service_name=SERVICE_NAME)
+orders = OrderRepository(db, logger=logger, service_name=SERVICE_NAME)
+tracking = OrderTrackingRepository(db)
+menu_service = MenuServiceClient(logger)
 user_service = UserServiceClient(logger)
 restaurant_service = RestaurantServiceClient(logger)
 
@@ -93,12 +106,12 @@ def create_order(
     user_service.verify_customer(principal.user_id, principal.token)
     restaurant_service.verify_restaurant(payload.restaurant_id, principal.token)
 
+    # (e) The order and the opening 'created' entry of its audit trail commit together —
+    # same database, one transaction. There is no window in which one exists without the
+    # other, which is what the cross-service HTTP log call could never promise.
     order = orders.create(
         payload, principal.user_id, items_snapshot, total, x_idempotency_key
     )
-
-    # (e) Audit trail is written through the Menu Service, never straight to MongoDB.
-    menu_service.write_audit_log(order, x_idempotency_key)
 
     return OrderResponse(**order)
 
@@ -124,6 +137,52 @@ def get_order(
 
     require_self_or_admin(principal, row["customer_id"])
     return OrderResponse(**row)
+
+
+@app.post(
+    "/api/v1/orders/logs",
+    response_model=OrderTrackingLogResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_internal)],
+)
+def log_order_status(payload: OrderTrackingLogCreateRequest) -> OrderTrackingLogResponse:
+    """Append a status transition reported by another service.
+
+    Service-to-service only, on the internal key rather than a bearer token: the Order
+    Service writes its own transitions in-process, so anything arriving here is a sibling
+    reporting one it observed — a rider marking a delivery, a workflow cancelling. The
+    customer must not be able to call it themselves, because the audit trail cannot be
+    writable by the party it is about.
+
+    This endpoint replaced `POST /api/v1/menus/logs`; it moved with the table it writes to.
+
+    An unknown order or an invented status is `422`: the request is well formed, and it is
+    the thing it points at that is wrong.
+    """
+    return OrderTrackingLogResponse(**tracking.append(payload))
+
+
+@app.get(
+    "/api/v1/orders/{order_id}/logs",
+    response_model=list[OrderTrackingLogResponse],
+)
+def get_order_timeline(
+    order_id: UUID,
+    principal: Principal = Depends(current_principal),
+) -> list[OrderTrackingLogResponse]:
+    """Return every recorded transition for one order, oldest first.
+
+    Readable by the customer who placed it, or an admin — the same rule as the order
+    itself, decided in the same place (D16). The order is looked up first so an unknown id
+    is `404` rather than an empty list, which would otherwise be indistinguishable from an
+    order that exists and has no trail.
+    """
+    order = orders.find(order_id)
+    if order is None:
+        raise not_found(f"Order {order_id} not found")
+
+    require_self_or_admin(principal, order["customer_id"])
+    return [OrderTrackingLogResponse(**row) for row in tracking.timeline(order_id)]
 
 
 if __name__ == "__main__":

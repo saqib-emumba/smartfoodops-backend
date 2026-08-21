@@ -9,7 +9,7 @@ volumes:
   restaurant_postgres_data:
   order_postgres_data:
   payment_postgres_data:
-  mongodb_data:
+  menu_postgres_data:
   redis_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
@@ -34,6 +34,11 @@ x-order-db-env: &order-db-env
 x-payment-db-env: &payment-db-env
   DATABASE_URL: postgresql://sfo_payment_admin:${PAYMENT_POSTGRES_PASSWORD:?set PAYMENT_POSTGRES_PASSWORD in the root .env}@db-payment-postgres:5432/sfo_payment_core
 
+# The Menu Service replaced MongoDB with a Postgres database of its own, so it now holds a
+# credential like everybody else — the one service that used to be exempt.
+x-menu-db-env: &menu-db-env
+  DATABASE_URL: postgresql://sfo_menu_admin:${MENU_POSTGRES_PASSWORD:?set MENU_POSTGRES_PASSWORD in the root .env}@db-menu-postgres:5432/sfo_menu_core
+
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
 # identity, which is the whole reason the signing is asymmetric. The internal key is shared
@@ -42,7 +47,7 @@ x-jwt-env: &jwt-env
   JWT_PUBLIC_KEY_B64: ${JWT_PUBLIC_KEY_B64:?set JWT_PUBLIC_KEY_B64 in the root .env - scripts/init_bootstrap.sh generates a keypair}
   INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in the root .env}
 
-# The four Postgres containers differ only in credentials, published port, volume and
+# The five Postgres containers differ only in credentials, published port, volume and
 # schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
 # variables (`$$` defers expansion to the container) so it needs no per-database copy.
 x-postgres-base: &postgres-base
@@ -59,7 +64,7 @@ x-postgres-base: &postgres-base
 services:
   # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
   # Each database runs on 5432 inside the network and publishes a distinct host port, so a
-  # local SQL client can reach all four at once.
+  # local SQL client can reach all five at once.
   db-user-postgres:
     <<: *postgres-base
     container_name: sfo-user-db
@@ -112,21 +117,20 @@ services:
       - payment_postgres_data:/var/lib/postgresql/data
       - ./db/payment/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
-  db-nosql:
-    image: mongo:6.0
-    container_name: sfo-mongodb
-    restart: always
+  # Replaced sfo-mongodb: the `menus` collection became a `menus` table here, and
+  # `order_tracking_logs` went to the Order Service's database instead.
+  db-menu-postgres:
+    <<: *postgres-base
+    container_name: sfo-menu-db
+    environment:
+      POSTGRES_DB: sfo_menu_core
+      POSTGRES_USER: sfo_menu_admin
+      POSTGRES_PASSWORD: ${MENU_POSTGRES_PASSWORD}
     ports:
-      - "27017:27017"
+      - "5436:5432" # Maps host 5436 to container 5432
     volumes:
-      - mongodb_data:/data/db
-    networks:
-      - smartfoodops-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - menu_postgres_data:/var/lib/postgresql/data
+      - ./db/menu/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   cache-redis:
     image: redis:7.0-alpine
@@ -207,12 +211,13 @@ services:
     container_name: sfo-menu-service
     restart: always
     environment:
-      <<: *jwt-env
-      MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
+      <<: [*menu-db-env, *jwt-env]
+      # Database 0. The cache is a copy of the table above, never the source of truth, so
+      # this service starts and serves with Redis down — just without the shortcut.
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
     depends_on:
-      db-nosql:
+      db-menu-postgres:
         condition: service_healthy
       cache-redis:
         condition: service_healthy

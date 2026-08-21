@@ -138,29 +138,3 @@ class ServiceClient:
             missing_error=missing_error,
             bad_gateway_hint=bad_gateway_hint,
         )
-
-    def post_best_effort(
-        self, path: str, payload: dict, *, purpose: str, headers: dict | None = None
-    ) -> bool:
-        """POST that reports failures instead of raising them.
-
-        For side effects that must not fail the caller's request — the primary work is
-        already committed, so a rejected or undeliverable POST is logged and swallowed.
-        Returns whether the downstream accepted it.
-        """
-        try:
-            with httpx.Client(timeout=self._timeout) as client:
-                response = client.post(self._url(path), json=payload, headers=headers)
-        except httpx.RequestError as exc:
-            self._logger.error("Could not deliver %s to %s: %s", purpose, self.name, exc)
-            return False
-        if response.status_code >= 400:
-            self._logger.error(
-                "%s rejected %s (%s): %s",
-                self.name,
-                purpose,
-                response.status_code,
-                response.text[:200],
-            )
-            return False
-        return True

@@ -48,3 +48,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code personal overrides (not team-wide)
+.claude/settings.local.json

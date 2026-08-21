@@ -1,54 +1,46 @@
-"""MongoDB access for the `menus` and `order_tracking_logs` collections.
+"""PostgreSQL access for the `menus` table.
 
-Every driver call is funnelled through here so that a PyMongo failure becomes a 503 in
-exactly one place rather than in each route handler.
+One row per restaurant, with the whole category tree in a JSONB column — the shape the
+MongoDB document had, kept deliberately. Publishing is a single `ON CONFLICT` upsert
+rather than a read-then-write, so two owners publishing at once cannot interleave into a
+half-updated menu, and the UNIQUE constraint rather than the application is what enforces
+"one live menu per restaurant".
+
+`restaurant_id` is a plain UUID into the Restaurant Service's database; main.py verifies
+it over HTTP before calling in here (see D02).
 """
 
-from datetime import datetime, timezone
 from uuid import UUID
 
-from pymongo import ReturnDocument
-from pymongo.errors import PyMongoError
+from psycopg2.extras import Json
 
-from datastores import DocumentStores
+from common.postgres import PostgresPool
+
+_COLUMNS = "restaurant_id, categories"
+
+_SELECT_BY_RESTAURANT = f"SELECT {_COLUMNS} FROM menus WHERE restaurant_id = %s"
+
+_UPSERT_MENU = f"""
+    INSERT INTO menus (restaurant_id, categories)
+    VALUES (%s, %s)
+    ON CONFLICT (restaurant_id) DO UPDATE
+       SET categories = EXCLUDED.categories,
+           updated_at = CURRENT_TIMESTAMP
+    RETURNING {_COLUMNS}
+"""
 
 
 class MenuRepository:
-    def __init__(self, stores: DocumentStores):
-        self._stores = stores
+    def __init__(self, db: PostgresPool):
+        self._db = db
 
-    async def upsert_menu(self, restaurant_id: UUID, categories: list[dict]) -> dict:
-        """Replace the category tree for one restaurant, creating the document if new."""
-        now = datetime.now(timezone.utc)
-        try:
-            return await self._stores.db.menus.find_one_and_update(
-                {"restaurant_id": str(restaurant_id)},
-                {
-                    "$set": {"categories": categories, "updated_at": now},
-                    "$setOnInsert": {"created_at": now},
-                },
-                upsert=True,
-                return_document=ReturnDocument.AFTER,
-            )
-        except PyMongoError as exc:
-            raise self._stores.unavailable(exc) from exc
+    def find(self, restaurant_id: UUID) -> dict | None:
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_BY_RESTAURANT, (str(restaurant_id),))
+            return cur.fetchone()
 
-    async def find_menu(self, restaurant_id: UUID) -> dict | None:
-        try:
-            return await self._stores.db.menus.find_one(
-                {"restaurant_id": str(restaurant_id)}
-            )
-        except PyMongoError as exc:
-            raise self._stores.unavailable(exc) from exc
-
-    async def append_status_log(self, order_id: UUID, entry: dict) -> bool:
-        """Append one status transition; returns whether a new document was created."""
-        try:
-            result = await self._stores.db.order_tracking_logs.update_one(
-                {"order_id": str(order_id)},
-                {"$push": {"status_history": entry}},
-                upsert=True,
-            )
-        except PyMongoError as exc:
-            raise self._stores.unavailable(exc) from exc
-        return result.upserted_id is not None
+    def upsert(self, restaurant_id: UUID, categories: list[dict]) -> dict:
+        """Replace the category tree for one restaurant, inserting it if it is new."""
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(_UPSERT_MENU, (str(restaurant_id), Json(categories)))
+            return cur.fetchone()

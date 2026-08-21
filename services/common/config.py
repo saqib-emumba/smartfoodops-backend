@@ -28,7 +28,6 @@ def required(name: str) -> str:
 
 
 # Credential-free datastore endpoints (mirrored by docker-compose.yml).
-DEFAULT_MONGO_URI = "mongodb://db-nosql:27017/smartfoodops_menus"
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
 
 # Refresh tokens live in logical database 1, keeping them clear of the Menu Service's
@@ -52,8 +51,14 @@ DEFAULT_ORDER_SERVICE_URL = "http://order-service:8004"
 # timeout so a slow dependency surfaces as a 503 rather than hanging the caller.
 HTTP_TIMEOUT = 5.0
 
-# Ceiling on MongoDB server-selection and socket operations.
-MONGO_TIMEOUT_MS = 5000
+# Ceiling on a Redis round trip. Well under HTTP_TIMEOUT: the cache sits inside a request
+# that has its own deadline, and a slow cache must fall back to Postgres rather than spend
+# the whole budget waiting for the copy.
+REDIS_TIMEOUT = 2.0
+
+# How long a cached menu may outlive the row it was read from. Only reached when an
+# invalidation is lost (see services/menu/cache.py), so it is a backstop, not the plan.
+MENU_CACHE_TTL_SECONDS = 3600
 
 # Bounds on each service's PostgreSQL connection pool.
 POOL_MIN_CONNECTIONS = 1

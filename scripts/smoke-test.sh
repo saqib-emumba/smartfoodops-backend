@@ -329,26 +329,6 @@ expect "min_selection > max_selection -> 422" 422 POST /api/v1/menus \
 expect "no menu published -> 404" 404 GET /api/v1/menus/11111111-1111-1111-1111-111111111111 \
   "" "${CUST_AUTH[@]}"
 
-# The audit endpoint is service-to-service: a bearer token is the wrong credential for it,
-# and a customer holding one must not be able to write the record of their own order.
-AUDIT_ORDER=$(python3 -c 'import uuid; print(uuid.uuid4())')
-expect "audit log rejects an end-user token -> 401" 401 POST /api/v1/menus/logs \
-  "{\"order_id\":\"$AUDIT_ORDER\",\"status\":\"created\",\"service\":\"smoke-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}" \
-  "${CUST_AUTH[@]}"
-
-if [[ -n "$INTERNAL_KEY" ]]; then
-  expect "audit log creates document -> 201" 201 POST /api/v1/menus/logs \
-    "{\"order_id\":\"$AUDIT_ORDER\",\"status\":\"created\",\"service\":\"smoke-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}" \
-    -H "X-Internal-Key: $INTERNAL_KEY"
-  assert "  first write created the document" "$(jfield "['created_document']")" "True"
-  expect "audit log appends to document -> 201" 201 POST /api/v1/menus/logs \
-    "{\"order_id\":\"$AUDIT_ORDER\",\"status\":\"confirmed\",\"service\":\"smoke-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}" \
-    -H "X-Internal-Key: $INTERNAL_KEY"
-  assert "  second write appended, did not recreate" "$(jfield "['created_document']")" "False"
-else
-  printf '  %sSKIP%s  audit-log writes (INTERNAL_API_KEY not readable from .env)\n' "$DIM" "$RESET"
-fi
-
 # -------------------------------------------------------- order service
 section "Order Service edge cases"
 expect "missing idempotency key -> 400" 400 POST /api/v1/orders "$ORDER" "${CUST_AUTH[@]}"
@@ -386,6 +366,42 @@ SECOND_ORDER_ID=$(jfield "['id']")
 expect "unknown order id -> 404" 404 GET /api/v1/orders/00000000-0000-0000-0000-000000000000 \
   "" "${CUST_AUTH[@]}"
 
+# `order_tracking_logs` moved out of MongoDB and into this service's own database, so the
+# audit endpoint moved with it: POST /api/v1/menus/logs is now POST /api/v1/orders/logs.
+# It stays service-to-service — a customer holding a bearer token must not be able to write
+# the record of their own order.
+expect "audit log rejects an end-user token -> 401" 401 POST /api/v1/orders/logs \
+  "{\"order_id\":\"$ORDER_ID\",\"status\":\"confirmed\",\"service\":\"smoke-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}" \
+  "${CUST_AUTH[@]}"
+
+if [[ -n "$INTERNAL_KEY" ]]; then
+  expect "audit log appends a transition -> 201" 201 POST /api/v1/orders/logs \
+    "{\"order_id\":\"$ORDER_ID\",\"status\":\"confirmed\",\"service\":\"smoke-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}" \
+    -H "X-Internal-Key: $INTERNAL_KEY"
+  # Checkout opened the trail in the same transaction as the order, so the entry before
+  # this one is the 'created' the Order Service wrote for itself.
+  assert "  previous status read from the preceding entry" "$(jfield "['previous_status']")" "created"
+  # Both rejections below come from the engine, not from application checks: the foreign
+  # key knows which orders exist and the order_status enum knows which statuses do. Neither
+  # was possible while this was a MongoDB collection.
+  expect "log against an unknown order -> 422" 422 POST /api/v1/orders/logs \
+    "{\"order_id\":\"00000000-0000-0000-0000-000000000000\",\"status\":\"confirmed\",\"service\":\"smoke-test\",\"raw_log\":\"{}\"}" \
+    -H "X-Internal-Key: $INTERNAL_KEY"
+  expect "log with a status the enum does not define -> 422" 422 POST /api/v1/orders/logs \
+    "{\"order_id\":\"$ORDER_ID\",\"status\":\"teleported\",\"service\":\"smoke-test\",\"raw_log\":\"{}\"}" \
+    -H "X-Internal-Key: $INTERNAL_KEY"
+else
+  printf '  %sSKIP%s  audit-log writes (INTERNAL_API_KEY not readable from .env)\n' "$DIM" "$RESET"
+fi
+
+expect "read the order's tracking timeline" 200 GET "/api/v1/orders/$ORDER_ID/logs" "" "${CUST_AUTH[@]}"
+assert "  trail opens with the checkout transition" "$(jfield "[0]['status']")" "created"
+assert "  the first entry has no predecessor" "$(jfield "[0]['previous_status']")" "None"
+expect "another customer cannot read the timeline -> 403" 403 GET "/api/v1/orders/$ORDER_ID/logs" \
+  "" "${OTHER_AUTH[@]}"
+expect "timeline for an unknown order -> 404" 404 \
+  GET /api/v1/orders/00000000-0000-0000-0000-000000000000/logs "" "${CUST_AUTH[@]}"
+
 # ------------------------------------------------------ payment service
 section "Payment Service edge cases"
 expect "missing idempotency header -> 400" 400 POST /api/v1/payments "$PAYMENT" "${CUST_AUTH[@]}"
@@ -408,13 +424,47 @@ expect "unknown payment id -> 404" 404 GET /api/v1/payments/00000000-0000-0000-0
 
 # ---------------------------------------------- cross-service integration
 section "Cross-service integration"
-expect "order audit trail reached the Menu Service" 200 GET "/api/v1/menus/$REST_ID" "" "${CUST_AUTH[@]}"
-if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-mongodb$'; then
-  HISTORY=$(docker exec sfo-mongodb mongosh smartfoodops_menus --quiet --eval \
-    "const d=db.order_tracking_logs.findOne({order_id:'$ORDER_ID'}); print(d ? d.status_history.map(e=>e.status).join(',') : 'MISSING')" 2>/dev/null | tr -d '\r')
-  assert "  order-service wrote 'created' log via Menu Service" "$HISTORY" "created"
+
+# MongoDB is gone. The `menus` collection became a table in the Menu Service's own
+# database, and `order_tracking_logs` went the other way, into the Order Service's — prove
+# each one landed where it was supposed to, in the database only its owner can reach.
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-menu-db$'; then
+  STORED_ITEMS=$(docker exec sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core -tA \
+    -c "SELECT jsonb_array_length(categories -> 0 -> 'items') FROM menus WHERE restaurant_id = '$REST_ID';" 2>/dev/null | tr -d '\r')
+  assert "  menu stored in sfo_menu_core as a JSONB tree" "$STORED_ITEMS" "2"
 else
-  printf '  %sSKIP%s  MongoDB audit-trail check (docker/sfo-mongodb not reachable)\n' "$DIM" "$RESET"
+  printf '  %sSKIP%s  menu database check (docker/sfo-menu-db not reachable)\n' "$DIM" "$RESET"
+fi
+
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-order-db$'; then
+  # Checkout writes the order and its opening entry in one transaction, so 'created' is
+  # there whether or not the internal key was available to append the second one.
+  EXPECTED_TRAIL="created"
+  [[ -n "$INTERNAL_KEY" ]] && EXPECTED_TRAIL="created,confirmed"
+  TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
+    -c "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id = '$ORDER_ID';" 2>/dev/null | tr -d '\r')
+  assert "  tracking trail stored in sfo_order_core" "$TRAIL" "$EXPECTED_TRAIL"
+  # The foreign key the MongoDB collection could not have. Rejected by the engine, not by
+  # any check the application makes.
+  ORPHAN=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
+    -c "INSERT INTO order_tracking_logs (order_id, new_status, service) VALUES (uuid_generate_v4(), 'created', 'smoke');" 2>&1 | grep -c 'violates foreign key constraint')
+  assert "  a log against a nonexistent order is refused by the engine" "$ORPHAN" "1"
+else
+  printf '  %sSKIP%s  tracking-log database checks (docker/sfo-order-db not reachable)\n' "$DIM" "$RESET"
+fi
+
+# Cache-aside: reads populate Redis, and publishing drops the copy. Without the second
+# half, customers keep being quoted the previous prices until the TTL lapses.
+if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-redis$'; then
+  expect "fetch the menu again (populates the cache)" 200 GET "/api/v1/menus/$REST_ID" "" "${CUST_AUTH[@]}"
+  CACHED=$(docker exec sfo-redis redis-cli EXISTS "menu:$REST_ID" 2>/dev/null | tr -d '\r')
+  assert "  the read populated the Redis cache" "$CACHED" "1"
+  expect "republish the menu" 200 POST /api/v1/menus "$MENU" "${OWNER_AUTH[@]}"
+  CACHED_AFTER=$(docker exec sfo-redis redis-cli EXISTS "menu:$REST_ID" 2>/dev/null | tr -d '\r')
+  assert "  publishing invalidated the cached copy" "$CACHED_AFTER" "0"
+  expect "the menu still serves with the cache cold" 200 GET "/api/v1/menus/$REST_ID" "" "${CUST_AUTH[@]}"
+else
+  printf '  %sSKIP%s  menu cache checks (docker/sfo-redis not reachable)\n' "$DIM" "$RESET"
 fi
 
 # The payments table moved out of the order database entirely — prove both halves of that.

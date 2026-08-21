@@ -25,7 +25,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D06](#d06--the-server-re-prices-every-cart) | The server re-prices every cart | 2026-08-13 | Accepted |
 | [D07](#d07--money-is-decimal-until-the-json-boundary) | Money is `Decimal` until the JSON boundary | 2026-08-13 | Accepted |
 | [D08](#d08--idempotency-keys-are-mandatory-and-a-replay-answers-200) | Idempotency keys are mandatory; a replay answers `200` | 2026-08-13 | Accepted |
-| [D09](#d09--audit-logging-is-best-effort-and-goes-through-the-menu-service) | Audit logging is best-effort, through the Menu Service | 2026-08-13 | Accepted |
+| [D09](#d09--audit-logging-is-best-effort-and-goes-through-the-menu-service) | Audit logging is best-effort, through the Menu Service | 2026-08-13 | Superseded by [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) |
 | [D10](#d10--the-card-gateway-is-a-seam-not-a-scattered-stub) | The card gateway is a seam, not a scattered stub | 2026-08-13 | Accepted |
 | [D11](#d11--authentication-is-rs256-with-the-user-service-as-sole-issuer) | RS256, User Service as sole issuer | 2026-08-18 | Accepted |
 | [D12](#d12--tokens-are-verified-in-process-not-at-the-gateway) | Tokens are verified in-process, not at nginx | 2026-08-18 | Accepted |
@@ -38,6 +38,9 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D19](#d19--secrets-live-only-in-a-gitignored-env) | Secrets live only in a gitignored `.env` | 2026-08-13 | Accepted |
 | [D20](#d20--init_bootstrapsh-regenerates-config-byte-for-byte) | `init_bootstrap.sh` regenerates config byte-for-byte | 2026-08-13 | Accepted |
 | [D21](#d21--blueprint-deviations-are-deliberate-and-recorded) | Blueprint deviations are deliberate and recorded | 2026-08-13 | Accepted |
+| [D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) | MongoDB dropped; menus are JSONB in Postgres | 2026-08-21 | Accepted |
+| [D23](#d23--menus-are-read-through-a-redis-cache-aside-layer) | Menus are read through a Redis cache-aside layer | 2026-08-21 | Accepted |
+| [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) | The tracking trail moved into the order database | 2026-08-21 | Accepted |
 
 ---
 
@@ -45,9 +48,10 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 
 ### D01 — Database-per-service
 
-**Decided:** every Postgres-backed service owns one physical database with its own
-credentials — `sfo_user_core`, `sfo_restaurant_core`, `sfo_order_core`, `sfo_payment_core`
-— plus MongoDB and Redis owned by the Menu Service.
+**Decided:** every service owns one physical database with its own credentials —
+`sfo_user_core`, `sfo_restaurant_core`, `sfo_order_core`, `sfo_payment_core`,
+`sfo_menu_core` — plus Redis, used as a cache by the Menu Service and as a session store by
+the User Service. The Menu Service was the last exception, on MongoDB; D22 closed it.
 
 **Instead of:** one shared database with a schema per service, which is cheaper and is what
 the first cut of the project used.
@@ -167,6 +171,12 @@ payments demand both.
 
 ### D09 — Audit logging is best-effort and goes through the Menu Service
 
+> **Superseded by [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) on 2026-08-21.** Kept because the reasoning below is
+> exactly what changed: the argument for best-effort rested on the log being a separate
+> write after the commit, and once the trail moved into the order database that stopped
+> being true.
+
+
 **Decided:** the Order Service posts the `created` transition to `POST /api/v1/menus/logs`
 and never touches MongoDB. A failure there is logged, not returned.
 
@@ -264,7 +274,7 @@ why that lifetime is short. Redis becomes a hard dependency of the User Service.
 ### D15 — Two kinds of service-to-service credential
 
 **Decided:** calls made *on behalf of a user* forward that user's bearer token unchanged.
-Endpoints no end user may reach — currently only `POST /api/v1/menus/logs` — take a shared
+Endpoints no end user may reach — currently only `POST /api/v1/orders/logs` — take a shared
 `X-Internal-Key` instead.
 
 **Why:** forwarding means a service can never do more than the user who invoked it. That is
@@ -359,11 +369,120 @@ via `UNIQUE`; passwords interpolated from `.env` rather than inlined; schema mou
 and `GET /api/v1/orders/{order_id}` added, because the blueprint hands the Payment Service
 an `ORDER_SERVICE_URL` and no endpoint to call with it.
 
+From the MongoDB migration (D22–D24): psycopg2 and the existing `PostgresPool` chassis
+instead of the blueprint's SQLAlchemy async engines, which would have made the Menu and
+Order Services the only two in the platform with a second way to reach a database; the
+blueprint's redundant `idx_menus_restaurant_id` and speculative GIN index dropped; a `seq
+BIGSERIAL` added to `order_tracking_logs` so `old_status` is derivable; and the blueprint's
+claim that "API validation payloads remain untouched" honoured for the *wire* contract even
+though its own DDL and Pydantic models changed the field names — the endpoint still takes
+`status` / `service` / `raw_log`, and the mapping to `old_status` / `new_status` happens in
+SQL.
+
 **Why:** a blueprint followed exactly where it is wrong produces a broken system; one
 departed from silently produces an unreviewable one. Recording the difference makes the
 deviation itself the reviewable artifact.
 
 **Costs:** the docs must be re-checked whenever a blueprint is revised.
+
+---
+
+## The MongoDB migration
+
+Added 2026-08-21, implementing [postgres-menu-tracking-migration-v2.md](postgres-menu-tracking-migration-v2.md).
+MongoDB held two unrelated things — a catalogue and an audit trail — for one reason: it was
+the NoSQL box on the Week 1 stack diagram. Splitting them sent each to the service that owns
+the fact it records, and left nothing for Mongo to hold.
+
+### D22 — MongoDB was dropped; menus are JSONB in Postgres
+
+**Decided:** the `menus` collection became a `menus` table in `sfo_menu_core`, one row per
+restaurant, with the whole category/item/customization tree in a single `JSONB` column. The
+Mongo container and the `motor` dependency are gone.
+
+**Instead of:** keeping Mongo, or normalising the tree into `categories` / `items` /
+`customization_groups` / `options` tables.
+
+**Why:** the document shape was never the reason to run a second engine — Postgres stores
+the same document in `JSONB` and reads it back the same way. What it adds is a credential
+boundary the Menu Service was the last service to lack (D01), and an engine that enforces
+"one live menu per restaurant" via `UNIQUE (restaurant_id)`, which turns publishing into a
+single `ON CONFLICT` upsert instead of a read-then-write.
+
+Not normalising is the other half of the decision. A menu is read whole, written whole, and
+by exactly one key; four tables would buy joins nobody performs and cost a multi-statement
+transaction on every publish. The relational shape is right for `order_tracking_logs` (D24)
+and wrong here, and the difference is which reads the data actually gets.
+
+**Costs:** no schema enforcement inside the tree — Pydantic remains the only thing checking
+that a menu item has a price, exactly as under Mongo. Querying *inside* the tree ("which
+restaurants serve a vegan main?") has no index behind it; the blueprint's GIN index was
+deliberately not created, because until such a query exists it is a write cost on every
+publish for a read nobody issues. One more container and one more password.
+
+### D23 — Menus are read through a Redis cache-aside layer
+
+**Decided:** `GET /api/v1/menus/{restaurant_id}` reads Redis first, falls back to Postgres,
+populates the key with a one-hour TTL, and publishing deletes the key. Redis failures are
+swallowed on the read path.
+
+**Instead of:** no cache, or write-through on publish.
+
+**Why:** this is the platform's hottest read — every checkout re-prices against it (D06) —
+and one of its coldest writes. Cache-aside rather than write-through because a write-through
+cache is a second place that must agree with the table; deleting the key leaves one, and the
+next reader repopulates it from the row that was actually committed.
+
+Swallowing read-path Redis errors is what keeps the cache from becoming a dependency: with
+Redis down, menus still serve, just always from Postgres. That is why `cache_reachable:
+false` in the health payload does not mean the service is degraded in the way
+`database_reachable: false` does.
+
+**Costs:** two real ones. A failed invalidation serves stale prices for up to the TTL — the
+reason `MenuCache.invalidate` logs at *error* while the read path logs at *warning*, and the
+reason the TTL exists at all. And a reader that misses can repopulate from a row that a
+concurrent publish is about to replace, leaving a stale copy behind the write. Both are
+bounded by an hour and neither is fixed here; a versioned key or a short lock is the answer
+if menus ever change often enough for it to matter.
+
+### D24 — The tracking trail moved into the order database, and stopped being best-effort
+
+**Decided:** `order_tracking_logs` is an append-only table in `sfo_order_core`, one row per
+transition, with a real `REFERENCES orders(id) ON DELETE CASCADE`. The Order Service writes
+the opening `created` entry **in the same transaction as the order insert**.
+`POST /api/v1/menus/logs` became `POST /api/v1/orders/logs`, still internal-key only, and
+`GET /api/v1/orders/{order_id}/logs` was added so the trail is readable through the API
+rather than only through `psql`. This supersedes D09.
+
+**Instead of:** leaving it in Mongo, giving it a database of its own, or appending to a
+JSONB array on `orders`.
+
+**Why:** which state an order is in is the Order Service's fact, so the trail belongs where
+the order does. Putting it there buys three things that were unavailable across a service
+boundary:
+
+* **The foreign key.** An entry against a nonexistent order is refused by the engine, and
+  deleting an order takes its trail with it. Mongo could not express either.
+* **The enum.** `new_status` is the same `order_status` type as `orders.status`, so there is
+  one list of valid statuses and an invented one is a `422` from the database.
+* **The transaction.** D09 argued audit logging had to be best-effort because the order was
+  already committed when the log call fired — returning `500` would tell a client their
+  order failed when it existed. That argument dissolves once both writes share a
+  transaction: nothing is committed, so failing is safe and the client simply retries with
+  the same idempotency key. An order without its first transition can no longer exist.
+
+Append-only rather than a JSONB array on `orders`, because appending to a column rewrites
+the whole order row under MVCC — a chatty delivery would rewrite the order once per GPS
+ping, on the row the checkout path reads.
+
+**Costs:** a `seq BIGSERIAL` had to be added that the blueprint did not have, because
+`created_at` alone cannot order two entries written in one transaction and `old_status` has
+to be derivable without a tie-break; the blueprint's `(order_id, created_at DESC)` index is
+`(order_id, seq DESC)` here for the same reason. `POST /api/v1/menus/logs` is a breaking
+change for anything that called it, and the response body changed with it —
+`created_document` was a document-model artifact and is now `previous_status` plus the row's
+`id`. The trail is no longer writable while the order database is down, which under D09 it
+sort of was — the write simply vanished.
 
 ---
 
@@ -379,5 +498,6 @@ Not yet decided, and worth settling before the code forces an answer:
   via `require_role` and `require_self_or_admin`. Convenient, and unaudited.
 - **Sweeping payments stranded at `pending`** (D10). Week 2's compensation workflow is the
   intended answer; nothing does it today.
-- **Whether the audit trail stays best-effort** (D09) once Week 3's observability work
-  starts reading it.
+- ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24: the opening
+  entry now commits with the order. Transitions reported by *other* services still arrive
+  over HTTP and can still be lost in flight — that half is open.

@@ -12,8 +12,8 @@ Two deliberate choices:
 * Refreshing rotates. The presented token is consumed in the same round trip that reads it
   (GETDEL), so a token replayed by an attacker who captured it finds nothing there.
 
-The User Service is synchronous — psycopg2 and plain `def` handlers — so this uses the
-blocking Redis client, unlike the Menu Service's async one.
+Logical database 1, kept clear of the Menu Service's cache in database 0: an accidental
+FLUSHDB there costs a cache rebuild, not everybody's session.
 """
 
 import hashlib
@@ -22,10 +22,9 @@ from uuid import UUID
 
 import redis
 
-from common.config import REFRESH_TOKEN_TTL_DAYS
+from common.config import REDIS_TIMEOUT, REFRESH_TOKEN_TTL_DAYS
 
 REFRESH_TTL_SECONDS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60
-REDIS_TIMEOUT = 2.0
 
 _KEY_PREFIX = "refresh:"
 

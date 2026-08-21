@@ -1,6 +1,6 @@
 """Pydantic v2 validation schemas for the SmartFoodOps Menu Service."""
 
-from typing import List, Optional
+from typing import List
 from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
@@ -54,12 +54,3 @@ class MenuUpsertRequest(BaseModel):
 class MenuResponse(BaseModel):
     restaurant_id: UUID
     categories: List[MenuCategory]
-
-
-class OrderTrackingLogCreateRequest(BaseModel):
-    order_id: UUID
-    status: str
-    service: str
-    raw_log: str
-    updated_by: Optional[str] = "system"
-    metadata: Optional[dict] = None

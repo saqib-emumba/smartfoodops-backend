@@ -7,7 +7,7 @@ echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
 echo "📂 Creating services, gateway and per-service database directories..."
-mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment},services/{common,user,restaurant,menu,order,payment}}
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu},services/{common,user,restaurant,menu,order,payment}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
@@ -21,9 +21,7 @@ USER_POSTGRES_PASSWORD=sfo_user_password_123
 RESTAURANT_POSTGRES_PASSWORD=sfo_restaurant_password_123
 ORDER_POSTGRES_PASSWORD=sfo_order_password_123
 PAYMENT_POSTGRES_PASSWORD=sfo_payment_password_123
-
-# NoSQL & caching tier (owned by the Menu Service)
-MONGO_DB=smartfoodops_menus
+MENU_POSTGRES_PASSWORD=sfo_menu_password_123
 
 # Services Endpoints (Within Docker Network)
 USER_SERVICE_URL=http://user-service:8001
@@ -51,14 +49,14 @@ JWT_PRIVATE_KEY_B64=$(printf '%s' "$jwt_private_pem" | openssl base64 -A)
 JWT_PUBLIC_KEY_B64=$(printf '%s' "$jwt_public_pem" | openssl base64 -A)
 
 # Shared secret for the service-to-service endpoints no end user may call directly, such as
-# the Menu Service's audit log write.
+# the Order Service's audit log write.
 INTERNAL_API_KEY=$(openssl rand -hex 32)
 EOF
 
 # 3. Write out one initialization migration script per physical database.
 # Each is mounted into its own container, so a service's schema exists only in the database
 # that service holds credentials for.
-echo "🐘 Generating Postgres schemas (db/{user,restaurant,order,payment}/init.sql)..."
+echo "🐘 Generating Postgres schemas (db/{user,restaurant,order,payment,menu}/init.sql)..."
 cat << 'EOF' > db/user/init.sql
 -- ============================================================================
 -- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
@@ -159,15 +157,21 @@ cat << 'EOF' > db/order/init.sql
 -- ============================================================================
 -- Order Service database — sfo_order_core (container sfo-order-db, host port 5434)
 --
--- Owns `orders`. Only the Order Service connects here.
+-- Owns `orders` and the append-only `order_tracking_logs` trail beside it. Only the
+-- Order Service connects here.
 --
 -- `payments` used to live here too. It now belongs to the Payment Service's own database
 -- (sfo_payment_core), which is why neither the table nor the `payment_status` enum is
 -- declared below — see readme/payments-service-migration.md.
 --
+-- `order_tracking_logs` moved the other way: it used to be a MongoDB collection owned by
+-- the Menu Service, and came here because a status transition is an Order Service fact —
+-- see readme/postgres-menu-tracking-migration-v2.md.
+--
 -- Every column pointing at another service's table is a plain UUID: a foreign key
 -- cannot span physical databases, so the reference is verified over HTTP before the
--- insert (see services/order/clients.py) instead of by the engine.
+-- insert (see services/order/clients.py) instead of by the engine. The one real foreign
+-- key here is `order_tracking_logs.order_id`, because both ends live in this database.
 -- ============================================================================
 
 -- Enable UUID extension for secure, non-sequential IDs
@@ -194,6 +198,33 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
 -- Order-history reads filter by customer, which no longer benefits from a foreign key.
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
+
+-- 2. Order Tracking Logs (Append-Only Audit Trail Of Status Transitions)
+-- One row per transition rather than an array on `orders`: appending to a JSONB column
+-- rewrites the whole order row under MVCC, so a chatty delivery would rewrite the order
+-- once per GPS ping. Inserts here touch nothing the checkout path reads.
+CREATE TABLE IF NOT EXISTS order_tracking_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- A genuine foreign key, which the MongoDB collection could not have: an entry for an
+    -- order that does not exist is rejected outright, and deleting an order takes its
+    -- trail with it rather than orphaning rows nothing will ever read again.
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    -- Append order, and the reason it is a sequence rather than a timestamp: entries
+    -- written inside one transaction share a `created_at`, and "the status before this
+    -- one" has to be answerable without a tie-break.
+    seq BIGSERIAL NOT NULL,
+    old_status order_status,          -- Filled in server-side from the preceding entry; NULL on the first
+    new_status order_status NOT NULL, -- Same enum as orders.status, so an invented status name is rejected by the engine
+    service VARCHAR(100) NOT NULL,    -- Microservice that observed the transition
+    updated_by VARCHAR(100) NOT NULL DEFAULT 'system', -- Actor on whose behalf it happened
+    raw_log TEXT,                     -- Event payload as the emitting service serialised it
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb, -- Dynamic per-event fields (idempotency key, ETA, coordinates)
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Serves both reads this table has: the chronological timeline for one order, and the
+-- single-row "what was the status before this entry?" lookup that fills `old_status`.
+CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(order_id, seq DESC);
 EOF
 
 cat << 'EOF' > db/payment/init.sql
@@ -238,6 +269,44 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 EOF
 
+cat << 'EOF' > db/menu/init.sql
+-- ============================================================================
+-- Menu Service database — sfo_menu_core (container sfo-menu-db, host port 5436)
+--
+-- Owns `menus`. Only the Menu Service connects here; every other service reads a menu
+-- through GET /api/v1/menus/{restaurant_id}.
+--
+-- This table replaced the MongoDB `menus` collection. The document shape survived the
+-- move intact inside a single JSONB column: a menu is read and written whole, by
+-- restaurant, so splitting the category/item/option tree into three relational tables
+-- would buy joins nobody performs and cost a transaction on every publish.
+--
+-- `restaurant_id` is a plain UUID pointing into the Restaurant Service's database, where
+-- no foreign key can follow it, so the restaurant is verified over HTTP before the upsert
+-- (see services/menu/clients.py) instead of by the engine.
+-- ============================================================================
+
+-- Enable UUID extension for secure, non-sequential IDs
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- 1. Menus Table (One Row Per Restaurant, Whole Category Tree In JSONB)
+CREATE TABLE IF NOT EXISTS menus (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- UNIQUE is what makes "publish a menu" an upsert rather than an append: one live
+    -- menu per restaurant, enforced by the engine instead of by the application.
+    restaurant_id UUID UNIQUE NOT NULL, -- restaurants.id (Restaurant Service database)
+    categories JSONB NOT NULL DEFAULT '[]'::jsonb, -- Nested categories -> items -> customization groups -> options
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- No index is declared here on purpose. Every read is `WHERE restaurant_id = ...`, which
+-- the UNIQUE constraint above already backs with a btree index; a second one would be
+-- dead weight. A GIN index over `categories` would only pay for itself once something
+-- searches *inside* the tree (e.g. "which restaurants serve a vegan main?"), and until
+-- then it is a write cost on every publish for a query nobody issues.
+EOF
+
 # 4. Write out the Docker Compose orchestration configuration
 echo "🐳 Generating docker-compose.yml..."
 cat << 'EOF' > docker-compose.yml
@@ -252,7 +321,7 @@ volumes:
   restaurant_postgres_data:
   order_postgres_data:
   payment_postgres_data:
-  mongodb_data:
+  menu_postgres_data:
   redis_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
@@ -277,6 +346,11 @@ x-order-db-env: &order-db-env
 x-payment-db-env: &payment-db-env
   DATABASE_URL: postgresql://sfo_payment_admin:${PAYMENT_POSTGRES_PASSWORD:?set PAYMENT_POSTGRES_PASSWORD in the root .env}@db-payment-postgres:5432/sfo_payment_core
 
+# The Menu Service replaced MongoDB with a Postgres database of its own, so it now holds a
+# credential like everybody else — the one service that used to be exempt.
+x-menu-db-env: &menu-db-env
+  DATABASE_URL: postgresql://sfo_menu_admin:${MENU_POSTGRES_PASSWORD:?set MENU_POSTGRES_PASSWORD in the root .env}@db-menu-postgres:5432/sfo_menu_core
+
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
 # identity, which is the whole reason the signing is asymmetric. The internal key is shared
@@ -285,7 +359,7 @@ x-jwt-env: &jwt-env
   JWT_PUBLIC_KEY_B64: ${JWT_PUBLIC_KEY_B64:?set JWT_PUBLIC_KEY_B64 in the root .env - scripts/init_bootstrap.sh generates a keypair}
   INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in the root .env}
 
-# The four Postgres containers differ only in credentials, published port, volume and
+# The five Postgres containers differ only in credentials, published port, volume and
 # schema. Shared settings live here; the healthcheck reads the container's own POSTGRES_*
 # variables (`$$` defers expansion to the container) so it needs no per-database copy.
 x-postgres-base: &postgres-base
@@ -302,7 +376,7 @@ x-postgres-base: &postgres-base
 services:
   # --- 1. DATABASES & CACHING (ONE PER SERVICE) ---
   # Each database runs on 5432 inside the network and publishes a distinct host port, so a
-  # local SQL client can reach all four at once.
+  # local SQL client can reach all five at once.
   db-user-postgres:
     <<: *postgres-base
     container_name: sfo-user-db
@@ -355,21 +429,20 @@ services:
       - payment_postgres_data:/var/lib/postgresql/data
       - ./db/payment/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
-  db-nosql:
-    image: mongo:6.0
-    container_name: sfo-mongodb
-    restart: always
+  # Replaced sfo-mongodb: the `menus` collection became a `menus` table here, and
+  # `order_tracking_logs` went to the Order Service's database instead.
+  db-menu-postgres:
+    <<: *postgres-base
+    container_name: sfo-menu-db
+    environment:
+      POSTGRES_DB: sfo_menu_core
+      POSTGRES_USER: sfo_menu_admin
+      POSTGRES_PASSWORD: ${MENU_POSTGRES_PASSWORD}
     ports:
-      - "27017:27017"
+      - "5436:5432" # Maps host 5436 to container 5432
     volumes:
-      - mongodb_data:/data/db
-    networks:
-      - smartfoodops-network
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      - menu_postgres_data:/var/lib/postgresql/data
+      - ./db/menu/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   cache-redis:
     image: redis:7.0-alpine
@@ -450,12 +523,13 @@ services:
     container_name: sfo-menu-service
     restart: always
     environment:
-      <<: *jwt-env
-      MONGO_URI: mongodb://db-nosql:27017/${MONGO_DB:-smartfoodops_menus}
+      <<: [*menu-db-env, *jwt-env]
+      # Database 0. The cache is a copy of the table above, never the source of truth, so
+      # this service starts and serves with Redis down — just without the shortcut.
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
     depends_on:
-      db-nosql:
+      db-menu-postgres:
         condition: service_healthy
       cache-redis:
         condition: service_healthy

@@ -53,7 +53,7 @@ login() {
 Tokens last 15 minutes. If calls suddenly return `401`, run `login` again (or use
 `POST /api/v1/users/refresh`, section 1.4).
 
-One endpoint — `POST /api/v1/menus/logs` — is service-to-service and takes a shared key
+One endpoint — `POST /api/v1/orders/logs` — is service-to-service and takes a shared key
 instead of a bearer token, so that customers cannot write the audit trail describing their
 own orders. Export it from the same `.env` compose reads:
 
@@ -363,29 +363,6 @@ This is what the Order Service reads to price a checkout.
 curl -s "$BASE/api/v1/menus/$REST_ID" -H "Authorization: Bearer $CUSTOMER" | pretty
 ```
 
-### 3.3 Append an order audit log → `201`
-
-The Order Service posts here rather than writing to MongoDB itself.
-
-```bash
-export LOG_ORDER=$(python3 -c 'import uuid; print(uuid.uuid4())')
-
-curl -s -X POST "$BASE/api/v1/menus/logs" \
-  -H "X-Internal-Key: $INTERNAL_KEY" \
-  -H 'Content-Type: application/json' \
-  -d "{\"order_id\":\"$LOG_ORDER\",\"status\":\"created\",\"service\":\"manual-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\",\"metadata\":{\"note\":\"first\"}}" | pretty
-```
-
-`created_document` is `true` the first time. Post again with a different `status` and it
-turns `false` — the entry is appended to the same document's `status_history`:
-
-```bash
-curl -s -X POST "$BASE/api/v1/menus/logs" \
-  -H "X-Internal-Key: $INTERNAL_KEY" \
-  -H 'Content-Type: application/json' \
-  -d "{\"order_id\":\"$LOG_ORDER\",\"status\":\"confirmed\",\"service\":\"manual-test\",\"raw_log\":\"{}\"}" | pretty
-```
-
 ### Edge cases
 
 | Scenario | Expected |
@@ -395,7 +372,8 @@ curl -s -X POST "$BASE/api/v1/menus/logs" \
 | `base_price` of 0 or less | `422` |
 | No menu published for that restaurant | `404` |
 | Restaurant Service is down | `503` |
-| MongoDB is down | `503` |
+| The menu database is down | `503` |
+| Redis is down | `200` — the read falls through to Postgres; the cache is a copy, not the source of truth |
 
 ```bash
 # Unknown restaurant -> 404 (verified via the Restaurant Service, not the database)
@@ -569,6 +547,40 @@ curl -s "$BASE/api/v1/orders/$ORDER_ID" | field "['total_amount']"
 
 Expect `27.0`. An unknown id is a `404`.
 
+### 4.4 Read the tracking timeline → `200`
+
+`order_tracking_logs` lives in this service's own database, beside `orders`. Creating the
+order wrote its first entry in the same transaction, so the trail is never empty:
+
+```bash
+curl -s "$BASE/api/v1/orders/$ORDER_ID/logs" -H "Authorization: Bearer $CUSTOMER" | pretty
+```
+
+The first entry has `"status": "created"` and a null `previous_status`. Same rule as the
+order itself: the customer who placed it, or a `system_admin`. An unknown id is a `404`.
+
+### 4.5 Append a transition → `201`
+
+Service-to-service, on the internal key rather than a bearer token — a customer must not be
+able to write the record of their own order. The Order Service records its own transitions
+in-process, so this endpoint is for siblings reporting one they observed:
+
+```bash
+curl -s -X POST "$BASE/api/v1/orders/logs" \
+  -H "X-Internal-Key: $INTERNAL_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"order_id\":\"$ORDER_ID\",\"status\":\"confirmed\",\"service\":\"manual-test\",\"raw_log\":\"{}\",\"updated_by\":\"tester\",\"metadata\":{\"note\":\"first\"}}" | pretty
+```
+
+`previous_status` comes back as `created` — derived server-side from the preceding entry, so
+a caller cannot report a transition that contradicts the recorded history.
+
+| Scenario | Expected |
+|---|---|
+| Bearer token instead of `X-Internal-Key` | `401` |
+| `order_id` that no order matches | `422` — the foreign key refuses it |
+| A `status` the `order_status` enum does not define | `422` — the enum refuses it |
+
 ---
 
 ## 5. Payment Service (`:8005`)
@@ -731,16 +743,23 @@ Each returns `503` with a message naming the unreachable service.
 
 ## 7. Verifying what was actually stored
 
-The order audit log is written by the Order Service **through** the Menu Service, so it
-should be in MongoDB even though `order-service` never opens a Mongo connection:
+The audit trail is written by the Order Service into its own database, in the same
+transaction as the order — so a committed order always has a `created` entry, and the
+foreign key guarantees no entry can point at an order that does not exist:
 
 ```bash
-docker exec sfo-mongodb mongosh smartfoodops_menus --quiet \
-  --eval "JSON.stringify(db.order_tracking_logs.findOne({order_id:'$ORDER_ID'}), null, 2)"
+docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
+  -c "SELECT seq, old_status, new_status, service, updated_by FROM order_tracking_logs
+      WHERE order_id = '$ORDER_ID' ORDER BY seq;"
 ```
 
-The order itself, with its priced snapshot, lives in the Order Service's own database —
-`sfo-order-db`, which holds `orders` and nothing else:
+The same trail over HTTP, for the customer who placed the order:
+
+```bash
+curl -s "$BASE/api/v1/orders/$ORDER_ID/logs" -H "Authorization: Bearer $CUSTOMER" | pretty
+```
+
+The order itself, with its priced snapshot, lives in the same database beside it:
 
 ```bash
 docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core \

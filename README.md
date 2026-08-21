@@ -1,8 +1,8 @@
 # SmartFoodOps — Backend (Week 1)
 
 A containerised, five-service food-ordering backend fronted by an Nginx API gateway.
-Everything runs locally through Docker Compose: four PostgreSQL databases, MongoDB, Redis,
-the gateway, and the five FastAPI services.
+Everything runs locally through Docker Compose: five PostgreSQL databases, Redis, the
+gateway, and the five FastAPI services.
 
 ---
 
@@ -25,8 +25,9 @@ would need does not exist.
 └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘   └─────┬─────┘
       │               │           ┌───┴───┐           │               │
       ▼               ▼           ▼       ▼           ▼               ▼
-   Postgres        Postgres    MongoDB  Redis      Postgres        Postgres
-    :5432           :5433       :27017  :6379       :5434           :5435
+   Postgres        Postgres   Postgres  Redis      Postgres        Postgres
+    :5432           :5433       :5436   :6379       :5434           :5435
+                               (menus)  (cache)   (+ tracking)
 ```
 
 Arrows between services are **HTTP calls, not shared tables**. Each service owns its data:
@@ -35,16 +36,23 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 |---|---|---|---|---|
 | `user-service` | 8001 | `roles`, `users`, `riders` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
-| `menu-service` | 8003 | Mongo `menus`, `order_tracking_logs` | `smartfoodops_menus` @ `sfo-mongodb` (27017) + Redis | Restaurant Service (active check) |
-| `order-service` | 8004 | `orders` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing + audit log), User + Restaurant Services (participant checks) |
+| `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
+| `order-service` | 8004 | `orders`, `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant checks) |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
 
 Four rules the code enforces deliberately:
 
 - The Restaurant Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
-- The Order Service never writes to MongoDB — it POSTs to `/api/v1/menus/logs`.
+- The Order Service never reads the `menus` table — it calls `GET /api/v1/menus/{id}`.
 - The Payment Service never reads the `orders` table — it calls `GET /api/v1/orders/{id}`.
 - No service holds credentials for a database it does not own.
+
+**MongoDB is gone.** The `menus` collection became a JSONB table in the Menu Service's own
+Postgres database, read through a Redis cache-aside layer; `order_tracking_logs` became a
+relational table in the Order Service's database, where it can hold a real foreign key
+against the order it describes. See
+[readme/postgres-menu-tracking-migration-v2.md](readme/postgres-menu-tracking-migration-v2.md)
+for the blueprint and D22–D24 in the decision record for what shipped and why.
 
 **Why any of this is the way it is** —
 [readme/key-decisions.md](readme/key-decisions.md) is the decision record: each entry gives
@@ -90,7 +98,7 @@ gets reconciled — a single Postgres instance was hiding the problem, not solvi
 
 - Docker Desktop (Compose v2) — `docker compose version`
 - `curl` and `python3` for the smoke tests below
-- Ports free on the host: **80, 5432, 5433, 5434, 5435, 6379, 27017**
+- Ports free on the host: **80, 5432, 5433, 5434, 5435, 5436, 6379**
 - A `.env` file at the repo root — see below, it is not committed
 
 ---
@@ -108,9 +116,7 @@ USER_POSTGRES_PASSWORD=<choose one>
 RESTAURANT_POSTGRES_PASSWORD=<choose one>
 ORDER_POSTGRES_PASSWORD=<choose one>
 PAYMENT_POSTGRES_PASSWORD=<choose one>
-
-# NoSQL & caching tier (owned by the Menu Service)
-MONGO_DB=smartfoodops_menus
+MENU_POSTGRES_PASSWORD=<choose one>
 
 # Service endpoints (within the Docker network)
 USER_SERVICE_URL=http://user-service:8001
@@ -146,8 +152,7 @@ service talks to which database.
 
 | Key | Required | Notes |
 |---|---|---|
-| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
-| `MONGO_DB` | no | Defaults to `smartfoodops_menus` |
+| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
 Nothing falls back to a baked-in password, at either layer. Compose refuses to start with an
@@ -208,8 +213,10 @@ done
 ```
 
 All six must return `200`. The service health endpoints also report whether their
-backing stores actually round-trip (`database_reachable`, `mongo_reachable`, `redis_reachable`)
-— a `200` with `"database_reachable": false` means the app is up but the DB is not.
+backing stores actually round-trip (`database_reachable`, `cache_reachable`) — a `200` with
+`"database_reachable": false` means the app is up but the DB is not. The Menu Service's
+`"cache_reachable": false` is different in kind: menus still serve, straight from Postgres,
+because the cache is a copy and never the source of truth.
 
 ### Run the test suite
 
@@ -232,9 +239,12 @@ What it covers beyond status codes:
 - **Idempotency** — a replayed `X-Idempotency-Key` returns the *same* order (and the *same*
   payment) id, not a duplicate
 - **Server-side pricing** — asserts the recalculated unit price and total, not just a `201`
-- **Boundary enforcement** — that `order-service` reached MongoDB *through* the Menu Service,
-  by reading `order_tracking_logs` back out
-- **Upsert semantics** — first audit-log write creates the document, the second appends
+- **Where each table landed** — that the menu tree is JSONB in `sfo_menu_core` and the
+  tracking trail is relational rows in `sfo_order_core`, read back out of each database
+- **Referential integrity** — that an entry written against a nonexistent order is refused
+  by the foreign key, which the MongoDB collection had no way to do
+- **Cache-aside** — that a read populates `menu:<restaurant_id>` in Redis, that publishing
+  invalidates it, and that the menu still serves with the cache cold
 - **The payments split** — that the authorised payment landed in `sfo_payment_core` and that
   `sfo_order_core` has no `payments` table at all
 
@@ -315,7 +325,7 @@ Two mechanisms, deliberately different:
 - **On behalf of a user** — the caller's bearer token is forwarded downstream unchanged, so
   a service can never do more than the user who invoked it. The Payment Service reads an
   order with *your* token, which is exactly why it cannot pay for someone else's.
-- **Internal only** — `POST /api/v1/menus/logs` takes `X-Internal-Key` instead. Forwarding
+- **Internal only** — `POST /api/v1/orders/logs` takes `X-Internal-Key` instead. Forwarding
   a user token there would let customers write the audit trail describing their own orders.
 
 ---
@@ -435,9 +445,10 @@ from one place instead of being re-decided in two.
 | `GET` | `/api/v1/restaurants/{restaurant_id}` | any signed-in user | Exposes `is_active` to other services |
 | `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree |
 | `GET` | `/api/v1/menus/{restaurant_id}` | any signed-in user | Used by the Order Service to price a cart |
-| `POST` | `/api/v1/menus/logs` | services only (`X-Internal-Key`) | Appends to `order_tracking_logs.status_history` |
 | `POST` | `/api/v1/orders` | `customer` | `201` new / `200` idempotent replay; customer taken from the token |
 | `GET` | `/api/v1/orders/{order_id}` | the order's customer, or `system_admin` | Exposes the recalculated `total_amount` to the Payment Service |
+| `POST` | `/api/v1/orders/logs` | services only (`X-Internal-Key`) | Appends one row to `order_tracking_logs`; `422` on an unknown order or an undefined status |
+| `GET` | `/api/v1/orders/{order_id}/logs` | the order's customer, or `system_admin` | The full transition timeline, oldest first |
 | `POST` | `/api/v1/payments` | `customer` owning the order | `201` new / `200` idempotent replay; verifies order + amount over HTTP |
 | `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending` or `authorized` |
 
@@ -455,7 +466,7 @@ Interactive docs per service, once you expose a port (see below): `http://localh
 | `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown restaurant; payment naming an unknown order or not settling it exactly |
 | `500` | Postgres connection pool starved |
 | `502` | Unexpected response from an upstream service |
-| `503` | Upstream service unreachable; MongoDB socket timeout |
+| `503` | Upstream service unreachable |
 
 ---
 
@@ -574,18 +585,23 @@ docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core
 docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core
 #   SELECT order_id, amount, status, transaction_reference FROM payments;
 
-# MongoDB
-docker exec -it sfo-mongodb mongosh smartfoodops_menus
-#   db.menus.find().pretty()
-#   db.order_tracking_logs.find().pretty()
+# Order tracking trail — lives beside `orders`, in the same database
+#   SELECT seq, old_status, new_status, service, updated_by
+#     FROM order_tracking_logs WHERE order_id = '<uuid>' ORDER BY seq;
 
-# Redis
+# Menu database — menus (the JSONB tree that replaced the MongoDB collection)
+docker exec -it sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core
+#   SELECT restaurant_id, jsonb_pretty(categories) FROM menus;
+
+# Redis — the menu cache (database 0) and refresh tokens (database 1)
 docker exec -it sfo-redis redis-cli ping
+#   redis-cli KEYS 'menu:*'
+#   redis-cli TTL menu:<restaurant_id>     # counts down from 3600
 ```
 
 `psql` inside the container needs no password (local trust); from a GUI client on your host,
-connect to `localhost:5432` / `:5433` / `:5434` / `:5435` with the matching role and `.env`
-password.
+connect to `localhost:5432` / `:5433` / `:5434` / `:5435` / `:5436` with the matching role
+and `.env` password.
 
 Joining across services is deliberately impossible now. To follow an order to its customer,
 read `customer_id` and call `GET /api/v1/users/{id}` — the same path the services take.
@@ -598,7 +614,7 @@ A schema file runs **only** when its own Postgres volume is empty. After editing
 docker compose down -v && docker compose up --build -d
 ```
 
-This wipes all four Postgres volumes plus Mongo and Redis. To reset a single database,
+This wipes all five Postgres volumes plus Redis. To reset a single database,
 target its volume — the others keep their data:
 
 ```bash
@@ -636,7 +652,7 @@ smartfoodops-backend/
 │   │   └── service_client.py  # Inter-service HTTP + failure translation
 │   ├── user/                  # main.py, repository.py, schemas.py           (:8001)
 │   ├── restaurant/            # + clients.py (User Service)                  (:8002)
-│   ├── menu/                  # + clients.py, datastores.py (Mongo/Redis)    (:8003)
+│   ├── menu/                  # + clients.py, cache.py (Redis cache-aside)   (:8003)
 │   ├── order/                 # + clients.py, pricing.py (re-pricing rules)  (:8004)
 │   └── payment/               # + clients.py, gateway.py, amounts.py         (:8005)
 ├── scripts/smoke-test.sh      # End-to-end assertions across all five services
@@ -654,10 +670,10 @@ Every service follows the same layering, so any one of them can be read the same
 | File | Responsibility |
 |---|---|
 | `main.py` | Wiring and route handlers only — no SQL, no HTTP calls |
-| `repository.py` | All datastore access for the tables/collections this service owns |
+| `repository.py` | All database access for the tables this service owns |
 | `clients.py` | Outbound calls to sibling services |
 | `schemas.py` | Pydantic request/response models (the service's public contract) |
-| `pricing.py`, `datastores.py`, `amounts.py`, `gateway.py` | Service-specific domain or infrastructure detail |
+| `pricing.py`, `cache.py`, `amounts.py`, `gateway.py` | Service-specific domain or infrastructure detail |
 
 `services/common/` is a shared *chassis*, not a shared domain. It holds connection
 pooling, logging, error mapping, and HTTP transport — the plumbing that would otherwise be
@@ -684,12 +700,12 @@ in a single-repo Compose setup; if services ever ship on independent release cyc
 | Schema changes not visible | A `db/*/init.sql` only runs on an empty volume — `docker compose down -v` |
 | `password authentication failed` after changing `.env` | Postgres keeps the password baked into its existing volume. Reset that volume |
 | Port 5433 / 5434 / 5435 already in use | Another Postgres is bound. Stop it, or change the published port for that database |
-| `503` on menu writes | MongoDB unreachable. `docker compose ps db-nosql` |
+| `503` on menu writes | The menu database is unreachable. `docker compose ps db-menu-postgres` |
 | `401` on every call that worked yesterday | The access token expired — they last 15 minutes. `POST /api/v1/users/refresh` with the refresh token, or log in again |
 | `401 Access token is invalid` right after a rebuild | `.env` was regenerated, so tokens signed by the old key no longer verify. Log in again |
 | Services refuse to start: `JWT_PUBLIC_KEY_B64 is not set` | `.env` predates authentication. Add the keypair — see [Environment file](#environment-file) |
 | `403 Not authorised to access this resource in the Order Service` | The order belongs to a different customer. Payments are refused where the order is read, not where the payment is written |
-| `401 This endpoint is internal to SmartFoodOps services` | `POST /api/v1/menus/logs` needs `X-Internal-Key`, not a bearer token — it is service-to-service only |
+| `401 This endpoint is internal to SmartFoodOps services` | `POST /api/v1/orders/logs` needs `X-Internal-Key`, not a bearer token — it is service-to-service only |
 | `409` on a repeated register | Working as intended — email/phone are unique |
 | `409 Order … has already been paid for` | Working as intended — `payments.order_id` is unique, so an order can be charged once. Replay the *original* idempotency key to get that payment back |
 | A payment stuck at `pending` | The gateway call failed after the row was written. Nothing was charged; Week 2's compensation workflow is what will reconcile these |
