@@ -371,7 +371,10 @@ services:
     environment:
       <<: [*order-db-env, *jwt-env]
       TEMPORAL_ADDRESS: temporal-server:7233
-      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      # No RESTAURANT_SERVICE_URL: since D32 the saga never calls that service. The
+      # kitchen's decision is a column in the order database, and the restaurant's capacity
+      # and coordinates ride in the workflow payload, captured once at checkout. Its absence
+      # here is the dependency reduction, made structural rather than merely true in code.
       PAYMENT_SERVICE_URL: http://payment-service:8005
       RIDER_SERVICE_URL: http://rider-service:8006
     depends_on:

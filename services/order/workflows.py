@@ -119,8 +119,6 @@ class OrderWorkflow:
     @workflow.run
     async def run(self, payload: dict) -> dict:
         order_id = payload["order_id"]
-        restaurant_id = payload["restaurant_id"]
-        items = payload.get("items", [])
 
         # 1. Payment. Nothing has been charged yet, so a failure here needs no refund —
         #    only a cancellation. This is the one branch that does not compensate.
@@ -137,22 +135,28 @@ class OrderWorkflow:
             await self._cancel(order_id, "payment_failed", str(exc.cause or exc))
             return {"status": "cancelled", "order_id": order_id, "reason": "payment_failed"}
 
-        await self._transition(order_id, "confirmed", "payment-service")
-
-        # 2. The kitchen. Send the ticket, then wait on a durable timer for a human to
-        #    answer. The workflow is idle here — no thread, no connection, no memory in any
-        #    service — and it survives a worker restart. The first revision modelled this as
-        #    a synchronous HTTP call that returned the decision, which no kitchen can do.
+        # 2. The kitchen. Entering 'confirmed' *is* joining the kitchen's rail, so this
+        #    single transition both records the payment and claims a capacity slot — one
+        #    local transaction, so two orders cannot both take the last one. A full kitchen
+        #    comes back as a non-retryable failure and compensates; there is no separate
+        #    "send the ticket" call any more, because there is no ticket (D32).
         self._stage = "awaiting_kitchen"
         try:
-            await workflow.execute_activity(
-                OrderActivities.send_ticket_activity,
-                {"order_id": order_id, "restaurant_id": restaurant_id, "items": items},
-                start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=TRANSIENT,
+            await self._transition(
+                order_id,
+                "confirmed",
+                "payment-service",
+                capacity_limit=payload["capacity"],
             )
         except ActivityError as exc:
-            return await self._compensate(order_id, "kitchen_refused", str(exc.cause or exc))
+            return await self._compensate(
+                order_id, "kitchen_at_capacity", str(exc.cause or exc)
+            )
+
+        #    Then wait on a durable timer for a human to answer. The workflow is idle here —
+        #    no thread, no connection, no memory in any service — and it survives a worker
+        #    restart. The first revision modelled this as a synchronous HTTP call that
+        #    returned the decision, which no kitchen can do.
 
         try:
             await workflow.wait_condition(
@@ -162,10 +166,9 @@ class OrderWorkflow:
         except asyncio.TimeoutError:
             # The timer expired without a signal. That usually means the kitchen never
             # looked at its rail — but it can also mean the kitchen *did* answer and the
-            # HTTP relay carrying that answer was lost, because the Restaurant Service
-            # commits a decision before relaying it. Read the ticket before concluding
-            # anything: refunding an order the kitchen actually accepted is a real
-            # customer-visible failure, and it is entirely avoidable with one lookup.
+            # signal was lost, because the decision is committed before it is relayed. Read
+            # the order before concluding anything: refunding an order the kitchen actually
+            # accepted is a real customer-visible failure, avoidable with one local lookup.
             self._stage = "recovering_kitchen_decision"
             self._restaurant_decision = await self._recover_kitchen_decision(order_id)
 
@@ -189,7 +192,7 @@ class OrderWorkflow:
         #    start_to_close_timeout and called that the allocation window; that bounds an
         #    attempt, not a search.
         self._stage = "dispatching_rider"
-        assignment = await self._find_rider(order_id, restaurant_id)
+        assignment = await self._find_rider(order_id, payload)
         if assignment is None:
             return await self._compensate(
                 order_id,
@@ -256,6 +259,7 @@ class OrderWorkflow:
         *,
         metadata: dict | None = None,
         rider_id: str | None = None,
+        capacity_limit: int | None = None,
     ) -> None:
         await workflow.execute_activity(
             OrderActivities.transition_order_activity,
@@ -266,6 +270,7 @@ class OrderWorkflow:
                 "event": {"event": f"order_{new_status}", "order_id": order_id},
                 "metadata": metadata or {},
                 "rider_id": rider_id,
+                "capacity_limit": capacity_limit,
             },
             start_to_close_timeout=timedelta(seconds=10),
             retry_policy=STATE,
@@ -274,36 +279,37 @@ class OrderWorkflow:
     async def _recover_kitchen_decision(self, order_id: str) -> str | None:
         """Ask the Restaurant Service what the ticket says, after waiting timed out.
 
-        Returns `"accepted"`, `"rejected"`, or `None` for "no decision on record" — which
-        includes a ticket still `pending`, a ticket already `expired`, and no ticket at all.
+        Returns `"accepted"`, `"rejected"`, or `None` for "no decision on record".
 
-        This is the recovery for the one hole the signal design leaves open: a decision is
-        committed in `sfo_restaurant_core` before the relay carrying it is sent, so a lost
-        relay used to mean a refund for an order that had actually been accepted. Reading
-        the record turns that from a silent wrong answer into a self-correcting one.
+        This is the recovery for the one hole the signal design leaves open: the decision is
+        committed before the signal carrying it is sent, so a lost signal used to mean a
+        refund for an order that had actually been accepted. Reading the record turns that
+        from a silent wrong answer into a self-correcting one.
 
-        A failure to reach the Restaurant Service at all — after the retry policy is
-        exhausted — is treated as "no decision". That is the safe default: refunding an
-        accepted order is recoverable by a human, whereas leaving a charged customer
-        waiting on a saga that will never finish is not.
+        Since D32 the read is local — `orders.kitchen_decision`, in this service's own
+        database — so it uses the STATE retry policy rather than TRANSIENT, and the old
+        "the other service is unreachable so we cannot tell" branch is gone. What remains
+        is only a database that will not answer, and that is treated as no decision: the
+        safe default, because refunding an accepted order is recoverable by a human while
+        leaving a charged customer on a saga that never finishes is not.
         """
         try:
-            ticket = await workflow.execute_activity(
-                OrderActivities.read_ticket_activity,
+            recorded_on_order = await workflow.execute_activity(
+                OrderActivities.read_kitchen_decision_activity,
                 {"order_id": order_id},
                 start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=TRANSIENT,
+                retry_policy=STATE,
             )
         except ActivityError as exc:
             workflow.logger.error(
-                "Could not read the ticket for order %s after the kitchen timeout; "
+                "Could not read the kitchen decision for order %s after the timeout; "
                 "treating it as no decision: %s",
                 order_id,
                 exc.cause or exc,
             )
             return None
 
-        recorded = ticket.get("status")
+        recorded = recorded_on_order.get("decision")
         if recorded in ("accepted", "rejected"):
             # The kitchen had answered all along; only the signal went missing.
             workflow.logger.info(
@@ -314,16 +320,21 @@ class OrderWorkflow:
             return recorded
 
         workflow.logger.info(
-            "Ticket for order %s is '%s'; no decision was ever made", order_id, recorded
+            "Order %s has no kitchen decision on record; the wait was genuine silence",
+            order_id,
         )
         return None
 
-    async def _find_rider(self, order_id: str, restaurant_id: str) -> dict | None:
+    async def _find_rider(self, order_id: str, payload: dict) -> dict | None:
         """Try repeatedly to claim a rider, sleeping on a durable timer between attempts."""
         for attempt in range(RIDER_SEARCH_ATTEMPTS):
             result = await workflow.execute_activity(
                 OrderActivities.dispatch_rider_activity,
-                {"order_id": order_id, "restaurant_id": restaurant_id},
+                {
+                    "order_id": order_id,
+                    "restaurant_latitude": payload["restaurant_latitude"],
+                    "restaurant_longitude": payload["restaurant_longitude"],
+                },
                 start_to_close_timeout=timedelta(seconds=20),
                 retry_policy=TRANSIENT,
             )
@@ -375,16 +386,11 @@ class OrderWorkflow:
         if self._rider_id is not None:
             await self._release_rider(order_id)
 
-        # Free the kitchen's capacity slot. Unconditional, because a ticket exists on every
-        # path that reaches here — and harmless when it has already been decided, since only
-        # `pending` rows move.
-        await workflow.execute_activity(
-            OrderActivities.expire_ticket_activity,
-            {"order_id": order_id},
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=COMPENSATION,
-        )
-
+        # Nothing frees the kitchen's capacity slot, because nothing has to: the rail is
+        # defined as `status = 'confirmed' AND kitchen_decision IS NULL`, so the cancel
+        # below removes this order from it as a side effect of being cancelled. That is the
+        # whole reason D32 could delete the expire-ticket step — and with it an entire class
+        # of leak, where a slot stayed occupied by an order that no longer existed.
         await self._cancel(order_id, reason, detail)
         self._stage = f"cancelled:{reason}"
         return {"status": "cancelled", "order_id": order_id, "reason": reason}

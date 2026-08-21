@@ -46,12 +46,12 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | Service | Port | Owns | Its database (host port) | Reaches out to |
 |---|---|---|---|---|
 | `user-service` | 8001 | `roles`, `users` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
-| `restaurant-service` | 8002 | `restaurants`, `order_tickets` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check), Order Service (signal relay) |
+| `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
 | `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
-| `order-service` | 8004 | `orders`, `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant checks), Temporal |
+| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
-| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (signal relay) |
-| `order-worker` | — | nothing | reads/writes `sfo_order_core` | Payment, Restaurant and Rider Services (saga activities) |
+| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (pickup/delivery signal relay) |
+| `order-worker` | — | nothing | reads/writes `sfo_order_core` | Payment and Rider Services only — the saga does not call the Restaurant Service at all (D32) |
 
 Rules the code enforces deliberately:
 
@@ -60,6 +60,9 @@ Rules the code enforces deliberately:
 - The Payment Service never reads the `orders` table — it calls `GET /api/v1/orders/{id}`.
 - The Rider Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
 - No service holds credentials for a database it does not own.
+- The kitchen's queue is a query over `orders`, not a table of its own. A restaurant
+  admin reads and decides it on the Order Service; whether they *own* that restaurant is
+  still resolved against the Restaurant Service over HTTP (D32).
 - Only two processes hold a Temporal client: `order-service` (starts sagas, relays signals)
   and `order-worker` (runs them). Every other service reports what it observed over HTTP and
   is unaware an orchestrator exists.
@@ -72,11 +75,12 @@ audit trail in one transaction. It then starts a workflow whose id is derived fr
 id, so starting one twice is a no-op.
 
 ```
-created ──payment authorised──▶ confirmed
-                                    │  ticket on the kitchen's rail,
+created ──payment authorised──▶ confirmed  (= on the kitchen's rail;
+                                    │       entering it claims a capacity slot,
+                                    │       checked in the same transaction)
                                     │  durable timer (120s)
                     ┌───────────────┴───────────────┐
-              accepted                      rejected / silence
+              accepted                   rejected / silence / at capacity
                     │                               │
           rider search (6 × 10s)                    │
                     │                               │
@@ -86,8 +90,10 @@ created ──payment authorised──▶ confirmed
  rider signals               ────┴──────────────────┴────▶ COMPENSATE
  picked_up ──▶ delivered                                   refund payment
        │                                                   release rider
- release rider                                             expire ticket
-                                                           ──▶ cancelled
+ release rider                                             ──▶ cancelled
+                                                    (the capacity slot frees
+                                                     itself: a cancelled order
+                                                     is no longer on the rail)
 ```
 
 Every step is idempotent and every wait is a durable timer, so the worker can be killed
@@ -132,10 +138,11 @@ the owning service does, over HTTP, immediately before the write:
 Those status codes are unchanged from the single-database version, where the same failures
 arrived as foreign-key violations.
 
-Two references keep a real foreign key, because both of their ends live in one database:
-`order_tracking_logs.order_id` (which is why that table moved out of MongoDB — D24) and
-`order_tickets.restaurant_id`. `riders.user_id` used to be a third, until the fleet moved
-into its own database in Week 2 and it became a checked reference like the others (D28).
+One reference keeps a real foreign key, because both of its ends live in one database:
+`order_tracking_logs.order_id`, which is why that table moved out of MongoDB (D24).
+`order_tickets.restaurant_id` was a second until D32 deleted that table, and
+`riders.user_id` a third until the fleet moved into its own database (D28) — both are now
+checked references like the rest.
 `payments.order_id` lost its key when the Payment Service split out, which is why
 `GET /api/v1/orders/{order_id}` exists at all — an HTTP call is what replaced that
 constraint.
@@ -542,12 +549,16 @@ The saga is now parked on a durable timer waiting for a human. The restaurant re
 and answers:
 
 ```bash
-curl -s http://localhost/api/v1/restaurants/<RESTAURANT_UUID>/tickets \
+curl -s http://localhost/api/v1/orders/kitchen/<RESTAURANT_UUID> \
   -H "Authorization: Bearer $OWNER"
 
-curl -s -X POST http://localhost/api/v1/restaurants/tickets/<ORDER_UUID>/accept \
+curl -s -X POST http://localhost/api/v1/orders/<ORDER_UUID>/accept \
   -H "Authorization: Bearer $OWNER"
 ```
+
+Both live on the *Order* Service, because since D32 the kitchen's queue is a query over
+`orders` rather than a table of its own. Whether the caller owns that restaurant is still
+the Restaurant Service's fact, resolved over HTTP before the decision is recorded.
 
 Accepting releases the saga to search for a rider; rejecting — or saying nothing for 120
 seconds — refunds the customer, expires the ticket and cancels the order.
@@ -602,9 +613,9 @@ curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bear
 | `GET` | `/api/v1/orders/{order_id}/logs` | the order's customer, or `system_admin` | The full transition timeline, oldest first |
 | `POST` | `/api/v1/payments` | `customer` owning the order | `409` for a saga-owned order (D30); otherwise `201`/`200` idempotent replay |
 | `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending`, `authorized` or `refunded` |
-| `GET` | `/api/v1/restaurants/{restaurant_id}/tickets` | `restaurant_admin` owning it | The kitchen's rail, oldest first; `?ticket_status=` to filter |
-| `POST` | `/api/v1/restaurants/tickets/{order_id}/accept` | `restaurant_admin` owning it | Releases the saga to dispatch a rider; second call is a no-op |
-| `POST` | `/api/v1/restaurants/tickets/{order_id}/reject` | `restaurant_admin` owning it | Triggers refund + cancel |
+| `GET` | `/api/v1/orders/kitchen/{restaurant_id}` | `restaurant_admin` owning it | The kitchen's rail, oldest first. Returns a narrowed projection — no `total_amount`, `customer_id` or `idempotency_key` |
+| `POST` | `/api/v1/orders/{order_id}/accept` | `restaurant_admin` owning it | Releases the saga to dispatch a rider; `changed: false` on a second call |
+| `POST` | `/api/v1/orders/{order_id}/reject` | `restaurant_admin` owning it | Triggers refund + cancel |
 | `POST` | `/api/v1/riders` | `rider` | `201`; rider taken from the token, live role re-checked over HTTP |
 | `GET` | `/api/v1/riders/me` | `rider` | Own profile — availability, location, current order |
 | `PATCH` | `/api/v1/riders/me/location` | `rider` | Until a location is reported, the rider is invisible to dispatch |
@@ -617,12 +628,8 @@ curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bear
 | Method | Path | Called by | Notes |
 |---|---|---|---|
 | `POST` | `/api/v1/orders/logs` | any service | Appends one reported transition; `422` on an unknown order or undefined status |
-| `POST` | `/api/v1/orders/{order_id}/signals` | Restaurant, Rider | The one door into a running saga; `404` if it has finished |
+| `POST` | `/api/v1/orders/{order_id}/signals` | Rider | Carries pickup/delivery only — a kitchen decision has its own authenticated endpoint (D32) |
 | `GET` | `/api/v1/orders/{order_id}/internal` | Payment, worker | Same order as the bearer path, for callers with no user |
-| `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | worker | Coordinates for proximity dispatch |
-| `POST` | `/api/v1/restaurants/tickets` | worker | Idempotent on `order_id`; `{"queued": false}` when at capacity |
-| `GET` | `/api/v1/restaurants/tickets/{order_id}` | worker | Reads a decision back when its signal was lost in flight |
-| `POST` | `/api/v1/restaurants/tickets/{order_id}/expire` | worker | Compensation; `pending`-only, so it cannot overwrite a decision |
 | `POST` | `/api/v1/payments/authorize` | worker | Amount as a **string** so the decimal stays exact (D07) |
 | `POST` | `/api/v1/payments/refund` | worker | Compensation; idempotent by status, and sweeps stranded `pending` rows |
 | `POST` | `/api/v1/riders/dispatch` | worker | Claims the nearest rider; `{"assigned": false}` is a `200`, not an error |
@@ -750,16 +757,18 @@ docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core
 #   \dt              list tables
 #   SELECT u.email, r.name FROM users u JOIN roles r ON r.id = u.role_id;
 
-# Restaurant database — restaurants and the kitchen queue
+# Restaurant database — restaurants only (the kitchen queue moved to `orders`, D32)
 docker exec -it sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core
-#   SELECT order_id, status, created_at FROM order_tickets ORDER BY created_at DESC LIMIT 5;
-#   -- capacity is a count of *pending* tickets, so this is what a full kitchen looks like:
-#   SELECT r.name, r.capacity, count(t.id) FILTER (WHERE t.status = 'pending') AS on_rail
-#     FROM restaurants r LEFT JOIN order_tickets t ON t.restaurant_id = r.id GROUP BY 1, 2;
+#   SELECT id, name, capacity FROM restaurants;
 
-# Order database — orders (payments are NOT here any more)
+# Order database — orders, their kitchen decisions, and the tracking trail
 docker exec -it sfo-order-db psql -U sfo_order_admin -d sfo_order_core
-#   SELECT id, status, rider_id, total_amount FROM orders ORDER BY created_at DESC LIMIT 5;
+#   SELECT id, status, kitchen_decision, rider_id, total_amount
+#     FROM orders ORDER BY created_at DESC LIMIT 5;
+#   -- the kitchen's rail: confirmed and undecided. This one predicate is both the admin's
+#   -- queue and the capacity count, which is why one partial index serves both.
+#   SELECT restaurant_id, count(*) FROM orders
+#    WHERE status = 'confirmed' AND kitchen_decision IS NULL GROUP BY 1;
 
 # Payment database — payments
 docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core

@@ -7,7 +7,7 @@ actually do, and how the three sibling services (Payment, Restaurant, Rider) par
 - **What to build, and why it differs from the original plan** →
   [week2-temporal-orchestration-blueprint.md](week2-temporal-orchestration-blueprint.md)
 - **Why each choice was made, against what alternative** →
-  [key-decisions.md](key-decisions.md) (D25–D31)
+  [key-decisions.md](key-decisions.md) (D25–D32)
 - **This document** → how it runs, end to end, including every way it can fail
 
 ---
@@ -45,22 +45,29 @@ stays completely unaware that an orchestrator exists — they see HTTP requests 
 but travel in opposite directions:
 
 ```
- order-worker ──X-Internal-Key──▶ payment-service      (authorize / refund)
- order-worker ──X-Internal-Key──▶ restaurant-service   (send ticket / expire ticket)
- order-worker ──X-Internal-Key──▶ rider-service         (dispatch / release)
+ order-worker ──X-Internal-Key──▶ payment-service   (authorize / refund)
+ order-worker ──X-Internal-Key──▶ rider-service     (dispatch / release)
+ order-worker ────── local SQL ──▶ sfo_order_core   (status, trail, kitchen decision)
 
- restaurant-service ──X-Internal-Key──▶ order-service  POST /orders/{id}/signals
- rider-service      ──X-Internal-Key──▶ order-service  POST /orders/{id}/signals
+ rider-service ──X-Internal-Key──▶ order-service    POST /orders/{id}/signals
+                                                    (pickup / delivery only)
+
+ restaurant admin ──bearer token──▶ order-service   POST /orders/{id}/accept|reject
+                                                    (no relay: the Order Service owns
+                                                     both the column and the workflow)
 ```
 
 - **`order-service`** starts a workflow when an order is created, and exposes the one door
   a signal can enter through: `POST /api/v1/orders/{id}/signals`.
 - **`order-worker`** is a separate container running the same image, polling the
   `order-tasks` task queue. It hosts the workflow's *logic* and every *activity* — the actual
-  HTTP calls out to Payment, Restaurant and Rider.
-- **Payment, Restaurant, Rider** never import `temporalio`. They answer plain HTTP requests
-  and, for Restaurant/Rider, occasionally call back into `order-service`'s signal endpoint to
-  report something a human just did (a kitchen decision, a pickup, a delivery).
+  HTTP calls out to Payment and Rider. **Not Restaurant**: since D32 the saga never calls
+  that service, and `order-worker` does not even have `RESTAURANT_SERVICE_URL` in its
+  environment.
+- **Payment and Rider** never import `temporalio`. They answer plain HTTP requests, and the
+  Rider Service calls back into `order-service`'s signal endpoint to report a pickup or a
+  delivery. The kitchen's decision arrives differently — an admin posts it straight to the
+  Order Service, which owns both the column it lands in and the workflow it notifies.
 
 This split is what a worker restart can prove safe: the workflow's *state* lives inside
 Temporal's own storage, not inside `order-worker`'s process memory. Kill the container, and
@@ -73,7 +80,7 @@ makes the workflow replayable:
 
 | Primitive | Direction | Used for | Example in this saga |
 |---|---|---|---|
-| **Activity** | workflow → outside world | any side effect (HTTP call, DB write) | `authorize_payment_activity` |
+| **Activity** | workflow → outside world | any side effect (HTTP call, DB write) — and one pure read, `read_kitchen_decision_activity` | `authorize_payment_activity` |
 | **Signal** | outside world → workflow | reporting an event that already happened | `restaurant_decision`, `rider_pickup`, `rider_delivery` |
 | **Query** | outside world → workflow (read-only) | asking the workflow's current state, with no side effect | `stage()` |
 
@@ -82,9 +89,12 @@ activity directly (`workflows.py:80-100`). Only the `run()` coroutine, on its ow
 reacts to what a signal set. That is what keeps the ordering of side effects deterministic
 regardless of exactly when a signal happens to arrive.
 
-`WorkflowSignalRequest.signal` (`schemas.py`) is a Pydantic `Literal["restaurant_decision",
-"rider_pickup", "rider_delivery"]`, so a typo in a signal name is a `422` at the relay
-endpoint rather than a signal Temporal accepts and nothing ever reads.
+`WorkflowSignalRequest.signal` (`schemas.py`) is a Pydantic
+`Literal["rider_pickup", "rider_delivery"]`, so a typo is a `422` at the relay endpoint
+rather than a signal Temporal accepts and nothing ever reads. `restaurant_decision` is
+deliberately *not* in that list: since D32 a kitchen decision arrives through an
+authenticated endpoint that records it and signals in one place, and leaving it reachable via
+the relay as well would be a second, unauthenticated way to do the same thing.
 
 ### How the Order Service wires into Temporal
 
@@ -113,19 +123,21 @@ Postgres pool and the Temporal connection — composed with one `AsyncExitStack`
     ├── declined ─────────────────────────────────────────▶ cancelled  (no refund needed)
     │
     ▼ authorized
- confirmed
-    │  send_ticket_activity
-    ▼
+ confirmed   ← entering this state IS joining the kitchen's rail, and the
+    │            capacity check happens in the same transaction (D32)
+    ├── kitchen already full ─────────────────────────────▶ COMPENSATE ──▶ cancelled
+    │
+    ▼ on the rail
  awaiting_kitchen
     │  restaurant_decision signal, or 120s silence
     │
-    │  on timeout: read the ticket back before concluding anything —
-    │  a decision is committed before the signal carrying it is sent,
-    │  so silence may just mean the relay was lost (§6.5)
+    │  on timeout: read orders.kitchen_decision before concluding
+    │  anything — the decision is committed before the signal carrying
+    │  it is sent, so silence may just mean the signal was lost (§6.5)
     │
     ├── rejected, or genuinely no decision ───────────────▶ COMPENSATE ──▶ cancelled
     │
-    ▼ accepted (signalled, or recovered from the ticket)
+    ▼ accepted (signalled, or recovered from the order row)
  searching_for_rider
     │  dispatch_rider_activity, up to 6× / 10s apart
     ├── no rider found ───────────────────────────────────▶ COMPENSATE ──▶ cancelled
@@ -173,17 +185,18 @@ TEMPORAL  ── hands the run to ──▶  ORDER-WORKER
                           authorize_payment_activity ────────▶ PAYMENT SERVICE
                                         │  (declined → cancel, no refund needed)
                                         ▼ authorized
-                              transition → confirmed
-                                        │
-                                        ▼
-                            send_ticket_activity ───────────▶ RESTAURANT SERVICE
+                       transition → confirmed  + claim a capacity slot
+                                        │        (one local transaction; full → compensate)
                                         │
                           wait_condition(restaurant_decision, timeout=120s)
                                         │
-                                        │◀── signal: restaurant_decision ─── RESTAURANT SVC
-                                        │        (relayed from an admin's POST .../accept)
+                                        │◀── signal: restaurant_decision ─── ORDER SERVICE
+                                        │        (an admin's POST /orders/{id}/accept wrote
+                                        │         the decision, then signalled — same service)
                                         ▼ accepted
                           dispatch_rider_activity  (×1..6, 10s apart) ─────▶ RIDER SERVICE
+                                        │  (coordinates come from the workflow payload,
+                                        │   not from a call to the Restaurant Service)
                                         │
                                         ▼ assigned
                               transition → assigned  (rider_id set)
@@ -263,15 +276,15 @@ survive that.
 | Order status transition | Compare-and-set: `status <> new AND status NOT IN ('delivered','cancelled') AND (new='cancelled' OR new > status)` | `order/repository.py::OrderRepository.transition` |
 | Payment authorization | Idempotency key **derived** from the order id (`wf-pay-{order_id}`), enforced by `UNIQUE(idempotency_key)` | `activities.py::payment_key`, `payment/repository.py` |
 | Payment refund | Idempotent by **status**, not by key — a `refunded` row is returned unchanged | `payment/repository.py::mark_refunded` |
-| Kitchen ticket creation | `order_id UNIQUE`, `ON CONFLICT DO NOTHING` | `restaurant/repository.py::enqueue` |
-| Ticket accept / reject / expire | `WHERE status = 'pending'` — only the first decision sticks | `restaurant/repository.py::decide` / `expire` |
+| Joining the kitchen's rail | Capacity counted and the transition written in **one** transaction, so two orders cannot both take the last slot | `order/repository.py::transition` (`capacity_limit`) |
+| Kitchen accept / reject | `WHERE status = 'confirmed' AND kitchen_decision IS NULL` — only the first decision sticks, and a cancelled order cannot be decided at all | `order/repository.py::decide_kitchen` |
 | Rider dispatch | Checks `current_order_id` **before** claiming; a retry that skipped this would strand the first rider | `rider/repository.py::dispatch` |
 | Rider release | Zero rows affected = already released = success | `rider/repository.py::release` |
 | Saga start | `WorkflowIDConflictPolicy.USE_EXISTING` + workflow id = `order-{order_id}` | `order/main.py::_start_saga` |
 
 That is seven of the eight activities registered on the worker
 (`worker.py::Worker(activities=[...])`), plus the one non-activity idempotency guard (saga
-start) that lives in the HTTP handler instead. The eighth activity, `read_ticket_activity`,
+start) that lives in the HTTP handler instead. The remaining activity, `read_kitchen_decision_activity`,
 is absent from this table because it is the only pure **read** in the set — it has no side
 effect to make idempotent (§6.5).
 
@@ -311,15 +324,18 @@ steps, in this order:
    release_rider_activity     only if a rider had actually been claimed
         │
         ▼
-   expire_ticket_activity     always: frees the kitchen's pending-ticket capacity slot
-        │
-        ▼
-   transition → cancelled
+   transition → cancelled     frees the capacity slot as a side effect: the rail is
+                              "confirmed AND undecided", which a cancelled order is not
 ```
 
 Refund goes first because it is the customer's money. The rider release comes next, and only
 conditionally — the first revision of the blueprint refunded and stopped, which is exactly
 how every dispatched rider ended up leaking `is_available = FALSE` forever.
+
+There used to be a third step, `expire_ticket_activity`, to hand the kitchen's capacity slot
+back. D32 deleted it: with the rail defined as `status = 'confirmed' AND kitchen_decision IS
+NULL`, cancelling the order removes it from the rail by definition. The step is not just
+unnecessary — the leak it existed to prevent is now unrepresentable.
 
 ### 6.1 Business-outcome failures (each is a **first-attempt**, non-retried decision)
 
@@ -331,31 +347,32 @@ compensation shown above:
  card declined ─────────────────────────────────────▶ cancel only
                                                         (nothing was ever charged)
 
- kitchen rejects        ┐
- kitchen silent (120s)  │
- kitchen at capacity *  ├──────────────────────────▶ COMPENSATE ──▶ cancelled
- no rider (6× / 10s)    │                             refund → release † → expire
+ kitchen at capacity    ┐
+ kitchen rejects        │
+ kitchen silent (120s)  ├──────────────────────────▶ COMPENSATE ──▶ cancelled
+ no rider (6× / 10s)    │                             refund → release † → cancel
  pickup timeout (1h)    │
  delivery timeout (1h)  ┘
 
-   * capacity refusal has no ticket to expire yet — see the note below
-   † release only runs if `self._rider_id` was actually set (i.e. one had been claimed)
+   † release only runs if `self._rider_id` was actually set (i.e. one had been claimed).
+     There is no third step: cancelling the order frees the kitchen's capacity slot by
+     definition, because the rail is "confirmed AND undecided" (D32).
 ```
 
 | Scenario | Detected by | Compensation run |
 |---|---|---|
 | **Card declined** | `authorize_payment_activity` sees `payment.status != "authorized"` | None — nothing was charged. Straight to `cancelled`. |
-| **Kitchen rejects** | `restaurant_decision` signal carries `"rejected"` | Refund → release rider (none claimed yet) → expire ticket → `cancelled` |
-| **Kitchen never answers** | `wait_condition(..., timeout=120s)` raises `asyncio.TimeoutError`, **then** `read_ticket_activity` confirms the ticket is still `pending`/`expired`/absent | Same as above — only genuine silence is treated as a refusal (§6.5) |
-| **Kitchen at capacity** | `send_ticket_activity` sees `{"queued": false}` | Refund → cancel (no ticket was ever created — see note below) |
-| **No rider within 10km after 6 tries (60s)** | `dispatch_rider_activity` returns `{"assigned": false}` every time | Refund → release rider (none claimed) → expire ticket → `cancelled` |
+| **Kitchen at capacity** | `transition_order_activity` raises `AtCapacity` from the guarded `confirmed` transition | Refund → `cancelled`. The order never reaches `confirmed`, so its trail reads `created,cancelled` |
+| **Kitchen rejects** | `restaurant_decision` signal carries `"rejected"` | Refund → release rider (none claimed yet) → `cancelled` |
+| **Kitchen never answers** | `wait_condition(..., timeout=120s)` raises `asyncio.TimeoutError`, **then** `read_kitchen_decision_activity` confirms `orders.kitchen_decision` is still NULL | Same as above — only genuine silence is treated as a refusal (§6.5) |
+| **No rider within 10km after 6 tries (60s)** | `dispatch_rider_activity` returns `{"assigned": false}` every time | Refund → release rider (none claimed) → `cancelled` |
 | **Rider never picks up (1h)** / **never delivers (1h)** | `wait_condition` timeout | Full compensation, including releasing the rider who *was* claimed |
 
-> Capacity refusal is the one compensation path that reaches `_compensate()` with no ticket
-> to expire. `expire_ticket_activity` handles this gracefully — the Restaurant Service
-> answers `422 "no ticket to expire"`, which the activity catches and logs rather than
-> propagating, since a lost capacity-slot cleanup must never block the refund that actually
-> matters to the customer (`activities.py::expire_ticket_activity`).
+> Capacity refusal is the only path that compensates an order which never reached
+> `confirmed`. `cancelled` is reachable from any non-terminal state (D31), so the rollback
+> works unchanged — and because the gate runs *before* the transition, a refused order never
+> occupied a slot in the first place. `scripts/smoke-test.sh` asserts that its trail reads
+> exactly `created,cancelled`.
 
 ### 6.2 Transport failures (retried automatically, invisible to the customer)
 
@@ -393,7 +410,7 @@ idempotency guards exist, and here is the concrete path through one of them:
 nothing about the wait ever lived in the worker's own memory:
 
 ```
- t0  order-worker-A   send_ticket_activity completes ──▶ recorded in Temporal's history
+ t0  order-worker-A   transition → confirmed completes ──▶ recorded in Temporal's history
  t1  order-worker-A   parks on wait_condition(restaurant_decision, timeout=120s)
  t2  order-worker-A   ✗ container killed  (crash, or `docker compose stop`)
               │
@@ -402,7 +419,7 @@ nothing about the wait ever lived in the worker's own memory:
               ▼
  t3  order-worker-B   starts, polls task queue "order-tasks"
  t4  order-worker-B   Temporal replays the history deterministically —
-                       reconstructs "ticket already sent, now waiting on the timer"
+                       reconstructs "already confirmed, now waiting on the timer"
  t5  restaurant admin accepts ──signal──▶ order-worker-B resumes run() right here
  t6  order-worker-B   dispatch_rider_activity, ... continues exactly as normal
 ```
@@ -467,49 +484,53 @@ assigned, and the other three run the full compensation path.
 
 ### 6.5 A lost kitchen decision — and why a timeout is not trusted on its own
 
-The signal relay has an unavoidable ordering problem: the Restaurant Service must commit the
-kitchen's decision **before** it can relay it, because a human pressed a button and must not
-see an error for something that worked. So a relay lost in flight leaves a ticket that says
-`accepted` and a workflow still sitting on its timer.
+There is an unavoidable ordering problem here: the decision must be committed **before** the
+saga is told about it, because a human pressed a button and must not see an error for
+something that worked. So a signal lost in flight leaves an order whose `kitchen_decision`
+says `accepted` and a workflow still sitting on its timer.
+
+Since D32 both halves live in the same service and the same database, which shortens the
+window considerably — but it does not close it, because Temporal cannot enlist in a Postgres
+transaction. The read-back is what actually makes it safe.
 
 Treating the timer expiring as "the kitchen refused" would then refund a customer whose order
 had actually been taken. So the timeout is a prompt to **go and look**, not a conclusion:
 
 ```
- t0   send_ticket_activity ──▶ ticket created, status='pending'
+ t0   transition → confirmed, capacity slot claimed (now on the rail)
  t1   workflow parks on wait_condition(restaurant_decision, timeout=120s)
 
- t2   admin: POST /restaurants/tickets/<id>/accept
- t3   Restaurant Service: UPDATE order_tickets SET status='accepted'   ── COMMITTED
- t4   Restaurant Service ──relay──▶ order-service /signals   ✗ LOST
+ t2   admin: POST /api/v1/orders/<id>/accept
+ t3   order-service: UPDATE orders SET kitchen_decision='accepted'   ── COMMITTED
+ t4   order-service: handle.signal(...)   ✗ LOST (Temporal unreachable, worker gone, ...)
               │
               │   the decision is on record; the workflow has no idea
               ▼
  t5   120s elapses — wait_condition raises asyncio.TimeoutError
- t6   _recover_kitchen_decision() → read_ticket_activity
-                                     GET /restaurants/tickets/<order_id>
- t7   ticket says 'accepted'  ──▶ resume as if the signal had arrived
-                                   (dispatch a rider; NO refund)
+ t6   _recover_kitchen_decision() → read_kitchen_decision_activity
+                                     SELECT kitchen_decision FROM orders WHERE id = ...
+ t7   the order says 'accepted'  ──▶ resume as if the signal had arrived
+                                      (dispatch a rider; NO refund)
 ```
 
 The three possible answers, and what each means:
 
 ```
- ticket says 'accepted'          ──▶ the signal was lost; continue to rider dispatch
- ticket says 'rejected'          ──▶ the signal was lost; compensate (refund + cancel)
- 'pending' / 'expired' / absent  ──▶ genuine silence; compensate (refund + cancel)
+ kitchen_decision = 'accepted'   ──▶ the signal was lost; continue to rider dispatch
+ kitchen_decision = 'rejected'   ──▶ the signal was lost; compensate (refund + cancel)
+ kitchen_decision IS NULL        ──▶ genuine silence; compensate (refund + cancel)
 
- Restaurant Service unreachable
- after TRANSIENT retries         ──▶ treated as no decision → compensate
+ the order database will not
+ answer after STATE retries      ──▶ treated as no decision → compensate
                                       (deliberate bias: refunding an accepted order is
                                        recoverable by a human, but leaving a charged
                                        customer on a saga that never finishes is not)
 ```
 
-`scripts/saga-resilience-test.sh` §4 exercises this by writing the decision straight into
-`sfo_restaurant_core` — which is exactly what an accept whose relay died looks like from the
-outside — and asserts that a lost *acceptance* completes the order without a refund, while a
-lost *rejection* still cancels and refunds.
+`scripts/saga-resilience-test.sh` §4 exercises this by writing `kitchen_decision` straight
+into `sfo_order_core` — which is exactly what an accept whose signal died looks like from the
+saga's side — and asserts that a lost *acceptance* completes the order without a refund,
+while a lost *rejection* still cancels and refunds.
 
 ---
 

@@ -125,9 +125,16 @@ cat << 'EOF' > db/restaurant/init.sql
 -- Restaurant Service database — sfo_restaurant_core
 -- (container sfo-restaurant-db, host port 5433)
 --
--- Owns `restaurants` and the `order_tickets` kitchen queue. Only the Restaurant
--- Service connects here; every other service reads a restaurant through
+-- Owns `restaurants`, and nothing else. Only the Restaurant Service connects
+-- here; every other service reads a restaurant through
 -- GET /api/v1/restaurants/{restaurant_id}.
+--
+-- An `order_tickets` kitchen queue lived here through the first cut of Week 2.
+-- It held a status, an items snapshot and a decision timestamp — none of which
+-- was restaurant-domain data that `orders` did not already have — so the whole
+-- table was a cross-database hop for facts about an order's lifecycle. D32 moved
+-- the kitchen's decision onto `orders.kitchen_decision`, which took the saga's
+-- dependency on this service to zero.
 -- ============================================================================
 
 -- Enable UUID extension for secure, non-sequential IDs
@@ -154,41 +161,6 @@ CREATE INDEX IF NOT EXISTS idx_restaurants_geo ON restaurants(latitude, longitud
 
 -- Owner lookups ("list my restaurants") scan by owner, so index the reference.
 CREATE INDEX IF NOT EXISTS idx_restaurants_owner ON restaurants(owner_id);
-
--- 2. Order Tickets (the kitchen queue) — added in Week 2.
---
--- A ticket is one order presented to one kitchen, and its status is the kitchen's
--- answer. It exists because the order saga has to wait for a human to accept or
--- decline: the Week 2 blueprint originally modelled acceptance as a synchronous
--- HTTP call that returned the decision, which no real kitchen can do (D27).
-CREATE TYPE ticket_status AS ENUM ('pending', 'accepted', 'rejected', 'expired');
-
-CREATE TABLE IF NOT EXISTS order_tickets (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    -- orders.id, in sfo_order_core. UNIQUE rather than merely indexed: the workflow
-    -- activity that creates a ticket is retried on any transport failure, and the
-    -- second attempt must collide here instead of queueing the order twice.
-    order_id UUID UNIQUE NOT NULL,
-    -- Both ends of this reference live in this database, so unlike every other
-    -- cross-service reference in the platform it gets a real foreign key — the same
-    -- argument D24 made for moving the tracking trail beside the orders it
-    -- describes. A ticket for a restaurant that does not exist is refused by the
-    -- engine, and deleting a restaurant takes its queue with it.
-    restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
-    -- The lines as priced by the Order Service, so the kitchen sees what was bought
-    -- without a call back. A snapshot, not a live reference.
-    items JSONB NOT NULL DEFAULT '[]'::jsonb,
-    status ticket_status NOT NULL DEFAULT 'pending',
-    decided_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Serves both reads that matter: the admin's queue ("my pending tickets, oldest
--- first") and the capacity check that counts them. Both filter on
--- (restaurant_id, status) and order by arrival, so one index covers them.
-CREATE INDEX IF NOT EXISTS idx_tickets_queue
-    ON order_tickets (restaurant_id, status, created_at);
 EOF
 
 cat << 'EOF' > db/order/init.sql
@@ -218,6 +190,13 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- Define custom ENUM types
 CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
 
+-- The kitchen's answer, which is a fact about this order and therefore lives on it.
+-- Deliberately NOT a member of order_status: acceptance does not move the order
+-- along its lifecycle (an accepted order is still `confirmed` until a rider is
+-- found), and adding a value would perturb the declaration order that the
+-- compare-and-set in OrderRepository.transition depends on (D31).
+CREATE TYPE kitchen_decision AS ENUM ('accepted', 'rejected');
+
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -227,6 +206,11 @@ CREATE TABLE IF NOT EXISTS orders (
     items JSONB NOT NULL, -- Stores snapshot of ordered items, prices, and selected customization options at checkout
     total_amount DECIMAL(10, 2) NOT NULL,
     status order_status NOT NULL DEFAULT 'created',
+    -- NULL means the kitchen has not answered yet. Together with status =
+    -- 'confirmed' that is the definition of "on the rail", which is what the
+    -- capacity check counts.
+    kitchen_decision kitchen_decision,
+    kitchen_decided_at TIMESTAMP WITH TIME ZONE,
     idempotency_key VARCHAR(255) UNIQUE, -- Protects order creation writes against API duplicate submissions
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -263,6 +247,14 @@ CREATE TABLE IF NOT EXISTS order_tracking_logs (
 -- Serves both reads this table has: the chronological timeline for one order, and the
 -- single-row "what was the status before this entry?" lookup that fills `old_status`.
 CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(order_id, seq DESC);
+
+-- Serves the two reads the kitchen queue needs, which are the same shape: an admin
+-- listing "my orders awaiting a decision", and the capacity count gating entry into
+-- 'confirmed'. Partial, because every other order in the table is irrelevant to both —
+-- and on a busy platform that is nearly all of them.
+CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
+    ON orders (restaurant_id, created_at)
+    WHERE status = 'confirmed' AND kitchen_decision IS NULL;
 EOF
 
 cat << 'EOF' > db/payment/init.sql
@@ -801,7 +793,10 @@ services:
     environment:
       <<: [*order-db-env, *jwt-env]
       TEMPORAL_ADDRESS: temporal-server:7233
-      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      # No RESTAURANT_SERVICE_URL: since D32 the saga never calls that service. The
+      # kitchen's decision is a column in the order database, and the restaurant's capacity
+      # and coordinates ride in the workflow payload, captured once at checkout. Its absence
+      # here is the dependency reduction, made structural rather than merely true in code.
       PAYMENT_SERVICE_URL: http://payment-service:8005
       RIDER_SERVICE_URL: http://rider-service:8006
     depends_on:

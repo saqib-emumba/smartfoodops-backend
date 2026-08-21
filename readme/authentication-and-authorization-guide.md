@@ -193,13 +193,13 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 | User | `GET /users/{id}` | `current_principal` + `require_self_or_admin` |
 | Restaurant | `POST /restaurants/onboard` | `require_role("restaurant_admin")` |
 | Restaurant | `GET /restaurants/{id}` | `current_principal` (any authenticated caller) |
-| Restaurant | `GET /restaurants/{id}/tickets`, `accept`, `reject` | `require_role("restaurant_admin")` + `require_self_or_admin` on `owner_id` |
-| Restaurant | `GET /restaurants/{id}/internal`, `POST /tickets`, `POST /tickets/{id}/expire` | `require_internal` |
+| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service |
 | Menu | `POST /menus` | `require_role("restaurant_admin")` |
 | Menu | `GET /menus/{id}` | `current_principal` (any authenticated caller) |
 | Order | `POST /orders` | `require_role("customer")` |
 | Order | `GET /orders/{id}`, `GET /orders/{id}/logs` | `current_principal` + `require_self_or_admin` on `customer_id` |
 | Order | `GET /orders/{id}/internal`, `POST /orders/logs`, `POST /orders/{id}/signals` | `require_internal` |
+| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service (D32) |
 | Payment | `POST /payments`, `GET /payments/{id}` | `require_role("customer")` (ownership settled by reading the order, §4.2) |
 | Payment | `POST /payments/authorize`, `POST /payments/refund` | `require_internal` |
 | Rider | `POST /riders`, `GET /riders/me`, `PATCH /riders/me/location`, `PATCH /riders/me/availability`, `POST /riders/me/orders/{id}/picked-up`, `/delivered` | `require_role("rider")` |
@@ -398,10 +398,12 @@ docker exec sfo-order-service printenv JWT_PRIVATE_KEY_B64   # must print nothin
   (`require_role` always admits it; `require_self_or_admin` always passes it). Convenient,
   and currently unaudited — no log records when an admin used the bypass versus acted as
   themselves.
-- **The internal key is one shared secret across an increasingly long list of endpoints** —
-  **eleven** of them, as of the Week 2 saga, across four services, including refunds
-  (`grep -c 'Depends(require_internal)' services/*/main.py`). `key-decisions.md` D15/D26 name
-  this explicitly: per-service keypairs are the better answer once that list grows, and it
-  has grown every time the saga did.
+- **The internal key is one shared secret across a list of endpoints that keeps moving** —
+  **seven** of them, across three services, including refunds
+  (`grep -c 'Depends(require_internal)' services/*/main.py`). It reached eleven with the Week
+  2 saga and came back down to seven when D32 removed the Restaurant Service from it.
+  `key-decisions.md` D15/D26 name the threshold explicitly: per-service keypairs are the
+  better answer, and the fact that this count drifts in both directions with each change is
+  itself the argument for deciding it deliberately.
 - **No brute-force throttling on `/login`.** The constant-time comparison stops the endpoint
   from *leaking which half was wrong*; it does nothing to slow down repeated guessing.

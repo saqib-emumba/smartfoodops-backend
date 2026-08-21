@@ -895,12 +895,17 @@ Placing an order (section 4) puts a ticket on the restaurant's rail and parks th
 durable timer. The owner reads their queue:
 
 ```bash
-curl -s "$BASE/api/v1/restaurants/$REST_ID/tickets" -H "Authorization: Bearer $OWNER" | pretty
+curl -s "$BASE/api/v1/orders/kitchen/$REST_ID" -H "Authorization: Bearer $OWNER" | pretty
 ```
+
+On the **Order** Service, not the Restaurant Service: since D32 the kitchen's queue is a
+query over `orders` rather than a table of its own. Note what the response does *not* carry —
+no `total_amount`, no `customer_id`, no `idempotency_key`. Moving the queue deliberately did
+not widen what a restaurant can read about a customer's order.
 
 ```bash
 # Accept -> the saga starts looking for a rider
-curl -s -X POST "$BASE/api/v1/restaurants/tickets/$ORDER_ID/accept" \
+curl -s -X POST "$BASE/api/v1/orders/$ORDER_ID/accept" \
   -H "Authorization: Bearer $OWNER" | pretty
 
 sleep 5
@@ -912,14 +917,25 @@ curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | p
 |---|---|
 | A `customer` accepting a ticket | `403` |
 | An owner accepting *another* owner's ticket | `403` — checked before anything is revealed |
-| Accepting twice | `200`, status unchanged, and the saga is **not** signalled again |
+| Accepting twice | `200` with `"changed": false`, and the saga is **not** signalled again |
 | Accepting after the 120s window | `200` on the ticket, but the order is already `cancelled` |
 | Accepting *just before* the window closes, with the relay failing | The saga reads the ticket back on timeout and continues anyway — see 8.6 |
-| A ticket for an unknown order | `404` |
+| Deciding an unknown order | `404` |
+| Deciding an order the saga already cancelled | `200` with `"changed": false` — it stays cancelled |
 
-**Capacity.** `restaurants.capacity` is a count of *pending* tickets, and it is finally read
-by something. Onboard a restaurant with `"capacity": 1`, place two orders against it, and the
-second saga cancels with the kitchen never seeing it.
+**Capacity.** `restaurants.capacity` bounds how many orders may sit on one kitchen's rail —
+that is, `status = 'confirmed' AND kitchen_decision IS NULL`. It is checked in the same
+transaction that puts an order there, so two orders can never both take the last slot.
+Onboard a restaurant with `"capacity": 1`, place two orders, and the second is refunded and
+cancelled with `kitchen_at_capacity` in its trail — without ever reaching `confirmed`:
+
+```bash
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -c \
+  "SELECT new_status, metadata->>'reason' FROM order_tracking_logs
+    WHERE order_id = '<SECOND_ORDER>' ORDER BY seq;"
+# -> created | (null)
+#    cancelled | kitchen_at_capacity
+```
 
 ### 8.3 Riding it out
 
@@ -971,7 +987,7 @@ The compensation paths are the interesting half. Each ends `cancelled` with the 
 # Place a fresh order first (section 4), then:
 
 # (a) The kitchen declines
-curl -s -X POST "$BASE/api/v1/restaurants/tickets/$ORDER_ID/reject" \
+curl -s -X POST "$BASE/api/v1/orders/$ORDER_ID/reject" \
   -H "Authorization: Bearer $OWNER" | pretty
 
 # (b) The kitchen says nothing — wait out the 120s window and do nothing at all
@@ -1012,7 +1028,7 @@ history (D26). Every one of these answers `401` with a user token, however privi
 
 ```bash
 for p in "riders/dispatch" "riders/release" "payments/refund" "payments/authorize" \
-         "restaurants/tickets" "orders/$ORDER_ID/signals"; do
+         "orders/$ORDER_ID/signals"; do
   printf '%-34s ' "$p"
   curl -s -o /dev/null -w '[%{http_code}]\n' -X POST "$BASE/api/v1/$p" \
     -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' -d '{}'
@@ -1037,15 +1053,16 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" 
 
 ### 8.6 Simulating a lost decision signal
 
-The Restaurant Service commits a decision *before* relaying it, so a relay lost in flight
-would leave a ticket saying `accepted` and a workflow still waiting. You can reproduce that
-exactly by writing the decision straight into the database — no endpoint, no relay:
+The decision is committed *before* the saga is signalled, so a signal lost in flight leaves
+an order whose `kitchen_decision` says `accepted` and a workflow still waiting. You can
+reproduce that exactly by writing the decision straight into the database — no endpoint, no
+signal:
 
 ```bash
 # Place an order and let it reach 'confirmed' (sections 4 and 5), then:
-docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core \
-  -c "UPDATE order_tickets SET status='accepted', decided_at=NOW()
-       WHERE order_id='$ORDER_ID';"
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
+  -c "UPDATE orders SET kitchen_decision='accepted', kitchen_decided_at=NOW()
+       WHERE id='$ORDER_ID';"
 
 # The saga has no idea. Watch it sit, then recover when its 120s timer fires:
 docker exec sfo-temporal-server temporal workflow query \
@@ -1057,8 +1074,8 @@ docker compose logs order-worker | grep "Recovered a lost kitchen decision"
 ```
 
 The order proceeds to `assigned` and the payment stays `authorized` — no refund. Do the same
-with `status='rejected'` and it cancels and refunds instead. Only a ticket left `pending`,
-`expired`, or absent is treated as genuine silence.
+with `kitchen_decision='rejected'` and it cancels and refunds instead. Only a `NULL`
+decision is treated as genuine silence.
 
 ### 8.7 Asking the saga where it is
 

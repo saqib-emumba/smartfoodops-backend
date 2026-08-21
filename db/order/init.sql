@@ -24,6 +24,13 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- Define custom ENUM types
 CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
 
+-- The kitchen's answer, which is a fact about this order and therefore lives on it.
+-- Deliberately NOT a member of order_status: acceptance does not move the order
+-- along its lifecycle (an accepted order is still `confirmed` until a rider is
+-- found), and adding a value would perturb the declaration order that the
+-- compare-and-set in OrderRepository.transition depends on (D31).
+CREATE TYPE kitchen_decision AS ENUM ('accepted', 'rejected');
+
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -33,6 +40,11 @@ CREATE TABLE IF NOT EXISTS orders (
     items JSONB NOT NULL, -- Stores snapshot of ordered items, prices, and selected customization options at checkout
     total_amount DECIMAL(10, 2) NOT NULL,
     status order_status NOT NULL DEFAULT 'created',
+    -- NULL means the kitchen has not answered yet. Together with status =
+    -- 'confirmed' that is the definition of "on the rail", which is what the
+    -- capacity check counts.
+    kitchen_decision kitchen_decision,
+    kitchen_decided_at TIMESTAMP WITH TIME ZONE,
     idempotency_key VARCHAR(255) UNIQUE, -- Protects order creation writes against API duplicate submissions
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -69,3 +81,11 @@ CREATE TABLE IF NOT EXISTS order_tracking_logs (
 -- Serves both reads this table has: the chronological timeline for one order, and the
 -- single-row "what was the status before this entry?" lookup that fills `old_status`.
 CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(order_id, seq DESC);
+
+-- Serves the two reads the kitchen queue needs, which are the same shape: an admin
+-- listing "my orders awaiting a decision", and the capacity count gating entry into
+-- 'confirmed'. Partial, because every other order in the table is irrelevant to both —
+-- and on a busy platform that is nearly all of them.
+CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
+    ON orders (restaurant_id, created_at)
+    WHERE status = 'confirmed' AND kitchen_decision IS NULL;

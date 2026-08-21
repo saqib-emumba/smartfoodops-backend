@@ -28,8 +28,18 @@ from schemas import OrderCreateRequest, OrderTrackingLogCreateRequest
 
 _COLUMNS = (
     "id, customer_id, restaurant_id, rider_id, items, total_amount, status, "
-    "idempotency_key"
+    "kitchen_decision, idempotency_key"
 )
+
+# What the kitchen is shown, and deliberately less than _COLUMNS. An admin deciding on an
+# order needs to know what to cook; they have no business seeing what the customer paid or
+# which idempotency key their client chose.
+_KITCHEN_COLUMNS = "id, restaurant_id, items, status, created_at"
+
+# "On the rail" — confirmed, and the kitchen has not answered yet. This one predicate is
+# both the capacity count and the admin's queue, which is why the partial index in
+# db/order/init.sql matches it exactly.
+_ON_RAIL = "status = 'confirmed' AND kitchen_decision IS NULL"
 
 _SELECT_BY_ID = f"SELECT {_COLUMNS} FROM orders WHERE id = %s"
 
@@ -70,6 +80,35 @@ _SELECT_TIMELINE = f"""
     SELECT {_LOG_COLUMNS} FROM order_tracking_logs WHERE order_id = %s ORDER BY seq
 """
 
+# Counts the rail this order is joining, deriving the restaurant from the order itself so
+# the caller does not have to supply it — and so the count and the transition it gates stay
+# one statement apart inside one transaction.
+_COUNT_ON_RAIL_FOR_ORDER = f"""
+    SELECT count(*) AS on_rail FROM orders
+     WHERE restaurant_id = (SELECT restaurant_id FROM orders WHERE id = %(order_id)s::uuid)
+       AND {_ON_RAIL}
+"""
+
+_SELECT_KITCHEN_QUEUE = f"""
+    SELECT {_KITCHEN_COLUMNS} FROM orders
+     WHERE restaurant_id = %s AND {_ON_RAIL}
+     ORDER BY created_at
+"""
+
+# Guarded on both halves of "undecided": a second accept, or an accept racing a reject,
+# changes nothing and the caller reports whichever decision actually stuck. The status
+# clause also refuses a decision on an order that has already been cancelled out from
+# under the kitchen — which is what a late click on a timed-out order is.
+_DECIDE_KITCHEN = f"""
+    UPDATE orders
+       SET kitchen_decision = %(decision)s::kitchen_decision,
+           kitchen_decided_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = %(order_id)s::uuid
+       AND {_ON_RAIL}
+    RETURNING {_COLUMNS}
+"""
+
 # A compare-and-set, not a blind UPDATE, and every clause earns its place.
 #
 # Temporal guarantees activities run *at least* once, so this statement is executed more
@@ -103,6 +142,23 @@ _TRANSITION_ORDER = f"""
            )
     RETURNING {_COLUMNS}
 """
+
+
+class AtCapacity(Exception):
+    """The kitchen already has as many undecided orders as its capacity allows.
+
+    A business answer, not a failure — which is why it is a distinct exception rather than
+    a generic error. The saga raises it non-retryably: waiting and asking again cannot
+    change a refusal the restaurant has already given.
+    """
+
+    def __init__(self, order_id, on_rail: int, capacity: int):
+        super().__init__(
+            f"The kitchen for order {order_id} has {on_rail} orders awaiting a "
+            f"decision and a capacity of {capacity}"
+        )
+        self.on_rail = on_rail
+        self.capacity = capacity
 
 
 def _append_log(cur, entry: dict) -> dict:
@@ -203,6 +259,7 @@ class OrderRepository:
         event: dict | None = None,
         metadata: dict | None = None,
         rider_id: UUID | str | None = None,
+        capacity_limit: int | None = None,
     ) -> tuple[dict | None, bool]:
         """Advance an order and record the transition, in one transaction.
 
@@ -219,8 +276,20 @@ class OrderRepository:
 
         Returns `(None, False)` when the order does not exist at all, which the caller
         distinguishes from a no-op because they mean different things to a saga.
+
+        `capacity_limit` gates entry into `confirmed`, and it is here rather than in a
+        method of its own because it has to be *atomic with the transition*: entering
+        `confirmed` is what puts an order on the kitchen's rail, so counting the rail and
+        joining it must not be two statements two orders can interleave between. Raises
+        `AtCapacity` when full, having written nothing.
         """
         with self._db.cursor(commit=True) as cur:
+            if capacity_limit is not None:
+                cur.execute(_COUNT_ON_RAIL_FOR_ORDER, {"order_id": str(order_id)})
+                on_rail = cur.fetchone()["on_rail"]
+                if on_rail >= capacity_limit:
+                    raise AtCapacity(order_id, on_rail, capacity_limit)
+
             cur.execute(
                 _TRANSITION_ORDER,
                 {
@@ -255,6 +324,31 @@ class OrderRepository:
                 },
             )
             return updated, True
+
+
+    def kitchen_queue(self, restaurant_id: UUID) -> list[dict]:
+        """Orders awaiting this kitchen's decision, oldest first."""
+        with self._db.cursor() as cur:
+            cur.execute(_SELECT_KITCHEN_QUEUE, (str(restaurant_id),))
+            return cur.fetchall()
+
+    def decide_kitchen(self, order_id: UUID, decision: str) -> tuple[dict | None, bool]:
+        """Record the kitchen's accept or reject.
+
+        Returns `(order, changed)`. `changed` is False when the order was already decided,
+        or is no longer `confirmed` — which lets the caller signal the saga exactly once. A
+        second accept must not tell the workflow twice, and a click on an order the saga
+        already timed out and cancelled must not un-cancel it.
+        """
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(
+                _DECIDE_KITCHEN, {"order_id": str(order_id), "decision": decision}
+            )
+            decided = cur.fetchone()
+            if decided is not None:
+                return decided, True
+            cur.execute(_SELECT_BY_ID, (str(order_id),))
+            return cur.fetchone(), False
 
 
 class OrderTrackingRepository:

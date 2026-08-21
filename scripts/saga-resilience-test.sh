@@ -34,8 +34,7 @@ note() { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
 ENV_FILE="$(dirname "$0")/../.env"
 INTERNAL_KEY=$(grep -m1 '^INTERNAL_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
 
-for c in sfo-rider-db sfo-order-db sfo-restaurant-db sfo-payment-db sfo-order-worker \
-         sfo-temporal-server; do
+for c in sfo-rider-db sfo-order-db sfo-payment-db sfo-order-worker sfo-temporal-server; do
   docker ps --format '{{.Names}}' | grep -q "^$c$" || {
     printf '%sNeeds the local stack running (%s not found).%s Try: docker compose up -d\n' \
       "$RED" "$c" "$RESET"; exit 1; }
@@ -98,7 +97,7 @@ note "restaurant=$REST  rider=$RIDER"
 ORDER_BODY="{\"restaurant_id\":\"$REST\",\"items\":[{\"item_id\":\"pie\",\"quantity\":1}],\"total_amount\":10.00}"
 
 place() { api POST /api/v1/orders "$ORDER_BODY" -H "X-Idempotency-Key: $1" "${CA[@]}" | jf "['id']"; }
-accept() { api POST "/api/v1/restaurants/tickets/$1/accept" "" "${OA[@]}" >/dev/null; }
+accept() { api POST "/api/v1/orders/$1/accept" "" "${OA[@]}" >/dev/null; }
 
 # ============================================================== 1. concurrency
 section "1. Concurrent dispatch against a fleet of one"
@@ -241,9 +240,10 @@ note "order $TO — nobody will accept this one"
 got=$(wait_status "$TO" confirmed 45)
 assert "reached 'confirmed' and is waiting on the kitchen" "$got" "confirmed"
 
-PENDING_BEFORE=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-  "SELECT status FROM order_tickets WHERE order_id='$TO';" 2>/dev/null | tr -d '[:space:]')
-assert "the ticket is on the rail" "$PENDING_BEFORE" "pending"
+ON_RAIL_BEFORE=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+  "SELECT (status='confirmed' AND kitchen_decision IS NULL)::text FROM orders WHERE id='$TO';" \
+  2>/dev/null | tr -d '[:space:]')
+assert "the order is on the kitchen's rail" "$ON_RAIL_BEFORE" "true"
 
 note "waiting out the 120s kitchen-decision window..."
 got=$(wait_status "$TO" cancelled 180)
@@ -253,24 +253,21 @@ PAY=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -
   "SELECT status FROM payments WHERE order_id='$TO';" 2>/dev/null | tr -d '[:space:]')
 assert "  the payment was refunded" "$PAY" "refunded"
 
-# The assertion this whole test exists for. Capacity counts `pending` tickets, so a ticket
-# left behind here would hold a slot in this kitchen's queue permanently.
+# The assertion this whole test exists for — and since D32 it holds by construction rather
+# than by an explicit cleanup step. The rail is `status='confirmed' AND kitchen_decision IS
+# NULL`, so cancelling the order removes it from the rail as a side effect. There is no
+# expiry activity left to forget, and no way for a slot to stay held by a dead order.
 sleep 3
-TICKET_AFTER=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-  "SELECT status FROM order_tickets WHERE order_id='$TO';" 2>/dev/null | tr -d '[:space:]')
-assert "  the abandoned ticket was expired, freeing the capacity slot" "$TICKET_AFTER" "expired"
+STILL_ON_RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+  "SELECT count(*) FROM orders WHERE restaurant_id='$REST'
+     AND status='confirmed' AND kitchen_decision IS NULL;" 2>/dev/null | tr -d '[:space:]')
+assert "  the abandoned order left the rail, freeing capacity" "$STILL_ON_RAIL" "0"
 
-STILL_PENDING=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-  "SELECT count(*) FROM order_tickets WHERE restaurant_id='$REST' AND status='pending';" \
-  2>/dev/null | tr -d '[:space:]')
-assert "  no cancelled order is still occupying the kitchen" "$STILL_PENDING" "0"
-
-# An expiry must never overwrite a decision the kitchen actually made.
-if [[ -n "$LIVE" ]]; then
-  EXPIRED_LIVE=$(api POST "/api/v1/restaurants/tickets/$LIVE/expire" "" \
-    -H "X-Internal-Key: $INTERNAL_KEY" | jf "['status']")
-  assert "expiring an accepted ticket leaves it accepted" "$EXPIRED_LIVE" "accepted"
-fi
+# A late click on an order the saga already cancelled must not resurrect it.
+LATE=$(api POST "/api/v1/orders/$TO/accept" "" "${OA[@]}" | jf "['changed']")
+assert "  accepting an already-cancelled order changes nothing" "$LATE" "False"
+STILL_CANCELLED=$(order_status_internal "$TO")
+assert "  and it stays cancelled" "$STILL_CANCELLED" "cancelled"
 
 # ================================================== 4. lost decision signal
 # The one hole the signal design leaves open: the Restaurant Service commits a decision
@@ -287,13 +284,14 @@ note "order $LOST"
 got=$(wait_status "$LOST" confirmed 45)
 assert "reached 'confirmed' and is waiting on the kitchen" "$got" "confirmed"
 
-# Decide the ticket without going through the endpoint that would relay the signal.
-docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -q -c \
-  "UPDATE order_tickets SET status = 'accepted', decided_at = NOW() WHERE order_id = '$LOST';" \
-  >/dev/null 2>&1
-TICKET=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-  "SELECT status FROM order_tickets WHERE order_id='$LOST';" 2>/dev/null | tr -d '[:space:]')
-assert "the kitchen's decision is on record" "$TICKET" "accepted"
+# Record the decision without going through the endpoint that would signal the saga —
+# which is exactly what an accept whose signal died looks like from the saga's side.
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -q -c \
+  "UPDATE orders SET kitchen_decision = 'accepted', kitchen_decided_at = NOW()
+    WHERE id = '$LOST';" >/dev/null 2>&1
+DECISION=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+  "SELECT kitchen_decision FROM orders WHERE id='$LOST';" 2>/dev/null | tr -d '[:space:]')
+assert "the kitchen's decision is on record" "$DECISION" "accepted"
 note "no signal was sent — the saga still believes it is waiting"
 
 # It must sit there for the full window, then recover rather than cancel.
@@ -315,9 +313,9 @@ assert "  and completed normally afterwards" "$got" "delivered"
 LOSTREJ=$(place "lostrej-$TAG")
 note "order $LOSTREJ — a lost rejection this time"
 wait_status "$LOSTREJ" confirmed 45 >/dev/null
-docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -q -c \
-  "UPDATE order_tickets SET status = 'rejected', decided_at = NOW() WHERE order_id = '$LOSTREJ';" \
-  >/dev/null 2>&1
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -q -c \
+  "UPDATE orders SET kitchen_decision = 'rejected', kitchen_decided_at = NOW()
+    WHERE id = '$LOSTREJ';" >/dev/null 2>&1
 note "waiting out the window again..."
 got=$(wait_status "$LOSTREJ" cancelled 200)
 assert "a lost rejection still cancels the order" "$got" "cancelled"

@@ -43,11 +43,12 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) | The tracking trail moved into the order database | 2026-08-21 | Accepted |
 | [D25](#d25--temporal-orchestrates-the-order-lifecycle-and-the-workflow-id-is-the-order-id) | Temporal orchestrates; the workflow id is the order id | 2026-08-21 | Accepted |
 | [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) | The worker uses the internal key, never a bearer token | 2026-08-21 | Accepted |
-| [D27](#d27--restaurant-acceptance-is-a-signal-and-a-timer-not-a-synchronous-call) | Restaurant acceptance is a signal and a timer | 2026-08-21 | Accepted |
+| [D27](#d27--restaurant-acceptance-is-a-signal-and-a-timer-not-a-synchronous-call) | Restaurant acceptance is a signal and a timer | 2026-08-21 | Partly superseded by [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) |
 | [D28](#d28--riders-got-their-own-service-and-database) | Riders got their own service and database | 2026-08-21 | Accepted |
 | [D29](#d29--dispatch-prevents-the-race-rather-than-detecting-it) | Dispatch prevents the race rather than detecting it | 2026-08-21 | Accepted |
 | [D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409) | The saga owns payment authorisation | 2026-08-21 | Accepted |
 | [D31](#d31--a-status-transition-is-a-compare-and-set-and-the-enum-supplies-the-ordering) | A status transition is a compare-and-set | 2026-08-21 | Accepted |
+| [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) | The kitchen queue collapsed into the `orders` table | 2026-08-21 | Accepted |
 
 ---
 
@@ -301,8 +302,9 @@ identities. If internal-only endpoints multiply, per-service keypairs become the
 answer.
 
 > **That condition was met on 2026-08-21.** [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) took the internal key from one endpoint to
-> **eleven**, because the saga's worker has no user to forward. The reasoning above is
-> unchanged and the conclusion it warned about is now due.
+> eleven, because the saga's worker has no user to forward. D32 brought it back down to
+> **seven** by removing the Restaurant Service from the saga entirely. The reasoning
+> above is unchanged and the conclusion it warned about is deferred, not resolved.
 
 ### D16 — Each authorisation decision lives in exactly one place
 
@@ -565,12 +567,18 @@ handler had established that the caller owns it.
 **Costs:** **this is the moment D15's own caveat fires.** D15 justified a shared symmetric
 secret on the grounds that it granted "one narrow endpoint rather than the ability to mint
 identities", and noted that "if internal-only endpoints multiply, per-service keypairs
-become the better answer". They have now multiplied — from one to **eleven**, and the count
-rose again with every subsequent change to the saga. The debt is recorded rather than
-absorbed: per-service keypairs, or a signed service assertion, is the right answer before
-this list grows further.
+become the better answer". They multiplied — one to eleven — and then D32 took it back to
+**seven** by deleting the saga's dependency on the Restaurant Service. The debt is
+recorded rather than absorbed: per-service keypairs, or a signed service assertion, is
+still the right answer, and the count is now moving in both directions rather than only up.
 
 ### D27 — Restaurant acceptance is a signal and a timer, not a synchronous call
+
+> **Partly superseded by [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) on 2026-08-21.** The signal-and-timer mechanism below is
+> unchanged and still correct. What changed is *where the decision is recorded*: the
+> `order_tickets` table this entry describes is gone, and the kitchen's answer is now a
+> column on `orders`. Read the costs section with that in mind — the capacity leak it
+> describes became structurally impossible rather than fixed.
 
 **Decided:** the saga posts a ticket to `order_tickets` and then waits on
 `workflow.wait_condition` with a 120-second timeout. A restaurant admin accepts or rejects
@@ -719,6 +727,69 @@ property no comment in `db/order/init.sql` previously depended on.
 
 ---
 
+### D32 — The kitchen queue collapsed into the `orders` table
+
+**Decided:** `order_tickets` and the `ticket_status` enum are gone. A kitchen's answer is
+`orders.kitchen_decision` (a nullable `kitchen_decision` enum) plus `kitchen_decided_at`,
+in the Order Service's own database. An admin reads their rail from
+`GET /api/v1/orders/kitchen/{restaurant_id}` and answers on
+`POST /api/v1/orders/{order_id}/accept|reject`, both on the **Order** Service, guarded by
+`require_role("restaurant_admin")` plus an ownership check made over HTTP against the
+Restaurant Service.
+
+**Instead of:** keeping the ticket table, which is what D27 shipped and what the Week 2
+blueprint's second revision specified.
+
+**Why:** the table held a status, an items snapshot and a decision timestamp — and not one
+of those was restaurant-domain data that `orders` did not already have. It was a second
+database holding facts about an order's lifecycle, while every other fact about that
+lifecycle, including two the *Rider* Service reports (`picked_up`, `delivered`), already
+lived on `orders`. That asymmetry had no principled defence.
+
+Collapsing it bought four things, in rough order of how much they matter:
+
+* **The saga stopped calling the Restaurant Service at all** — from four calls (ticket,
+  read-back, expiry, coordinates) to zero. `capacity`, `latitude` and `longitude` ride in
+  the workflow payload, captured at checkout from a `verify_restaurant` lookup that was
+  already happening and whose response was previously discarded. `order-worker` no longer
+  even has `RESTAURANT_SERVICE_URL` in its environment.
+* **An entire class of leak became unrepresentable.** The rail is defined as
+  `status = 'confirmed' AND kitchen_decision IS NULL`, so cancelling an order removes it
+  from the rail as a side effect. The `expire_ticket_activity` that D27 needed — and the
+  capacity leak it was written to fix — are both simply gone.
+* **The lost-signal recovery became a local read.** It was an HTTP call into another
+  service, which forced a "we cannot tell, so assume the worst and refund" branch. Reading
+  a column in the same database removes that failure mode.
+* **Two fewer activities and one less internal endpoint surface.** Eight activities became
+  six; the internal-key endpoint count fell from eleven to seven, which walks back some of
+  the debt D15 and D26 flagged.
+
+**Costs:** three real ones, and the first is the reason this was resisted for a while.
+
+* **Read-path coupling.** A kitchen tablet polling its rail now reads `sfo_order_core`, the
+  same database serving checkout and every saga transition. The partial index
+  `idx_orders_kitchen_queue` matches the predicate exactly so the query stays cheap, but the
+  *isolation* the separate database provided is gone. If kitchen polling ever becomes heavy,
+  a read replica — not another table — is the answer.
+* **A restaurant-facing surface on the Order Service.** It had no list endpoint at all
+  before. The privacy exposure that could have come with it is closed deliberately:
+  `KitchenOrderResponse` omits `total_amount`, `customer_id` and `idempotency_key`, so
+  moving the queue did not widen what a restaurant can read.
+* **Nowhere for real kitchen state to go.** Prep times, station routing, course sequencing
+  and bump-bar state do not belong on `orders`. If any of that arrives, a
+  restaurant-domain table comes back — but it will hold kitchen concepts rather than a
+  duplicate of an order's lifecycle.
+
+Two implementation notes worth carrying forward. `kitchen_decision` is deliberately **not**
+a member of `order_status`: acceptance does not advance the lifecycle (an accepted order is
+still `confirmed` until a rider is found), and adding a value would perturb the declaration
+order that D31's compare-and-set depends on. And the capacity check lives *inside*
+`OrderRepository.transition` rather than in a method of its own, because entering
+`confirmed` **is** joining the rail — counting the rail and joining it must be one
+transaction, or two orders can both take the last slot.
+
+---
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -742,9 +813,10 @@ Not yet decided, and worth settling before the code forces an answer:
   table in each reporting service is the general answer; Week 3's Kafka work is the natural
   place for it.
 - **Per-service credentials for internal calls** (D15, D26). The shared `INTERNAL_API_KEY`
-  now unlocks **eleven** endpoints across four services, including refunds. D15 named this
-  threshold in advance; crossing it is a decision that should be made deliberately rather
-  than by accretion — and it has been crossed by accretion, one endpoint at a time.
+  now unlocks **seven** endpoints across three services, including refunds — down from
+  eleven after D32. D15 named this threshold in advance; it was crossed by accretion and
+  has since been partly walked back, which is an argument for deciding it deliberately
+  rather than letting the count drift with each change.
 - **Whether the rider search window belongs in config or per-restaurant.**
   `RIDER_SEARCH_ATTEMPTS × RIDER_SEARCH_INTERVAL_SECONDS` is one platform-wide number, so a
   dense city centre and a rural outpost get the same 60 seconds before an order is refunded.

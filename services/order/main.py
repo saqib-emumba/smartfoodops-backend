@@ -34,6 +34,8 @@ from common.temporal import TemporalGateway, workflow_id_for
 from pricing import build_order_snapshot
 from repository import OrderRepository, OrderTrackingRepository
 from schemas import (
+    KitchenDecisionResponse,
+    KitchenOrderResponse,
     OrderCreateRequest,
     OrderResponse,
     OrderTrackingLogCreateRequest,
@@ -127,7 +129,14 @@ async def create_order(
         # A replay also re-attempts the saga. This is what repairs an order whose workflow
         # failed to start the first time: the workflow id is derived from the order id, so
         # a saga that is already running is left alone, and one that never began now does.
-        await _start_saga(existing)
+        # The restaurant is re-read because a replay has none in hand — the cost of making
+        # this path self-healing, paid only on an actual retry.
+        await _start_saga(
+            existing,
+            restaurant_service.verify_restaurant(
+                existing["restaurant_id"], principal.token
+            ),
+        )
         return OrderResponse(**existing)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
@@ -140,7 +149,13 @@ async def create_order(
     # also outlives the token's role claim: a demoted account fails here even while holding
     # a token minted before the change.
     user_service.verify_customer(principal.user_id, principal.token)
-    restaurant_service.verify_restaurant(payload.restaurant_id, principal.token)
+    # The response is kept, not discarded: `capacity`, `latitude` and `longitude` are on it,
+    # and handing them to the saga in its payload is what removed the saga's four HTTP calls
+    # to the Restaurant Service (D32). Captured here, at checkout, from a lookup that was
+    # already happening.
+    restaurant = restaurant_service.verify_restaurant(
+        payload.restaurant_id, principal.token
+    )
 
     # (e) The order and the opening 'created' entry of its audit trail commit together —
     # same database, one transaction. There is no window in which one exists without the
@@ -150,12 +165,12 @@ async def create_order(
     )
 
     # (f) The order exists; the saga runs it from here.
-    await _start_saga(order)
+    await _start_saga(order, restaurant)
 
     return OrderResponse(**order)
 
 
-async def _start_saga(order: dict) -> None:
+async def _start_saga(order: dict, restaurant: dict) -> None:
     """Hand a committed order to the orchestrator.
 
     Deliberately after the commit, and deliberately not fatal.
@@ -191,7 +206,13 @@ async def _start_saga(order: dict) -> None:
                 # A string, not a float: an exact decimal has to survive the JSON boundary
                 # into workflow history, and D07's guarantee stops at that boundary.
                 "amount": str(order["total_amount"]),
-                "items": order["items"],
+                # Snapshots taken at checkout, so the saga never has to call the Restaurant
+                # Service (D32). Staleness is harmless and arguably correct: the order
+                # queued under the capacity that existed when it was placed, and a
+                # restaurant does not move.
+                "capacity": restaurant["capacity"],
+                "restaurant_latitude": restaurant["latitude"],
+                "restaurant_longitude": restaurant["longitude"],
             },
             id=workflow_id_for(order_id),
             task_queue=ORDER_TASK_QUEUE,
@@ -226,6 +247,129 @@ def get_order(
 
     require_self_or_admin(principal, row["customer_id"])
     return OrderResponse(**row)
+
+
+@app.get(
+    "/api/v1/orders/kitchen/{restaurant_id}",
+    response_model=list[KitchenOrderResponse],
+)
+def kitchen_queue(
+    restaurant_id: UUID,
+    principal: Principal = Depends(require_role("restaurant_admin")),
+) -> list[KitchenOrderResponse]:
+    """The kitchen's rail: this restaurant's orders awaiting a decision, oldest first.
+
+    Restaurant-facing, on this service, because since D32 the kitchen's queue *is* a query
+    over `orders` — there is no separate ticket table to read. Whether the caller owns the
+    restaurant is still the Restaurant Service's fact, resolved over HTTP (D16).
+
+    Answers `KitchenOrderResponse`, not `OrderResponse`: an admin sees what to cook and not
+    what the customer paid. Widening the queue onto `orders` deliberately did not widen what
+    a restaurant can read.
+    """
+    restaurant_service.verify_owner(restaurant_id, principal.user_id, principal.token)
+    return [
+        KitchenOrderResponse(**row) for row in orders.kitchen_queue(restaurant_id)
+    ]
+
+
+async def _signal_saga_best_effort(order_id: UUID, signal: str, body: dict) -> None:
+    """Tell the saga about something already committed, without being able to undo it.
+
+    Best-effort on purpose. The kitchen's decision is in the database by the time this
+    runs, and the admin must not see an error for something that worked — so a signal
+    that cannot be delivered is logged, not raised.
+
+    Losing it is survivable precisely because of the read-back: when the saga's timer
+    expires it reads `orders.kitchen_decision` and finds the decision anyway. This is
+    the one place where those two mechanisms are designed as a pair.
+    """
+    try:
+        handle = temporal.client.get_workflow_handle(workflow_id_for(order_id))
+        await handle.signal(signal, body)
+        logger.info("Signalled '%s' to the saga for order %s", signal, order_id)
+    except Exception as exc:  # noqa: BLE001 - the decision is committed; do not undo it
+        logger.error(
+            "Recorded the decision for order %s but could not signal the saga; "
+            "its timeout will read the decision back instead: %s",
+            order_id,
+            exc,
+        )
+
+
+async def _decide_kitchen(
+    order_id: UUID, principal: Principal, decision: str
+) -> KitchenDecisionResponse:
+    """Record a kitchen decision and tell the saga about it, exactly once.
+
+    Two properties this ordering buys, and both matter:
+
+    The decision is committed *before* the signal, so a signal that fails to send leaves a
+    decision on record rather than losing it — and the saga reads that record back when its
+    timer expires, which is what makes a lost signal self-correcting.
+
+    The signal is sent only when the update actually changed something. A second accept must
+    not tell the workflow twice, and a click on an order the saga already timed out and
+    cancelled must not signal at all.
+
+    Since D32 this service owns both halves: the decision is a column in its own database
+    and the workflow is its own, so there is no cross-service relay left to lose.
+    """
+    order = orders.find(order_id)
+    if order is None:
+        raise not_found(f"Order {order_id} not found")
+    restaurant_service.verify_owner(
+        order["restaurant_id"], principal.user_id, principal.token
+    )
+
+    decided, changed = orders.decide_kitchen(order_id, decision)
+    if not changed:
+        logger.info(
+            "Order %s is already '%s'/%s; not signalling the saga again",
+            order_id,
+            decided["status"],
+            decided["kitchen_decision"],
+        )
+        return KitchenDecisionResponse(
+            order_id=order_id,
+            decision=decided["kitchen_decision"],
+            status=decided["status"],
+            changed=False,
+        )
+
+    await _signal_saga_best_effort(
+        order_id, "restaurant_decision", {"decision": decision}
+    )
+    return KitchenDecisionResponse(
+        order_id=order_id,
+        decision=decided["kitchen_decision"],
+        status=decided["status"],
+        changed=True,
+    )
+
+
+@app.post(
+    "/api/v1/orders/{order_id}/accept",
+    response_model=KitchenDecisionResponse,
+)
+async def accept_order(
+    order_id: UUID,
+    principal: Principal = Depends(require_role("restaurant_admin")),
+) -> KitchenDecisionResponse:
+    """Accept an order into the kitchen, releasing the saga to find a rider."""
+    return await _decide_kitchen(order_id, principal, "accepted")
+
+
+@app.post(
+    "/api/v1/orders/{order_id}/reject",
+    response_model=KitchenDecisionResponse,
+)
+async def reject_order(
+    order_id: UUID,
+    principal: Principal = Depends(require_role("restaurant_admin")),
+) -> KitchenDecisionResponse:
+    """Decline an order, which makes the saga refund the customer and cancel it."""
+    return await _decide_kitchen(order_id, principal, "rejected")
 
 
 @app.get(

@@ -22,6 +22,12 @@ The saga's clients at the bottom of this file are the exception, and the excepti
 point. An activity has no user behind it: a bearer token would be written into durable,
 UI-visible workflow history and would expire long before a saga that waits on a kitchen
 finishes. Those calls carry the internal key instead (D26).
+
+There is no saga client for the Restaurant Service, and that is the whole shape of D32. The
+saga used to call it four times — ticket, read-back, expiry and coordinates — and now calls
+it zero: the kitchen's decision is a column on `orders`, and the restaurant's capacity and
+coordinates ride in the workflow payload, captured once at checkout from a lookup this
+service already performed.
 """
 
 import os
@@ -37,7 +43,7 @@ from common.config import (
     DEFAULT_USER_SERVICE_URL,
     PAYMENT_HTTP_TIMEOUT,
 )
-from common.errors import unprocessable
+from common.errors import forbidden, unprocessable
 from common.service_client import ServiceClient
 
 USER_SERVICE_URL = os.getenv("USER_SERVICE_URL", DEFAULT_USER_SERVICE_URL)
@@ -83,6 +89,29 @@ class RestaurantServiceClient:
     def base_url(self) -> str:
         return self._client.base_url
 
+    def verify_owner(self, restaurant_id: UUID, owner_id: UUID, token: str) -> dict:
+        """Confirm this caller owns the restaurant an order was placed with.
+
+        Who owns a restaurant is the Restaurant Service's fact, so it is resolved there
+        rather than duplicated here (D16) — this reads the record as the caller and compares
+        the owner, exactly as the Menu Service does before letting an admin publish a menu.
+
+        Forwards the admin's own bearer token rather than the internal key: the caller *is*
+        a user, so the call should be able to do no more than they could (D15).
+        """
+        restaurant = self._client.get(
+            f"/api/v1/restaurants/{restaurant_id}",
+            missing=f"Restaurant {restaurant_id} no longer exists",
+            unreachable_hint="cannot verify who owns this restaurant",
+            bad_gateway_hint="verifying restaurant ownership",
+            headers=bearer(token),
+        )
+        if str(restaurant.get("owner_id")) != str(owner_id):
+            raise forbidden(
+                f"You do not own restaurant {restaurant_id}, so you may not decide its orders"
+            )
+        return restaurant
+
     def verify_restaurant(self, restaurant_id: UUID, token: str) -> dict:
         """Confirm the restaurant exists — the check the `restaurant_id` foreign key made.
 
@@ -122,71 +151,6 @@ class MenuServiceClient:
 #
 # Used only by activities.py, and only on the internal key. Each returns the sibling's raw
 # response so the activity — not the transport — decides what a business outcome means.
-
-
-class SagaRestaurantClient:
-    def __init__(self, logger: Logger):
-        self._client = ServiceClient(
-            "Restaurant Service", RESTAURANT_SERVICE_URL, logger=logger
-        )
-
-    def fetch_restaurant(self, restaurant_id: UUID) -> dict:
-        """Read a restaurant for its coordinates, which is what dispatch measures from.
-
-        The first revision of the Week 2 blueprint hardcoded a latitude and longitude here.
-        `restaurants.latitude`/`longitude` are `NOT NULL` and already on this response.
-        """
-        return self._client.get(
-            f"/api/v1/restaurants/{restaurant_id}/internal",
-            missing=f"Unknown restaurant {restaurant_id}",
-            missing_error=unprocessable,
-            unreachable_hint="cannot read the restaurant",
-            bad_gateway_hint="reading the restaurant",
-            headers=internal_headers(),
-        )
-
-    def send_ticket(self, order_id: UUID, restaurant_id: UUID, items: list) -> dict:
-        return self._client.post(
-            "/api/v1/restaurants/tickets",
-            json={
-                "order_id": str(order_id),
-                "restaurant_id": str(restaurant_id),
-                "items": items,
-            },
-            missing=f"Restaurant {restaurant_id} cannot be ticketed",
-            missing_error=unprocessable,
-            unreachable_hint="cannot send the order to the kitchen",
-            bad_gateway_hint="sending the order to the kitchen",
-            headers=internal_headers(),
-        )
-
-    def expire_ticket(self, order_id: UUID) -> dict:
-        """Retire a ticket the saga is abandoning, freeing the kitchen's capacity slot."""
-        return self._client.post(
-            f"/api/v1/restaurants/tickets/{order_id}/expire",
-            json={},
-            missing=f"Order {order_id} has no ticket to expire",
-            missing_error=unprocessable,
-            unreachable_hint="cannot expire the kitchen ticket",
-            bad_gateway_hint="expiring the kitchen ticket",
-            headers=internal_headers(),
-        )
-
-    def fetch_ticket(self, order_id: UUID) -> dict:
-        """Read the kitchen's ticket, to recover a decision whose signal never arrived.
-
-        `missing_error` is left as the default `not_found`, unlike every other method here:
-        the activity that calls this needs to distinguish "no ticket exists" (a definite
-        answer) from "the Restaurant Service is unreachable" (retry), and a `404` is how it
-        tells them apart.
-        """
-        return self._client.get(
-            f"/api/v1/restaurants/tickets/{order_id}",
-            missing=f"Order {order_id} has no kitchen ticket",
-            unreachable_hint="cannot read the kitchen ticket",
-            bad_gateway_hint="reading the kitchen ticket",
-            headers=internal_headers(),
-        )
 
 
 class SagaPaymentClient:

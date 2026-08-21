@@ -16,6 +16,14 @@ named.
 > **Read [key-decisions.md](key-decisions.md) first.** This document is the *how*; the
 > decisions it implements — and the ones Revision 1 would have broken — are the *why*.
 
+> **Amended after shipping, by D32.** Sections below describe an `order_tickets` table in
+> `sfo_restaurant_core` holding the kitchen's queue. That table no longer exists. The
+> kitchen's decision is `orders.kitchen_decision` in the Order Service's own database, its
+> queue is a query over `orders`, and the saga makes **zero** HTTP calls to the Restaurant
+> Service (it was four). The signal-and-timer mechanism this document specifies is unchanged
+> and still correct; only the location of the decision moved. For the shipped design read
+> [order-saga-orchestration-guide.md](order-saga-orchestration-guide.md), and D32 for why.
+
 ---
 
 ## Section 0: Deviations from Revision 1

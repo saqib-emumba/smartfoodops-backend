@@ -595,52 +595,51 @@ expect "authorize without the internal key -> 401" 401 POST /api/v1/payments/aut
   "{\"order_id\":\"$ORDER_ID\",\"amount\":\"27.00\",\"idempotency_key\":\"nope\"}"
 expect "signal relay without the internal key -> 401" 401 POST "/api/v1/orders/$ORDER_ID/signals" \
   "{\"signal\":\"rider_pickup\",\"payload\":{}}"
-expect "ticket creation without the internal key -> 401" 401 POST /api/v1/restaurants/tickets \
-  "{\"order_id\":\"$ORDER_ID\",\"restaurant_id\":\"$REST_ID\",\"items\":[]}"
-expect "ticket expiry without the internal key -> 401" 401 \
-  POST "/api/v1/restaurants/tickets/$ORDER_ID/expire"
-expect "ticket expiry with an owner token -> 401" 401 \
-  POST "/api/v1/restaurants/tickets/$ORDER_ID/expire" "" "${OWNER_AUTH[@]}"
-expect "ticket read without the internal key -> 401" 401 \
-  GET "/api/v1/restaurants/tickets/$ORDER_ID"
-expect "ticket read with a customer token -> 401" 401 \
-  GET "/api/v1/restaurants/tickets/$ORDER_ID" "" "${CUST_AUTH[@]}"
-
-if [[ -n "$INTERNAL_KEY" ]]; then
-  # The lookup the saga uses to recover a kitchen decision whose signal was lost. Routed
-  # as `tickets/{order_id}` rather than `{restaurant_id}/tickets`, so this also confirms
-  # the two three-segment paths do not shadow each other.
-  expect "saga can read a ticket by order id" 200 \
-    GET "/api/v1/restaurants/tickets/$ORDER_ID" "" "${INTERNAL[@]}"
-  assert "  the ticket is for this order" "$(jfield "['order_id']")" "$ORDER_ID"
-  expect "reading a ticket that does not exist -> 404" 404 \
-    GET /api/v1/restaurants/tickets/00000000-0000-0000-0000-000000000000 "" "${INTERNAL[@]}"
-fi
 expect "internal order read without the key -> 401" 401 GET "/api/v1/orders/$ORDER_ID/internal"
 
+# The kitchen path is no longer internal at all. Since D32 an admin decides an order
+# directly on the Order Service, authenticated as themselves — so what has to be proven
+# here is the *authorisation*, not an internal key: the wrong role, and the right role on
+# somebody else's restaurant, must both be refused.
+expect "deciding an order with no token -> 401" 401 POST "/api/v1/orders/$ORDER_ID/accept"
+expect "a customer cannot accept an order -> 403" 403 \
+  POST "/api/v1/orders/$ORDER_ID/accept" "" "${CUST_AUTH[@]}"
+expect "a rider cannot accept an order -> 403" 403 \
+  POST "/api/v1/orders/$ORDER_ID/accept" "" "${RIDER_AUTH[@]}"
+expect "the kitchen queue needs the admin role -> 403" 403 \
+  GET "/api/v1/orders/kitchen/$REST_ID" "" "${CUST_AUTH[@]}"
+expect "deciding an order that does not exist -> 404" 404 \
+  POST /api/v1/orders/00000000-0000-0000-0000-000000000000/accept "" "${OWNER_AUTH[@]}"
+
 if [[ -n "$INTERNAL_KEY" ]]; then
-  expect "an invented signal name -> 422" 422 POST "/api/v1/orders/$ORDER_ID/signals" \
-    "{\"signal\":\"teleported\",\"payload\":{}}" "${INTERNAL[@]}"
-  expect "signalling an order with no saga -> 404" 404 \
-    POST /api/v1/orders/00000000-0000-0000-0000-000000000000/signals \
-    "{\"signal\":\"rider_pickup\",\"payload\":{}}" "${INTERNAL[@]}"
+  # The relay now carries rider events only: a kitchen decision has its own authenticated
+  # endpoint, and leaving it reachable here too would be a second way to do one thing.
+  expect "the relay no longer accepts a kitchen decision -> 422" 422 \
+    POST "/api/v1/orders/$ORDER_ID/signals" \
+    '{"signal":"restaurant_decision","payload":{"decision":"accepted"}}' "${INTERNAL[@]}"
 fi
 
 # --- happy path all the way to delivered -------------------------------------------------
 section "Order saga — happy path to 'delivered'"
 
 # ORDER_ID is already 'confirmed' and parked waiting for the kitchen (asserted earlier).
-expect "kitchen queue shows the ticket" 200 GET "/api/v1/restaurants/$REST_ID/tickets" "" "${OWNER_AUTH[@]}"
-assert "  the pending ticket is this order" "$(jfield "[0]['order_id']")" "$ORDER_ID"
+expect "kitchen queue shows the order" 200 GET "/api/v1/orders/kitchen/$REST_ID" "" "${OWNER_AUTH[@]}"
+assert "  the order awaiting a decision is this one" "$(jfield "[0]['id']")" "$ORDER_ID"
+# The kitchen projection is narrower than OrderResponse on purpose: moving the queue onto
+# `orders` must not widen what a restaurant can see about a customer's order.
+assert "  the kitchen is not shown what was paid" \
+  "$(python3 -c "import json,sys; print('total_amount' in json.load(sys.stdin)[0])" <<<"$BODY")" "False"
+assert "  nor who ordered it" \
+  "$(python3 -c "import json,sys; print('customer_id' in json.load(sys.stdin)[0])" <<<"$BODY")" "False"
 
-expect "another owner cannot read the queue -> 403" 403 \
-  GET "/api/v1/restaurants/$REST_ID/tickets" "" "${CUST_AUTH[@]}"
-expect "a customer cannot accept a ticket -> 403" 403 \
-  POST "/api/v1/restaurants/tickets/$ORDER_ID/accept" "" "${CUST_AUTH[@]}"
-
-expect "kitchen accepts the order" 200 POST "/api/v1/restaurants/tickets/$ORDER_ID/accept" \
+expect "kitchen accepts the order" 200 POST "/api/v1/orders/$ORDER_ID/accept" \
   "" "${OWNER_AUTH[@]}"
-assert "  ticket recorded as accepted" "$(jfield "['status']")" "accepted"
+assert "  decision recorded as accepted" "$(jfield "['decision']")" "accepted"
+assert "  and it actually changed something" "$(jfield "['changed']")" "True"
+
+expect "accepting twice does not signal the saga again" 200 \
+  POST "/api/v1/orders/$ORDER_ID/accept" "" "${OWNER_AUTH[@]}"
+assert "  second accept is a no-op" "$(jfield "['changed']")" "False"
 
 # Acceptance releases the saga to find a rider.
 poll_status "$ORDER_ID" assigned 60 "${CUST_AUTH[@]}"
@@ -703,9 +702,9 @@ expect "place an order to be rejected" 201 POST /api/v1/orders "$ORDER" \
 REJ_ORDER=$(jfield "['id']")
 poll_status "$REJ_ORDER" confirmed 40 "${CUST_AUTH[@]}"
 
-expect "kitchen rejects the order" 200 POST "/api/v1/restaurants/tickets/$REJ_ORDER/reject" \
+expect "kitchen rejects the order" 200 POST "/api/v1/orders/$REJ_ORDER/reject" \
   "" "${OWNER_AUTH[@]}"
-assert "  ticket recorded as rejected" "$(jfield "['status']")" "rejected"
+assert "  decision recorded as rejected" "$(jfield "['decision']")" "rejected"
 
 poll_status "$REJ_ORDER" cancelled 60 "${CUST_AUTH[@]}"
 REJ_PAY=$(docker_payment_row "$REJ_ORDER")
@@ -721,36 +720,25 @@ if have_container sfo-rider-db; then
 fi
 
 # A second reject must not signal the saga again.
-expect "re-rejecting an already-decided ticket is a no-op" 200 \
-  POST "/api/v1/restaurants/tickets/$REJ_ORDER/reject" "" "${OWNER_AUTH[@]}"
-assert "  status unchanged" "$(jfield "['status']")" "rejected"
+expect "re-rejecting an already-decided order is a no-op" 200 \
+  POST "/api/v1/orders/$REJ_ORDER/reject" "" "${OWNER_AUTH[@]}"
+assert "  decision unchanged" "$(jfield "['decision']")" "rejected"
 
-# The capacity slot must come back. `restaurants.capacity` is a count of *pending* tickets,
-# so a ticket left pending by a cancelled order would hold a slot in this kitchen's queue
-# permanently — a slow leak with the same shape as a stranded rider, in a different table.
-#
-# Scoped to *this* order, and polled. Counting every pending ticket for the restaurant
-# would be wrong: earlier sections leave orders legitimately parked inside their 120s
-# kitchen window, and those tickets are supposed to still be pending. Polling matters too —
-# compensation is four activities deep (refund, release, expire, cancel), so the expiry
-# lands a moment after the status reaches 'cancelled'.
-if have_container sfo-restaurant-db; then
-  TICKET_STATE=""
+# The capacity slot must come back. Since D32 the kitchen's rail is defined as
+# `status = 'confirmed' AND kitchen_decision IS NULL`, so a cancelled order leaves it as a
+# side effect of being cancelled — there is no expiry step, and no way for a slot to stay
+# occupied by an order that no longer exists. That whole class of leak is gone by
+# construction, and this asserts it.
+if have_container sfo-order-db; then
+  ON_RAIL=""
   for _ in $(seq 1 15); do
-    TICKET_STATE=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-      "SELECT status FROM order_tickets WHERE order_id = '$REJ_ORDER';" 2>/dev/null | tr -d '[:space:]')
-    [[ "$TICKET_STATE" != "pending" ]] && break
+    ON_RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT count(*) FROM orders WHERE id = '$REJ_ORDER'
+         AND status = 'confirmed' AND kitchen_decision IS NULL;" 2>/dev/null | tr -d '[:space:]')
+    [[ "$ON_RAIL" == "0" ]] && break
     sleep 2
   done
-  # 'rejected' is the expected end state here — the kitchen decided, so there was never a
-  # pending ticket for the expiry step to retire. The property under test is only that it
-  # did not stay 'pending' and keep consuming capacity.
-  if [[ "$TICKET_STATE" == "rejected" || "$TICKET_STATE" == "expired" ]]; then
-    ok "  the cancelled order released its capacity slot (ticket is '$TICKET_STATE')"
-  else
-    bad "  the cancelled order released its capacity slot" \
-        "ticket is '$TICKET_STATE', expected 'rejected' or 'expired'"
-  fi
+  assert "  the cancelled order left the kitchen's rail" "$ON_RAIL" "0"
 fi
 
 # --- compensation: nobody is free to deliver ---------------------------------------------
@@ -768,7 +756,7 @@ if have_container sfo-rider-db; then
     -H "X-Idempotency-Key: $NR_IDEM" "${CUST_AUTH[@]}"
   NR_ORDER=$(jfield "['id']")
   poll_status "$NR_ORDER" confirmed 40 "${CUST_AUTH[@]}"
-  expect "kitchen accepts it" 200 POST "/api/v1/restaurants/tickets/$NR_ORDER/accept" "" "${OWNER_AUTH[@]}"
+  expect "kitchen accepts it" 200 POST "/api/v1/orders/$NR_ORDER/accept" "" "${OWNER_AUTH[@]}"
 
   # RIDER_SEARCH_ATTEMPTS x RIDER_SEARCH_INTERVAL_SECONDS = 6 x 10s, so allow ~90s.
   poll_status "$NR_ORDER" cancelled 120 "${CUST_AUTH[@]}"
@@ -782,6 +770,52 @@ if have_container sfo-rider-db; then
   ok "returned the fleet to the road"
 else
   printf '  %sSKIP%s  no-rider compensation (docker/sfo-rider-db not reachable)\n' "$DIM" "$RESET"
+fi
+
+# --- capacity ----------------------------------------------------------------------------
+# `restaurants.capacity` went unread by anything until Week 2, and since D32 it is enforced
+# in the same local transaction that puts an order on the rail — so two orders can never
+# both take the last slot. Onboard a kitchen with room for exactly one and prove the second
+# order is refused, refunded, and never reaches 'confirmed'.
+section "Order saga — capacity is enforced"
+
+expect "onboard a one-slot kitchen" 201 POST /api/v1/restaurants/onboard \
+  "{\"name\":\"One Slot Diner\",\"address\":\"1 Tight Street\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":1}" \
+  "${OWNER_AUTH[@]}"
+TIGHT_ID=$(jfield "['id']")
+expect "publish its menu" 200 POST /api/v1/menus \
+  "{\"restaurant_id\":\"$TIGHT_ID\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true}]}]}" \
+  "${OWNER_AUTH[@]}"
+
+TIGHT_ORDER="{\"restaurant_id\":\"$TIGHT_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}"
+expect "first order takes the only slot" 201 POST /api/v1/orders "$TIGHT_ORDER" \
+  -H "X-Idempotency-Key: $IDEM-cap1" "${CUST_AUTH[@]}"
+CAP1=$(jfield "['id']")
+expect "second order is placed too" 201 POST /api/v1/orders "$TIGHT_ORDER" \
+  -H "X-Idempotency-Key: $IDEM-cap2" "${CUST_AUTH[@]}"
+CAP2=$(jfield "['id']")
+
+poll_status "$CAP1" confirmed 45 "${CUST_AUTH[@]}"
+poll_status "$CAP2" cancelled 60 "${CUST_AUTH[@]}"
+
+CAP2_PAY=$(docker_payment_row "$CAP2")
+[[ -n "$CAP2_PAY" ]] && assert "  the refused order was refunded" "$(cut -d'|' -f1 <<<"$CAP2_PAY")" "refunded"
+
+if have_container sfo-order-db; then
+  # It never reached 'confirmed' at all: the gate is *entry* to the rail, so the refused
+  # order goes created -> cancelled without ever occupying a slot.
+  CAP2_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$CAP2';" \
+    2>/dev/null | tr -d '[:space:]')
+  assert "  it never joined the rail" "$CAP2_TRAIL" "created,cancelled"
+  CAP2_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$CAP2' AND new_status='cancelled';" \
+    2>/dev/null | tr -d '[:space:]')
+  assert "  and the trail names why" "$CAP2_REASON" "kitchen_at_capacity"
+  RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT count(*) FROM orders WHERE restaurant_id='$TIGHT_ID' AND status='confirmed' AND kitchen_decision IS NULL;" \
+    2>/dev/null | tr -d '[:space:]')
+  assert "  the rail never exceeded its capacity of 1" "$RAIL" "1"
 fi
 
 # --- no rider left behind ----------------------------------------------------------------

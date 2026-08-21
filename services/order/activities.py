@@ -26,12 +26,11 @@ argument is durable, UI-visible history, so a bearer token must never be one; an
 
 from logging import Logger
 
-from fastapi import HTTPException, status
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from clients import SagaPaymentClient, SagaRestaurantClient, SagaRiderClient
-from repository import OrderRepository
+from clients import SagaPaymentClient, SagaRiderClient
+from repository import AtCapacity, OrderRepository
 
 
 def payment_key(order_id: str) -> str:
@@ -56,7 +55,6 @@ class OrderActivities:
         self._orders = orders
         self._logger = logger
         self._payments = SagaPaymentClient(logger)
-        self._restaurants = SagaRestaurantClient(logger)
         self._riders = SagaRiderClient(logger)
 
     # --- state ---------------------------------------------------------------------------
@@ -72,14 +70,20 @@ class OrderActivities:
         Returns the resulting status rather than a bare bool so the workflow can tell a
         real transition from a no-op without a second read.
         """
-        order, changed = self._orders.transition(
-            order_id=details["order_id"],
-            new_status=details["status"],
-            updated_by=details.get("updated_by", "order-workflow"),
-            event=details.get("event"),
-            metadata=details.get("metadata"),
-            rider_id=details.get("rider_id"),
-        )
+        try:
+            order, changed = self._orders.transition(
+                order_id=details["order_id"],
+                new_status=details["status"],
+                updated_by=details.get("updated_by", "order-workflow"),
+                event=details.get("event"),
+                metadata=details.get("metadata"),
+                rider_id=details.get("rider_id"),
+                capacity_limit=details.get("capacity_limit"),
+            )
+        except AtCapacity as exc:
+            # A full kitchen is the restaurant's answer, not a malfunction. Non-retryable:
+            # asking again cannot change a refusal already given, and the saga compensates.
+            raise ApplicationError(str(exc), non_retryable=True) from exc
 
         if order is None:
             # The order is gone. Nothing a retry can fix, and the saga cannot continue —
@@ -133,79 +137,32 @@ class OrderActivities:
         )
         return refunded
 
-    # --- kitchen ------------------------------------------------------------------------
+    # --- kitchen ---------------------------------------------------------------------
 
     @activity.defn
-    def send_ticket_activity(self, details: dict) -> dict:
-        """Put the order on the kitchen's rail.
+    def read_kitchen_decision_activity(self, details: dict) -> dict:
+        """Read the kitchen's answer straight off the order.
 
-        Returning successfully means the ticket is queued, *not* that it was accepted — the
-        kitchen answers later, by signal. A full kitchen is a non-retryable failure: waiting
-        and asking again would only hold the customer longer for an order this restaurant
-        has already refused capacity for.
+        Called when the saga's wait for a decision times out. That wait can expire for two
+        very different reasons — the kitchen ignored the order, or it answered and the signal
+        never landed — and refunding the second case is a real customer-visible failure.
+
+        Since D32 this is a local read of `orders.kitchen_decision` rather than an HTTP call
+        into another service, which removes the failure mode the old version had to guess
+        around: "the Restaurant Service is unreachable so we cannot tell" is no longer one of
+        the possible answers.
         """
         order_id = details["order_id"]
-        result = self._restaurants.send_ticket(
-            order_id, details["restaurant_id"], details.get("items", [])
-        )
-
-        if not result.get("queued"):
+        order = self._orders.find(order_id)
+        if order is None:
             raise ApplicationError(
-                f"Restaurant {details['restaurant_id']} refused order {order_id}: "
-                f"{result.get('reason', 'unknown')}",
-                non_retryable=True,
+                f"Order {order_id} no longer exists", non_retryable=True
             )
-        return result
-
-    @activity.defn
-    def read_ticket_activity(self, details: dict) -> dict:
-        """Read the kitchen's ticket, for when a decision signal never arrived.
-
-        The Restaurant Service commits a decision *before* relaying the signal that carries
-        it, so a relay lost in flight leaves a ticket saying `accepted` and a workflow that
-        timed out waiting to hear so. This is how the saga checks the record rather than
-        assuming silence meant refusal — see `OrderWorkflow._recover_kitchen_decision`.
-
-        A `404` means no ticket was ever queued, which is a definite answer and is returned
-        as `{"status": "missing"}`. Everything else — unreachable, `5xx` — is allowed to
-        raise so the retry policy applies, because "we could not find out" must not be
-        mistaken for "there was nothing to find".
-        """
-        order_id = details["order_id"]
-        try:
-            return self._restaurants.fetch_ticket(order_id)
-        except HTTPException as exc:
-            if exc.status_code == status.HTTP_404_NOT_FOUND:
-                self._logger.info("No kitchen ticket exists for order %s", order_id)
-                return {"status": "missing"}
-            raise
-
-    @activity.defn
-    def expire_ticket_activity(self, details: dict) -> dict:
-        """Retire the kitchen ticket for an order the saga is abandoning.
-
-        Part of compensation, and easy to overlook: the capacity check counts `pending`
-        tickets, so a ticket left behind by a cancelled order occupies a slot in that
-        kitchen's queue permanently. Enough of them and the restaurant can no longer accept
-        anything — a slow leak with the same shape as the rider leak, in a different table.
-
-        Never raises for "nothing to expire": the Restaurant Service answers `422` only when
-        no ticket ever existed, and a compensation that failed for having nothing to do
-        would be retried until the workflow gave up.
-        """
-        order_id = details["order_id"]
-        try:
-            result = self._restaurants.expire_ticket(order_id)
-        except Exception as exc:  # noqa: BLE001 - see below
-            # A ticket that cannot be expired is a capacity slot lost, not an order left
-            # wrong. Log it and let the rest of the rollback proceed; failing here would
-            # block the refund that actually matters to the customer.
-            self._logger.error("Could not expire ticket for order %s: %s", order_id, exc)
-            return {"expired": False}
+        decision = order.get("kitchen_decision")
         self._logger.info(
-            "Ticket for order %s is now '%s'", order_id, result.get("status")
+            "Kitchen decision for order %s reads '%s'", order_id, decision
         )
-        return result
+        return {"decision": decision, "status": order["status"]}
 
     # --- fleet --------------------------------------------------------------------------
 
@@ -213,21 +170,20 @@ class OrderActivities:
     def dispatch_rider_activity(self, details: dict) -> dict:
         """One attempt at claiming the nearest rider.
 
-        Reads the restaurant for its coordinates first — the first revision of this
-        blueprint hardcoded a latitude and longitude, and the columns are `NOT NULL` and
-        already on the response.
+        The coordinates arrive in `details` rather than being fetched. `create_order`
+        already reads the restaurant to verify it exists, so the latitude and longitude are
+        in hand at checkout and ride in the workflow payload — which is what took the saga's
+        HTTP calls to the Restaurant Service from four to zero (D32).
 
         An empty fleet returns `{"assigned": false}` rather than raising. Whether to wait
         and try again is a scheduling decision, and scheduling belongs to the workflow,
         which can sleep on a durable timer; an activity can only fail.
         """
         order_id = details["order_id"]
-        restaurant = self._restaurants.fetch_restaurant(details["restaurant_id"])
-
         result = self._riders.dispatch(
             order_id,
-            float(restaurant["latitude"]),
-            float(restaurant["longitude"]),
+            float(details["restaurant_latitude"]),
+            float(details["restaurant_longitude"]),
         )
         if not result.get("assigned"):
             self._logger.info(
