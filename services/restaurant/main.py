@@ -199,6 +199,31 @@ def list_tickets(
     return [TicketResponse(**row) for row in tickets.queue(restaurant_id, ticket_status)]
 
 
+@app.get(
+    "/api/v1/restaurants/tickets/{order_id}",
+    response_model=TicketResponse,
+    dependencies=[Depends(require_internal)],
+)
+def get_ticket(order_id: UUID) -> TicketResponse:
+    """Read one ticket by the order it belongs to.
+
+    Internal-key only, and it exists for exactly one caller: the saga, when its wait for a
+    kitchen decision times out. A decision is committed here *before* the signal relaying it
+    is sent, so a relay that fails in flight leaves a ticket that says `accepted` and a
+    workflow that never heard about it. Rather than refund a customer whose order the
+    kitchen did in fact take, the saga asks this endpoint what the ticket actually says.
+
+    Keyed by `order_id` rather than the ticket's own id because that is what the saga
+    knows — and `order_id` is `UNIQUE` on this table, so it identifies exactly one row.
+
+    A `404` here is a real answer, not a failure: no ticket was ever queued for this order.
+    """
+    ticket = tickets.find(order_id)
+    if ticket is None:
+        raise not_found(f"No ticket for order {order_id}")
+    return TicketResponse(**ticket)
+
+
 @app.post(
     "/api/v1/restaurants/tickets/{order_id}/expire",
     response_model=TicketResponse,

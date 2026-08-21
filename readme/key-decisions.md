@@ -301,8 +301,8 @@ identities. If internal-only endpoints multiply, per-service keypairs become the
 answer.
 
 > **That condition was met on 2026-08-21.** [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) took the internal key from one endpoint to
-> eight, because the saga's worker has no user to forward. The reasoning above is unchanged
-> and the conclusion it warned about is now due.
+> **eleven**, because the saga's worker has no user to forward. The reasoning above is
+> unchanged and the conclusion it warned about is now due.
 
 ### D16 — Each authorisation decision lives in exactly one place
 
@@ -565,9 +565,10 @@ handler had established that the caller owns it.
 **Costs:** **this is the moment D15's own caveat fires.** D15 justified a shared symmetric
 secret on the grounds that it granted "one narrow endpoint rather than the ability to mint
 identities", and noted that "if internal-only endpoints multiply, per-service keypairs
-become the better answer". They have now multiplied — from one to eight. The debt is
-recorded rather than absorbed: per-service keypairs, or a signed service assertion, is the
-right answer before this list grows again.
+become the better answer". They have now multiplied — from one to **eleven**, and the count
+rose again with every subsequent change to the saga. The debt is recorded rather than
+absorbed: per-service keypairs, or a signed service assertion, is the right answer before
+this list grows further.
 
 ### D27 — Restaurant acceptance is a signal and a timer, not a synchronous call
 
@@ -593,9 +594,21 @@ order sits there.
 
 **Costs:** a decision can be lost in flight. The Restaurant Service commits the ticket
 before relaying the signal and does not roll the decision back if the relay fails — the
-kitchen should not see an error for something they did successfully. The saga's own timeout
-is the backstop, which means a lost acceptance eventually reads as a refusal. That is the
-one hole this design keeps, and it is the remaining half of the open question D24 left.
+kitchen should not see an error for something they did successfully.
+
+That used to mean a lost acceptance eventually read as a refusal, which was this design's
+one real hole. It is now closed by a **read-back on timeout**: when the wait for a decision
+expires, the saga calls `read_ticket_activity` and asks the Restaurant Service what the
+ticket actually says before concluding anything (`OrderWorkflow._recover_kitchen_decision`).
+An `accepted` ticket resumes the saga; a `rejected` one compensates; only a ticket still
+`pending`, already `expired`, or absent is treated as genuine silence.
+
+The remaining exposure is narrower and deliberately biased: if the Restaurant Service cannot
+be reached *at all* after the retry policy is exhausted, the saga treats that as no decision
+and refunds. Refunding an accepted order is recoverable by a human; leaving a charged
+customer waiting on a saga that will never finish is not. Both branches are asserted in
+`scripts/saga-resilience-test.sh` §4, which simulates a lost relay by writing the decision
+straight into `sfo_restaurant_core`.
 
 The timeout also created a second-order leak that had to be closed with it: capacity is a
 count of `pending` tickets, so a saga that gave up waiting left its ticket pending forever
@@ -720,15 +733,18 @@ Not yet decided, and worth settling before the code forces an answer:
   endpoint resolves `pending` as well as `authorized`.
 - ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24 for the opening
   entry and by D31 for the saga's own transitions, which now commit with the status change
-  they describe. **The remaining half is real and is now the platform's main gap:** a
-  decision or delivery reported by the Restaurant or Rider Service is committed locally and
-  *then* relayed as a signal, and a failed relay is logged rather than retried. The saga's
-  timeout turns a lost acceptance into a refusal. An outbox table in each reporting service
-  is the standard answer; Week 3's Kafka work is the natural place for it.
+  they describe. The reported half is **partly** settled: a decision or delivery is
+  committed locally and *then* relayed as a signal, and a failed relay is logged rather than
+  retried — but the saga now reads the ticket back when its timeout fires, so a lost
+  *kitchen decision* self-corrects (D27). **A lost rider pickup or delivery signal does
+  not**, because there is no equivalent record to read back: the Rider Service's
+  `current_order_id` says who is carrying the order, not how far along they are. An outbox
+  table in each reporting service is the general answer; Week 3's Kafka work is the natural
+  place for it.
 - **Per-service credentials for internal calls** (D15, D26). The shared `INTERNAL_API_KEY`
-  now unlocks eight endpoints across four services, including refunds. D15 named this
+  now unlocks **eleven** endpoints across four services, including refunds. D15 named this
   threshold in advance; crossing it is a decision that should be made deliberately rather
-  than by accretion.
+  than by accretion — and it has been crossed by accretion, one endpoint at a time.
 - **Whether the rider search window belongs in config or per-restaurant.**
   `RIDER_SEARCH_ATTEMPTS × RIDER_SEARCH_INTERVAL_SECONDS` is one platform-wide number, so a
   dense city centre and a rural outpost get the same 60 seconds before an order is refunded.

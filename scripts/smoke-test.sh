@@ -601,6 +601,21 @@ expect "ticket expiry without the internal key -> 401" 401 \
   POST "/api/v1/restaurants/tickets/$ORDER_ID/expire"
 expect "ticket expiry with an owner token -> 401" 401 \
   POST "/api/v1/restaurants/tickets/$ORDER_ID/expire" "" "${OWNER_AUTH[@]}"
+expect "ticket read without the internal key -> 401" 401 \
+  GET "/api/v1/restaurants/tickets/$ORDER_ID"
+expect "ticket read with a customer token -> 401" 401 \
+  GET "/api/v1/restaurants/tickets/$ORDER_ID" "" "${CUST_AUTH[@]}"
+
+if [[ -n "$INTERNAL_KEY" ]]; then
+  # The lookup the saga uses to recover a kitchen decision whose signal was lost. Routed
+  # as `tickets/{order_id}` rather than `{restaurant_id}/tickets`, so this also confirms
+  # the two three-segment paths do not shadow each other.
+  expect "saga can read a ticket by order id" 200 \
+    GET "/api/v1/restaurants/tickets/$ORDER_ID" "" "${INTERNAL[@]}"
+  assert "  the ticket is for this order" "$(jfield "['order_id']")" "$ORDER_ID"
+  expect "reading a ticket that does not exist -> 404" 404 \
+    GET /api/v1/restaurants/tickets/00000000-0000-0000-0000-000000000000 "" "${INTERNAL[@]}"
+fi
 expect "internal order read without the key -> 401" 401 GET "/api/v1/orders/$ORDER_ID/internal"
 
 if [[ -n "$INTERNAL_KEY" ]]; then
@@ -713,13 +728,29 @@ assert "  status unchanged" "$(jfield "['status']")" "rejected"
 # The capacity slot must come back. `restaurants.capacity` is a count of *pending* tickets,
 # so a ticket left pending by a cancelled order would hold a slot in this kitchen's queue
 # permanently — a slow leak with the same shape as a stranded rider, in a different table.
+#
+# Scoped to *this* order, and polled. Counting every pending ticket for the restaurant
+# would be wrong: earlier sections leave orders legitimately parked inside their 120s
+# kitchen window, and those tickets are supposed to still be pending. Polling matters too —
+# compensation is four activities deep (refund, release, expire, cancel), so the expiry
+# lands a moment after the status reaches 'cancelled'.
 if have_container sfo-restaurant-db; then
-  sleep 2
-  LEFT_PENDING=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
-    "SELECT count(*) FROM order_tickets t
-       JOIN restaurants r ON r.id = t.restaurant_id
-      WHERE r.id = '$REST_ID' AND t.status = 'pending';" 2>/dev/null | tr -d '[:space:]')
-  assert "  no cancelled order is still holding a capacity slot" "$LEFT_PENDING" "0"
+  TICKET_STATE=""
+  for _ in $(seq 1 15); do
+    TICKET_STATE=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
+      "SELECT status FROM order_tickets WHERE order_id = '$REJ_ORDER';" 2>/dev/null | tr -d '[:space:]')
+    [[ "$TICKET_STATE" != "pending" ]] && break
+    sleep 2
+  done
+  # 'rejected' is the expected end state here — the kitchen decided, so there was never a
+  # pending ticket for the expiry step to retire. The property under test is only that it
+  # did not stay 'pending' and keep consuming capacity.
+  if [[ "$TICKET_STATE" == "rejected" || "$TICKET_STATE" == "expired" ]]; then
+    ok "  the cancelled order released its capacity slot (ticket is '$TICKET_STATE')"
+  else
+    bad "  the cancelled order released its capacity slot" \
+        "ticket is '$TICKET_STATE', expected 'rejected' or 'expired'"
+  fi
 fi
 
 # --- compensation: nobody is free to deliver ---------------------------------------------

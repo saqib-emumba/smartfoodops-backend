@@ -350,6 +350,10 @@ could be passed by a synchronous implementation with a retry loop; neither of th
   were idempotent.
 - **Kitchen timeout** — nobody answers the ticket. The order cancels, the payment is
   refunded, and the abandoned ticket is expired so it stops occupying a capacity slot.
+- **Lost decision signal** — the kitchen's answer is written straight to its database,
+  bypassing the relay that would normally carry it, which is exactly what a signal lost in
+  flight looks like. A lost *acceptance* must still complete the order without refunding;
+  a lost *rejection* must still cancel and refund.
 
 Each run generates unique emails, phone numbers, and idempotency keys, so both are safe to
 run repeatedly against the same database. They only ever create data — nothing is deleted —
@@ -617,6 +621,7 @@ curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bear
 | `GET` | `/api/v1/orders/{order_id}/internal` | Payment, worker | Same order as the bearer path, for callers with no user |
 | `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | worker | Coordinates for proximity dispatch |
 | `POST` | `/api/v1/restaurants/tickets` | worker | Idempotent on `order_id`; `{"queued": false}` when at capacity |
+| `GET` | `/api/v1/restaurants/tickets/{order_id}` | worker | Reads a decision back when its signal was lost in flight |
 | `POST` | `/api/v1/restaurants/tickets/{order_id}/expire` | worker | Compensation; `pending`-only, so it cannot overwrite a decision |
 | `POST` | `/api/v1/payments/authorize` | worker | Amount as a **string** so the decimal stays exact (D07) |
 | `POST` | `/api/v1/payments/refund` | worker | Compensation; idempotent by status, and sweeps stranded `pending` rows |

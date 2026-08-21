@@ -71,6 +71,7 @@ async def main() -> None:
                     activities.authorize_payment_activity,
                     activities.refund_payment_activity,
                     activities.send_ticket_activity,
+                    activities.read_ticket_activity,
                     activities.expire_ticket_activity,
                     activities.dispatch_rider_activity,
                     activities.release_rider_activity,

@@ -171,6 +171,22 @@ class SagaRestaurantClient:
             headers=internal_headers(),
         )
 
+    def fetch_ticket(self, order_id: UUID) -> dict:
+        """Read the kitchen's ticket, to recover a decision whose signal never arrived.
+
+        `missing_error` is left as the default `not_found`, unlike every other method here:
+        the activity that calls this needs to distinguish "no ticket exists" (a definite
+        answer) from "the Restaurant Service is unreachable" (retry), and a `404` is how it
+        tells them apart.
+        """
+        return self._client.get(
+            f"/api/v1/restaurants/tickets/{order_id}",
+            missing=f"Order {order_id} has no kitchen ticket",
+            unreachable_hint="cannot read the kitchen ticket",
+            bad_gateway_hint="reading the kitchen ticket",
+            headers=internal_headers(),
+        )
+
 
 class SagaPaymentClient:
     def __init__(self, logger: Logger):

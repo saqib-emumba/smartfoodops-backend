@@ -160,13 +160,23 @@ class OrderWorkflow:
                 timeout=timedelta(seconds=RESTAURANT_DECISION_TIMEOUT_SECONDS),
             )
         except asyncio.TimeoutError:
-            # Silence is a refusal. The customer must not wait indefinitely on a kitchen
-            # that never looked at its rail.
-            return await self._compensate(
-                order_id,
-                "kitchen_timeout",
-                f"No decision within {RESTAURANT_DECISION_TIMEOUT_SECONDS}s",
-            )
+            # The timer expired without a signal. That usually means the kitchen never
+            # looked at its rail — but it can also mean the kitchen *did* answer and the
+            # HTTP relay carrying that answer was lost, because the Restaurant Service
+            # commits a decision before relaying it. Read the ticket before concluding
+            # anything: refunding an order the kitchen actually accepted is a real
+            # customer-visible failure, and it is entirely avoidable with one lookup.
+            self._stage = "recovering_kitchen_decision"
+            self._restaurant_decision = await self._recover_kitchen_decision(order_id)
+
+            if self._restaurant_decision is None:
+                # Genuinely no decision on record. Silence is a refusal — the customer
+                # must not wait indefinitely on a kitchen that ignored the order.
+                return await self._compensate(
+                    order_id,
+                    "kitchen_timeout",
+                    f"No decision within {RESTAURANT_DECISION_TIMEOUT_SECONDS}s",
+                )
 
         if self._restaurant_decision == "rejected":
             return await self._compensate(
@@ -260,6 +270,53 @@ class OrderWorkflow:
             start_to_close_timeout=timedelta(seconds=10),
             retry_policy=STATE,
         )
+
+    async def _recover_kitchen_decision(self, order_id: str) -> str | None:
+        """Ask the Restaurant Service what the ticket says, after waiting timed out.
+
+        Returns `"accepted"`, `"rejected"`, or `None` for "no decision on record" — which
+        includes a ticket still `pending`, a ticket already `expired`, and no ticket at all.
+
+        This is the recovery for the one hole the signal design leaves open: a decision is
+        committed in `sfo_restaurant_core` before the relay carrying it is sent, so a lost
+        relay used to mean a refund for an order that had actually been accepted. Reading
+        the record turns that from a silent wrong answer into a self-correcting one.
+
+        A failure to reach the Restaurant Service at all — after the retry policy is
+        exhausted — is treated as "no decision". That is the safe default: refunding an
+        accepted order is recoverable by a human, whereas leaving a charged customer
+        waiting on a saga that will never finish is not.
+        """
+        try:
+            ticket = await workflow.execute_activity(
+                OrderActivities.read_ticket_activity,
+                {"order_id": order_id},
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=TRANSIENT,
+            )
+        except ActivityError as exc:
+            workflow.logger.error(
+                "Could not read the ticket for order %s after the kitchen timeout; "
+                "treating it as no decision: %s",
+                order_id,
+                exc.cause or exc,
+            )
+            return None
+
+        recorded = ticket.get("status")
+        if recorded in ("accepted", "rejected"):
+            # The kitchen had answered all along; only the signal went missing.
+            workflow.logger.info(
+                "Recovered a lost kitchen decision for order %s: '%s'",
+                order_id,
+                recorded,
+            )
+            return recorded
+
+        workflow.logger.info(
+            "Ticket for order %s is '%s'; no decision was ever made", order_id, recorded
+        )
+        return None
 
     async def _find_rider(self, order_id: str, restaurant_id: str) -> dict | None:
         """Try repeatedly to claim a rider, sleeping on a durable timer between attempts."""

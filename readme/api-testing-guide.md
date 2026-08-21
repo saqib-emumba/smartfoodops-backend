@@ -914,6 +914,7 @@ curl -s "$BASE/api/v1/orders/$ORDER_ID" -H "Authorization: Bearer $CUSTOMER" | p
 | An owner accepting *another* owner's ticket | `403` — checked before anything is revealed |
 | Accepting twice | `200`, status unchanged, and the saga is **not** signalled again |
 | Accepting after the 120s window | `200` on the ticket, but the order is already `cancelled` |
+| Accepting *just before* the window closes, with the relay failing | The saga reads the ticket back on timeout and continues anyway — see 8.6 |
 | A ticket for an unknown order | `404` |
 
 **Capacity.** `restaurants.capacity` is a count of *pending* tickets, and it is finally read
@@ -1034,7 +1035,32 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" 
   -d '{"signal":"rider_pickup","payload":{}}'
 ```
 
-### 8.6 Asking the saga where it is
+### 8.6 Simulating a lost decision signal
+
+The Restaurant Service commits a decision *before* relaying it, so a relay lost in flight
+would leave a ticket saying `accepted` and a workflow still waiting. You can reproduce that
+exactly by writing the decision straight into the database — no endpoint, no relay:
+
+```bash
+# Place an order and let it reach 'confirmed' (sections 4 and 5), then:
+docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core \
+  -c "UPDATE order_tickets SET status='accepted', decided_at=NOW()
+       WHERE order_id='$ORDER_ID';"
+
+# The saga has no idea. Watch it sit, then recover when its 120s timer fires:
+docker exec sfo-temporal-server temporal workflow query \
+  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID" --type stage
+# -> "stage":"awaiting_kitchen"     ...then, after the timeout:
+# -> "stage":"dispatching_rider"    (recovered — NOT cancelled)
+
+docker compose logs order-worker | grep "Recovered a lost kitchen decision"
+```
+
+The order proceeds to `assigned` and the payment stays `authorized` — no refund. Do the same
+with `status='rejected'` and it cancels and refunds instead. Only a ticket left `pending`,
+`expired`, or absent is treated as genuine silence.
+
+### 8.7 Asking the saga where it is
 
 A workflow query reads live state without touching the database — useful for "why is this
 order stuck?":

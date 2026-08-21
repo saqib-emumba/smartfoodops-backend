@@ -26,6 +26,7 @@ argument is durable, UI-visible history, so a bearer token must never be one; an
 
 from logging import Logger
 
+from fastapi import HTTPException, status
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
@@ -155,6 +156,29 @@ class OrderActivities:
                 non_retryable=True,
             )
         return result
+
+    @activity.defn
+    def read_ticket_activity(self, details: dict) -> dict:
+        """Read the kitchen's ticket, for when a decision signal never arrived.
+
+        The Restaurant Service commits a decision *before* relaying the signal that carries
+        it, so a relay lost in flight leaves a ticket saying `accepted` and a workflow that
+        timed out waiting to hear so. This is how the saga checks the record rather than
+        assuming silence meant refusal — see `OrderWorkflow._recover_kitchen_decision`.
+
+        A `404` means no ticket was ever queued, which is a definite answer and is returned
+        as `{"status": "missing"}`. Everything else — unreachable, `5xx` — is allowed to
+        raise so the retry policy applies, because "we could not find out" must not be
+        mistaken for "there was nothing to find".
+        """
+        order_id = details["order_id"]
+        try:
+            return self._restaurants.fetch_ticket(order_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                self._logger.info("No kitchen ticket exists for order %s", order_id)
+                return {"status": "missing"}
+            raise
 
     @activity.defn
     def expire_ticket_activity(self, details: dict) -> dict:

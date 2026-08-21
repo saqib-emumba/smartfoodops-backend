@@ -34,7 +34,8 @@ note() { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
 ENV_FILE="$(dirname "$0")/../.env"
 INTERNAL_KEY=$(grep -m1 '^INTERNAL_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
 
-for c in sfo-rider-db sfo-order-db sfo-order-worker; do
+for c in sfo-rider-db sfo-order-db sfo-restaurant-db sfo-payment-db sfo-order-worker \
+         sfo-temporal-server; do
   docker ps --format '{{.Names}}' | grep -q "^$c$" || {
     printf '%sNeeds the local stack running (%s not found).%s Try: docker compose up -d\n' \
       "$RED" "$c" "$RESET"; exit 1; }
@@ -270,6 +271,59 @@ if [[ -n "$LIVE" ]]; then
     -H "X-Internal-Key: $INTERNAL_KEY" | jf "['status']")
   assert "expiring an accepted ticket leaves it accepted" "$EXPIRED_LIVE" "accepted"
 fi
+
+# ================================================== 4. lost decision signal
+# The one hole the signal design leaves open: the Restaurant Service commits a decision
+# *before* relaying it, so a relay lost in flight leaves a ticket saying 'accepted' and a
+# workflow that never heard so. Simulated exactly by writing the decision straight into
+# sfo_restaurant_core — which is what an accept whose relay died looks like from outside.
+#
+# Without the recovery lookup the saga would time out and refund an order the kitchen had
+# actually taken. With it, the saga reads the ticket and carries on.
+section "4. A kitchen decision whose signal was lost"
+
+LOST=$(place "lostsig-$TAG")
+note "order $LOST"
+got=$(wait_status "$LOST" confirmed 45)
+assert "reached 'confirmed' and is waiting on the kitchen" "$got" "confirmed"
+
+# Decide the ticket without going through the endpoint that would relay the signal.
+docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -q -c \
+  "UPDATE order_tickets SET status = 'accepted', decided_at = NOW() WHERE order_id = '$LOST';" \
+  >/dev/null 2>&1
+TICKET=$(docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -tA -c \
+  "SELECT status FROM order_tickets WHERE order_id='$LOST';" 2>/dev/null | tr -d '[:space:]')
+assert "the kitchen's decision is on record" "$TICKET" "accepted"
+note "no signal was sent — the saga still believes it is waiting"
+
+# It must sit there for the full window, then recover rather than cancel.
+note "waiting out the 120s kitchen-decision window..."
+got=$(wait_status "$LOST" assigned 200)
+assert "the saga recovered the lost decision and dispatched" "$got" "assigned"
+
+PAY=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -tA -c \
+  "SELECT status FROM payments WHERE order_id='$LOST';" 2>/dev/null | tr -d '[:space:]')
+assert "  the payment was NOT refunded" "$PAY" "authorized"
+
+# Finish it so the rider is not left holding this order.
+api POST "/api/v1/riders/me/orders/$LOST/picked-up" "" "${RA[@]}" >/dev/null
+api POST "/api/v1/riders/me/orders/$LOST/delivered" "" "${RA[@]}" >/dev/null
+got=$(wait_status "$LOST" delivered 60)
+assert "  and completed normally afterwards" "$got" "delivered"
+
+# The mirror case: a lost *rejection* must still cancel, not hang.
+LOSTREJ=$(place "lostrej-$TAG")
+note "order $LOSTREJ — a lost rejection this time"
+wait_status "$LOSTREJ" confirmed 45 >/dev/null
+docker exec sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core -q -c \
+  "UPDATE order_tickets SET status = 'rejected', decided_at = NOW() WHERE order_id = '$LOSTREJ';" \
+  >/dev/null 2>&1
+note "waiting out the window again..."
+got=$(wait_status "$LOSTREJ" cancelled 200)
+assert "a lost rejection still cancels the order" "$got" "cancelled"
+PAY=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -tA -c \
+  "SELECT status FROM payments WHERE order_id='$LOSTREJ';" 2>/dev/null | tr -d '[:space:]')
+assert "  and refunds the customer" "$PAY" "refunded"
 
 # ---------------------------------------------------------------- restore
 docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -q -c \
