@@ -14,7 +14,28 @@
 #   ./scripts/smoke-test.sh              # run against http://localhost
 #   ./scripts/smoke-test.sh --wait       # wait for services to come up first
 #   ./scripts/smoke-test.sh --verbose    # print every response body
+#   ./scripts/smoke-test.sh --fast       # skip the saga sections (~90s instead of ~12min)
 #   BASE_URL=http://host:8080 ./scripts/smoke-test.sh
+#
+# --fast exists for refactoring, where the cost that matters is per-commit rather than
+# per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
+# kitchen timeouts and two 200s lost-signal timers.
+#
+# It is a real reduction in coverage, not just in runtime. --fast asserts 115 of the 185
+# checks and leaves fourteen routes COMPLETELY untouched -- every one the saga drives:
+#
+#   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
+#   POST   /api/v1/orders/{id}/reject          POST   /api/v1/payments/refund
+#   GET    /api/v1/orders/kitchen/{id}         POST   /api/v1/riders/dispatch
+#   POST   /api/v1/orders/{id}/signals         POST   /api/v1/riders/release
+#   POST   /api/v1/riders                      GET    /api/v1/riders/me
+#   PATCH  /api/v1/riders/me/location          PATCH  /api/v1/riders/me/availability
+#   POST   /api/v1/riders/me/orders/{id}/picked-up
+#   POST   /api/v1/riders/me/orders/{id}/delivered
+#
+# So --fast is worthless for changes to the Rider or Payment services, or to the kitchen
+# and signal routes: it would report green on a service it never called. Use it for the
+# request path, and run the full suite for those, and always before merging.
 #
 # Requires: bash, curl, python3. Nothing needs to be installed in the containers.
 
@@ -23,12 +44,14 @@ set -uo pipefail
 BASE_URL="${BASE_URL:-http://localhost}"
 VERBOSE=0
 WAIT=0
+FAST=0
 
 for arg in "$@"; do
   case "$arg" in
     --verbose|-v) VERBOSE=1 ;;
     --wait|-w)    WAIT=1 ;;
-    --help|-h)    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --fast|-f)    FAST=1 ;;
+    --help|-h)    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -542,6 +565,14 @@ expect "unknown payment id -> 404" 404 GET /api/v1/payments/00000000-0000-0000-0
 # =========================================================== order saga
 # Week 2. Everything above tests one request at a time; this section tests a *process* that
 # outlives any single request — which is why every status assertion here polls.
+#
+# Skippable as a block via --fast, and only as a block: the sections below share the fleet
+# they register and they drive ORDER_ID from 'confirmed' through to 'delivered', so the
+# cross-service trail assertion further down reads whichever end state this leaves behind.
+if (( FAST )); then
+printf '\n  %sSKIP%s  order saga sections (--fast); ORDER_ID stays parked at '\''confirmed'\''\n' \
+  "$DIM" "$RESET"
+else
 section "Order saga — fleet setup"
 
 expect "rider registers a profile" 201 POST /api/v1/riders \
@@ -830,6 +861,7 @@ else
   # the Week 2 blueprint shipped: it refunded on failure but never released.
   assert "no rider is stranded after every saga finished" "$STUCK" "0"
 fi
+fi  # --fast
 
 # ---------------------------------------------- cross-service integration
 section "Cross-service integration"
@@ -853,6 +885,13 @@ if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/n
   # with no compare-and-set, so a manual report is an extra entry rather than a no-op.
   EXPECTED_TRAIL="created,confirmed,assigned,picked_up,delivered"
   [[ -n "$INTERNAL_KEY" ]] && EXPECTED_TRAIL="created,confirmed,confirmed,assigned,picked_up,delivered"
+  # Under --fast nothing accepted the order, so the trail stops where the saga parked it.
+  # The 'confirmed' entries are still asserted: they prove checkout wrote the opening entry
+  # in the same transaction and that the payment activity then transitioned the order.
+  if (( FAST )); then
+    EXPECTED_TRAIL="created,confirmed"
+    [[ -n "$INTERNAL_KEY" ]] && EXPECTED_TRAIL="created,confirmed,confirmed"
+  fi
   TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
     -c "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id = '$ORDER_ID';" 2>/dev/null | tr -d '\r')
   assert "  tracking trail stored in sfo_order_core" "$TRAIL" "$EXPECTED_TRAIL"
