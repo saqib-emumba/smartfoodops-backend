@@ -14,10 +14,11 @@ RUN pip install --no-cache-dir \
     temporalio==1.31.0 \
     "PyJWT[crypto]==2.10.1"
 
-# Build context is ./services so the shared chassis can be copied alongside this service.
+# Build context is ./services so the shared chassis can be copied alongside this
+# service, and the service is copied as a package so its own modules import absolutely.
 COPY common/ /app/common/
-COPY order/ /app/
+COPY order/ /app/order/
 
 EXPOSE 8004
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004"]
+CMD ["uvicorn", "order.main:app", "--host", "0.0.0.0", "--port", "8004"]

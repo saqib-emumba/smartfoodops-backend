@@ -24,7 +24,7 @@ from psycopg2.extras import Json
 
 from common.errors import conflict, unprocessable
 from common.postgres import PostgresPool
-from schemas import OrderCreateRequest, OrderTrackingLogCreateRequest
+from order.schemas import OrderCreateRequest, OrderTrackingLogCreateRequest
 
 _COLUMNS = (
     "id, customer_id, restaurant_id, rider_id, items, total_amount, status, "

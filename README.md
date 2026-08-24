@@ -668,26 +668,27 @@ docker compose up -d --build order-service
 Create a `docker-compose.override.yml` — Compose merges it automatically, and it stays
 out of the committed `docker-compose.yml`:
 
-Mount the service directory at `/app` and the shared chassis at `/app/common`, so edits to
-either are picked up:
+Mount the service directory at `/app/<service>` and the shared chassis at `/app/common`, so
+edits to either are picked up. Each service is a package, so the mount point and the
+`uvicorn` target both carry its name:
 
 ```yaml
 services:
   user-service:
-    volumes: ["./services/user:/app", "./services/common:/app/common"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
+    volumes: ["./services/user:/app/user", "./services/common:/app/common"]
+    command: ["uvicorn", "user.main:app", "--host", "0.0.0.0", "--port", "8001", "--reload"]
   restaurant-service:
-    volumes: ["./services/restaurant:/app", "./services/common:/app/common"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
+    volumes: ["./services/restaurant:/app/restaurant", "./services/common:/app/common"]
+    command: ["uvicorn", "restaurant.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
   menu-service:
-    volumes: ["./services/menu:/app", "./services/common:/app/common"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003", "--reload"]
+    volumes: ["./services/menu:/app/menu", "./services/common:/app/common"]
+    command: ["uvicorn", "menu.main:app", "--host", "0.0.0.0", "--port", "8003", "--reload"]
   order-service:
-    volumes: ["./services/order:/app", "./services/common:/app/common"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8004", "--reload"]
+    volumes: ["./services/order:/app/order", "./services/common:/app/common"]
+    command: ["uvicorn", "order.main:app", "--host", "0.0.0.0", "--port", "8004", "--reload"]
   payment-service:
-    volumes: ["./services/payment:/app", "./services/common:/app/common"]
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8005", "--reload"]
+    volumes: ["./services/payment:/app/payment", "./services/common:/app/common"]
+    command: ["uvicorn", "payment.main:app", "--host", "0.0.0.0", "--port", "8005", "--reload"]
 ```
 
 Then `docker compose up -d` — saving a `.py` file restarts that worker in about a second.
@@ -710,18 +711,18 @@ The datastores publish host ports, so a service can run outside Docker against t
 Point the URLs at `localhost` and keep the rest of the stack in Compose:
 
 ```bash
-cd services/user
+cd services
 python3 -m venv .venv && source .venv/bin/activate
 pip install fastapi uvicorn "pydantic[email]" psycopg2-binary bcrypt
 
-# In the image, `common/` sits inside /app; on the host it is one level up.
-export PYTHONPATH=..
+# No PYTHONPATH juggling: `user` and `common` are both packages in this directory,
+# which is the same shape the image has at /app.
 
 # Source the password from .env so it never lands in your shell history.
-set -a && source ../../.env && set +a
+set -a && source ../.env && set +a
 export DATABASE_URL="postgresql://sfo_user_admin:${USER_POSTGRES_PASSWORD}@localhost:5432/sfo_user_core"
 
-uvicorn main:app --reload --port 8001
+uvicorn user.main:app --reload --port 8001
 ```
 
 Each service reads the same `DATABASE_URL` variable, but points it at a different host port
@@ -850,17 +851,27 @@ smartfoodops-backend/
 │   │   ├── logging_config.py  # Uniform log format
 │   │   ├── postgres.py        # PostgresPool: lifespan, cursor, health probe
 │   │   └── service_client.py  # Inter-service HTTP + failure translation
-│   ├── user/                  # main.py, repository.py, schemas.py           (:8001)
-│   ├── restaurant/            # + clients.py (User Service)                  (:8002)
-│   ├── menu/                  # + clients.py, cache.py (Redis cache-aside)   (:8003)
-│   ├── order/                 # + clients.py, pricing.py (re-pricing rules)  (:8004)
-│   └── payment/               # + clients.py, gateway.py, amounts.py         (:8005)
+│   ├── user/                  # main.py, repository.py, schemas.py, tokens.py (:8001)
+│   ├── restaurant/            # + clients.py (User Service)                   (:8002)
+│   ├── menu/                  # + clients.py, cache.py (Redis cache-aside)    (:8003)
+│   ├── order/                 # + clients.py, pricing.py, workflows.py,       (:8004)
+│   │                          #   activities.py, worker.py (the saga)
+│   ├── payment/               # + clients.py, gateway.py, amounts.py          (:8005)
+│   └── rider/                 # + clients.py (fleet + proximity dispatch)     (:8006)
 ├── scripts/smoke-test.sh      # End-to-end assertions across all five services
 ├── readme/                    # Blueprints, contracts, and the decision record
 ├── docker-compose.yml         # Orchestration
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
 └── .env                       # Local environment variables — gitignored, create it yourself
 ```
+
+Each service directory is a Python *package* — it has an `__init__.py`, and its modules
+import each other absolutely (`from order.repository import ...`). The Dockerfile copies it
+to `/app/<service>/` alongside `/app/common/`, so the two are never confusable and no
+top-level dependency can shadow a module named `schemas` or `clients`.
+
+`services/order/__init__.py` carries a warning worth reading before editing it: Temporal's
+workflow sandbox executes that file, so it must stay a docstring.
 
 A service's schema lives under `db/<service>/`, not next to its code, because it is consumed
 by that service's *database container* at first boot — the service image never reads it.

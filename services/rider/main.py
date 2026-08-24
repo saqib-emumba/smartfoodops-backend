@@ -21,14 +21,14 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, status
 
-from clients import OrderServiceClient, UserServiceClient
+from rider.clients import OrderServiceClient, UserServiceClient
 from common.auth import CurrentUser, require_internal, require_role
 from common.config import RIDER_MAX_DISTANCE_KM, required
 from common.errors import conflict, forbidden, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from repository import RiderRepository
-from schemas import (
+from rider.repository import RiderRepository
+from rider.schemas import (
     DispatchRequest,
     DispatchResponse,
     ReleaseRequest,

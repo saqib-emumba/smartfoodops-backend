@@ -11,7 +11,7 @@ from fastapi import HTTPException
 
 from common.errors import bad_request, conflict
 from common.postgres import PostgresPool
-from schemas import UserRegisterRequest
+from user.schemas import UserRegisterRequest
 
 _INSERT_USER = """
     INSERT INTO users (email, password_hash, full_name, phone, role_id)

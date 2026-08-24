@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, Header, Response, status
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.service import RPCError, RPCStatusCode
 
-from clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
+from order.clients import MenuServiceClient, RestaurantServiceClient, UserServiceClient
 from common.auth import (
     CurrentUser,
     get_current_user,
@@ -31,9 +31,9 @@ from common.errors import conflict, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
 from common.temporal import TemporalGateway, workflow_id_for
-from pricing import build_order_snapshot
-from repository import OrderRepository, OrderTrackingRepository
-from schemas import (
+from order.pricing import build_order_snapshot
+from order.repository import OrderRepository, OrderTrackingRepository
+from order.schemas import (
     KitchenDecisionResponse,
     KitchenOrderResponse,
     OrderCreateRequest,
@@ -42,7 +42,7 @@ from schemas import (
     OrderTrackingLogResponse,
     WorkflowSignalRequest,
 )
-from workflows import OrderWorkflow
+from order.workflows import OrderWorkflow
 
 SERVICE_NAME = "order-service"
 DATABASE_URL = required("DATABASE_URL")

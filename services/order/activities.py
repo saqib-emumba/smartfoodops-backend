@@ -29,8 +29,8 @@ from logging import Logger
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from clients import SagaPaymentClient, SagaRiderClient
-from repository import AtCapacity, OrderRepository
+from order.clients import SagaPaymentClient, SagaRiderClient
+from order.repository import AtCapacity, OrderRepository
 
 
 def payment_key(order_id: str) -> str:

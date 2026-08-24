@@ -13,10 +13,11 @@ RUN pip install --no-cache-dir \
     "PyJWT[crypto]==2.10.1" \
     redis==5.2.1
 
-# Build context is ./services so the shared chassis can be copied alongside this service.
+# Build context is ./services so the shared chassis can be copied alongside this
+# service, and the service is copied as a package so its own modules import absolutely.
 COPY common/ /app/common/
-COPY user/ /app/
+COPY user/ /app/user/
 
 EXPOSE 8001
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "user.main:app", "--host", "0.0.0.0", "--port", "8001"]

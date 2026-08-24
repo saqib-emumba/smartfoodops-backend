@@ -11,7 +11,7 @@ an order's lifecycle already lived — so this service is back to owning exactly
 from uuid import UUID
 
 from common.postgres import PostgresPool
-from schemas import RestaurantOnboardRequest
+from restaurant.schemas import RestaurantOnboardRequest
 
 _COLUMNS = "id, owner_id, name, address, latitude, longitude, is_active, capacity"
 

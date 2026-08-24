@@ -19,15 +19,15 @@ from uuid import UUID
 from fastapi import Depends, FastAPI
 from pydantic import ValidationError
 
-from cache import MenuCache
-from clients import RestaurantServiceClient
+from menu.cache import MenuCache
+from menu.clients import RestaurantServiceClient
 from common.auth import CurrentUser, get_current_user, require_role
 from common.config import DEFAULT_REDIS_URL, required
 from common.errors import forbidden, not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from repository import MenuRepository
-from schemas import MenuResponse, MenuUpsertRequest
+from menu.repository import MenuRepository
+from menu.schemas import MenuResponse, MenuUpsertRequest
 
 SERVICE_NAME = "menu-service"
 DATABASE_URL = required("DATABASE_URL")

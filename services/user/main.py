@@ -32,15 +32,15 @@ from common.config import (
 from common.errors import not_found, unauthorized
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from repository import UserRepository
-from schemas import (
+from user.repository import UserRepository
+from user.schemas import (
     LoginRequest,
     RefreshRequest,
     TokenResponse,
     UserRegisterRequest,
     UserResponse,
 )
-from tokens import RefreshTokenStore
+from user.tokens import RefreshTokenStore
 
 SERVICE_NAME = "user-service"
 DATABASE_URL = required("DATABASE_URL")

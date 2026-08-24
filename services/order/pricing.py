@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from decimal import Decimal
 
 from common.errors import unprocessable
-from schemas import OrderCreateRequest, OrderItemSelection
+from order.schemas import OrderCreateRequest, OrderItemSelection
 
 # Currency resolution used for every rounding step.
 CENTS = Decimal("0.01")

@@ -22,10 +22,17 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
-    # Flat imports: the Dockerfile copies this service to /app, so there is no
-    # `services.order` package. The first revision's `from services.order.activities
-    # import ...` would have raised ModuleNotFoundError in the container.
-    from activities import OrderActivities
+    # Every service-local import belongs inside this block, and the reason is not
+    # style. Reaching `activities` pulls in `clients` and `repository`, and through
+    # them `common.auth`, which calls `required("JWT_PUBLIC_KEY_B64")` at import
+    # time. Passed through, the sandbox reuses the already-loaded modules; outside
+    # the block it would re-execute them under restriction and fail the workflow
+    # task — forever, since Temporal retries it. Add imports here, never above.
+    #
+    # (`order` is a real package since the layout change, so these are absolute.
+    # What is *not* safe is putting anything in order/__init__.py: that file is
+    # executed by the sandbox before this block is reached. See its docstring.)
+    from order.activities import OrderActivities
     from common.config import (
         DELIVERY_TIMEOUT_SECONDS,
         RESTAURANT_DECISION_TIMEOUT_SECONDS,

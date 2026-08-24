@@ -17,14 +17,14 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, status
 
-from clients import UserServiceClient
+from restaurant.clients import UserServiceClient
 from common.auth import CurrentUser, get_current_user, require_role
 from common.config import required
 from common.errors import not_found
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from repository import RestaurantRepository
-from schemas import RestaurantOnboardRequest, RestaurantResponse
+from restaurant.repository import RestaurantRepository
+from restaurant.schemas import RestaurantOnboardRequest, RestaurantResponse
 
 SERVICE_NAME = "restaurant-service"
 DATABASE_URL = required("DATABASE_URL")

@@ -21,7 +21,7 @@ import psycopg2
 
 from common.errors import conflict
 from common.postgres import PostgresPool
-from schemas import RiderRegisterRequest
+from rider.schemas import RiderRegisterRequest
 
 _COLUMNS = (
     "id, user_id, vehicle_type, vehicle_number, is_available, "

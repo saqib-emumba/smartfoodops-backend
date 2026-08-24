@@ -18,7 +18,7 @@ from fastapi import HTTPException
 
 from common.errors import conflict
 from common.postgres import PostgresPool
-from schemas import PaymentAuthorizeRequest, PaymentCreateRequest
+from payment.schemas import PaymentAuthorizeRequest, PaymentCreateRequest
 
 _COLUMNS = "id, order_id, amount, status, transaction_reference, idempotency_key"
 

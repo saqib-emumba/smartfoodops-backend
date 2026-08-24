@@ -14,16 +14,16 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, Response, status
 
-from amounts import assert_settles_order, to_cents
-from clients import OrderServiceClient
+from payment.amounts import assert_settles_order, to_cents
+from payment.clients import OrderServiceClient
 from common.auth import CurrentUser, require_internal, require_role
 from common.config import required
 from common.errors import bad_request, not_found, unprocessable
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from gateway import MockPaymentGateway
-from repository import PaymentRepository
-from schemas import (
+from payment.gateway import MockPaymentGateway
+from payment.repository import PaymentRepository
+from payment.schemas import (
     PaymentAuthorizeRequest,
     PaymentCreateRequest,
     PaymentRefundRequest,

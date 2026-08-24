@@ -21,7 +21,7 @@ from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from activities import OrderActivities
+from order.activities import OrderActivities
 from common.config import (
     DEFAULT_TEMPORAL_ADDRESS,
     ORDER_TASK_QUEUE,
@@ -30,8 +30,8 @@ from common.config import (
 )
 from common.logging_config import configure_logging
 from common.postgres import PostgresPool
-from repository import OrderRepository
-from workflows import OrderWorkflow
+from order.repository import OrderRepository
+from order.workflows import OrderWorkflow
 
 SERVICE_NAME = "order-worker"
 

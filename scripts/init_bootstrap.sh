@@ -789,7 +789,7 @@ services:
       dockerfile: order/Dockerfile
     container_name: sfo-order-worker
     restart: always
-    command: ["python", "worker.py"]
+    command: ["python", "-m", "order.worker"]
     environment:
       <<: [*order-db-env, *jwt-env]
       TEMPORAL_ADDRESS: temporal-server:7233
