@@ -1,7 +1,7 @@
-"""The saga's payment calls: authorise and refund, on the internal key.
+"""The order saga's payment calls: authorise and refund, on the internal key.
 
-Used only by activities.py. An activity has no user behind it, so these carry the internal
-key rather than a forwarded bearer token — see clients/__init__.py.
+Used only by activities/order.py. An activity has no user behind it, so these carry the
+internal key rather than a forwarded bearer token — see clients/order/__init__.py.
 """
 
 from uuid import UUID

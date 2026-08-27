@@ -130,6 +130,7 @@ class OrderRepository(Repository):
         metadata: dict | None = None,
         rider_id: UUID | str | None = None,
         capacity_limit: int | None = None,
+        service: str | None = None,
     ) -> tuple[dict | None, bool]:
         """Advance an order and record the transition, in one transaction.
 
@@ -152,6 +153,13 @@ class OrderRepository(Repository):
         `confirmed` is what puts an order on the kitchen's rail, so counting the rail and
         joining it must not be two statements two orders can interleave between. Raises
         `AtCapacity` when full, having written nothing.
+
+        `service` overrides the identity this instance normally stamps on the trail row
+        (`self._service_name`, fixed at construction). Needed because `apis/transitions.py`
+        shares one `OrderRepository` instance across every caller that reaches it over
+        HTTP — the orchestrator's worker among them — and `order_tracking_logs.service`
+        must keep saying which *process* observed the transition, not which process
+        happened to hold the connection that wrote it down (D36).
         """
         with self._db.cursor(commit=True) as cur:
             if capacity_limit is not None:
@@ -187,7 +195,7 @@ class OrderRepository(Repository):
                 {
                     "order_id": str(order_id),
                     "new_status": new_status,
-                    "service": self._service_name,
+                    "service": service or self._service_name,
                     "updated_by": updated_by,
                     "raw_log": json.dumps(event or {"event": f"order_{new_status}"}),
                     "metadata": Json(metadata or {}),

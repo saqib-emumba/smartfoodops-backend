@@ -1,7 +1,8 @@
-"""Customer-facing routes for the `payments` resource, plus the health probe.
+"""Customer-facing routes for the `payments` resource: charge and read.
 
-Two routes charge on the customer's own bearer token; the saga's routes, on the internal
-key, live in saga.py instead — same split rider/apis/ makes between its own audiences.
+The health probe lives in health.py instead. Two routes here charge on the customer's own
+bearer token; the saga's routes, on the internal key, live in saga.py — same split
+rider/apis/ makes between its own audiences.
 """
 
 from functools import partial
@@ -11,33 +12,17 @@ from fastapi import APIRouter, Depends, Header, Response, status
 
 from common.auth import CurrentUser, require_role
 from common.errors import bad_request, not_found
-from common.health import health_payload
+from common.responses import Envelope, REPLAY_RESPONSE, ok
 from payment import deps
 from payment.authorise import authorise
 from payment.schemas.payments import PaymentCreateRequest, PaymentResponse
 
 router = APIRouter(prefix="/api/v1/payments")
 
-# Declares 201 but answers 200 on an idempotent replay, so OpenAPI has to say both or it
-# is describing behaviour the service does not have. Shared with saga.py's own charging
-# route, which carries the same contract.
-REPLAY_RESPONSE = {200: {"description": "Idempotent replay of an already-processed key"}}
-
-
-@router.get("/health")
-def health():
-    return health_payload(
-        deps.SERVICE_NAME,
-        deps.db,
-        status="Payment Service is operational",
-        order_service_url=deps.order_service.base_url,
-        gateway=deps.gateway.name,
-    )
-
 
 @router.post(
     "",
-    response_model=PaymentResponse,
+    response_model=Envelope[PaymentResponse],
     status_code=status.HTTP_201_CREATED,
     responses=REPLAY_RESPONSE,
 )
@@ -46,7 +31,7 @@ def process_payment(
     response: Response,
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
     current_user: CurrentUser = Depends(require_role("customer")),
-) -> PaymentResponse:
+) -> Envelope[PaymentResponse]:
     """Authorise a payment for an order, at most once per idempotency key.
 
     Ownership is not checked here: the Order Service lookup runs as the caller and refuses
@@ -76,14 +61,15 @@ def process_payment(
     )
     if replayed:
         response.status_code = status.HTTP_200_OK
-    return PaymentResponse(**payment)
+        return ok(PaymentResponse(**payment), message="Replayed", status=200)
+    return ok(PaymentResponse(**payment), message="Payment authorised", status=201)
 
 
-@router.get("/{payment_id}", response_model=PaymentResponse)
+@router.get("/{payment_id}", response_model=Envelope[PaymentResponse])
 def get_payment(
     payment_id: UUID,
     current_user: CurrentUser = Depends(require_role("customer")),
-) -> PaymentResponse:
+) -> Envelope[PaymentResponse]:
     """Expose a payment's state so a saga (or an operator) can see where it stopped.
 
     `payments` holds no customer column — the order is what knows who this belongs to — so
@@ -95,4 +81,4 @@ def get_payment(
         raise not_found(f"Payment {payment_id} not found")
 
     deps.order_service.fetch_order(row["order_id"], current_user.token)
-    return PaymentResponse(**row)
+    return ok(PaymentResponse(**row), message="Payment found")

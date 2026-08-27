@@ -1,4 +1,4 @@
-"""Routers for the Rider Service, one module per audience.
+"""Routers for the Rider Service, one module per audience — plus `health`, on its own.
 
 `profile` and `delivery` are rider-facing on a bearer token; `dispatch` is saga-facing on
 the internal key. The split follows that boundary rather than the URL shape, because who

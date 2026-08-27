@@ -1,41 +1,24 @@
-"""HTTP routes for the session lifecycle: register, log in, refresh, log out.
+"""HTTP routes for the `session` entity: log in, refresh, log out.
 
-Reading a profile lives in users.py instead — see that module's docstring for why the
-split follows what a route answers rather than which repository method it calls.
+Registering an account lives in users.py instead, beside the rest of the `users` entity's
+routes — creating a user is a `users` write, not a session concern, even though it also
+opens the first session. See users.py's docstring for the split rationale.
 """
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends
 
 from common.auth import CurrentUser, get_current_user
 from common.errors import unauthorized
+from common.responses import Envelope, ok
 from user import deps
-from user.schemas.users import (
-    LoginRequest,
-    RefreshRequest,
-    TokenResponse,
-    UserRegisterRequest,
-    UserResponse,
-)
-from user.security import (
-    ABSENT_ACCOUNT_HASH,
-    INVALID_CREDENTIALS,
-    hash_password,
-    issue_session,
-    verify_password,
-)
+from user.schemas.sessions import LoginRequest, RefreshRequest, TokenResponse
+from user.security import ABSENT_ACCOUNT_HASH, INVALID_CREDENTIALS, issue_session, verify_password
 
 router = APIRouter(prefix="/api/v1/users")
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register_user(payload: UserRegisterRequest) -> UserResponse:
-    """Register a user, mapping the incoming role name to roles.id via a DB lookup."""
-    row = deps.users.register(payload, hash_password(payload.password))
-    return UserResponse(**row)
-
-
-@router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest) -> TokenResponse:
+@router.post("/login", response_model=Envelope[TokenResponse])
+def login(payload: LoginRequest) -> Envelope[TokenResponse]:
     """Exchange credentials for an access token and a refresh session."""
     record = deps.users.find_credentials(str(payload.email))
 
@@ -48,11 +31,12 @@ def login(payload: LoginRequest) -> TokenResponse:
         deps.logger.info("Failed login attempt for %s", payload.email)
         raise unauthorized(INVALID_CREDENTIALS)
 
-    return issue_session(deps.refresh_tokens, record["id"], record["role"])
+    token = issue_session(deps.refresh_tokens, record["id"], record["role"])
+    return ok(token, message="Logged in")
 
 
-@router.post("/refresh", response_model=TokenResponse)
-def refresh_session(payload: RefreshRequest) -> TokenResponse:
+@router.post("/refresh", response_model=Envelope[TokenResponse])
+def refresh_session(payload: RefreshRequest) -> Envelope[TokenResponse]:
     """Trade a refresh token for a fresh pair, rotating the refresh token in the process.
 
     Public by design: the refresh token *is* the credential here, and the access token it
@@ -67,15 +51,21 @@ def refresh_session(payload: RefreshRequest) -> TokenResponse:
     if record is None:
         raise unauthorized("The account behind this session no longer exists")
 
-    return issue_session(deps.refresh_tokens, user_id, record["role"])
+    token = issue_session(deps.refresh_tokens, user_id, record["role"])
+    return ok(token, message="Session refreshed")
 
 
-@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/logout", response_model=Envelope[None])
 def logout(
     payload: RefreshRequest,
     current_user: CurrentUser = Depends(get_current_user),
-) -> None:
+) -> Envelope[None]:
     """End a session by revoking its refresh token.
+
+    Answers `200` with a `null` body rather than the platform's old `204`: a `204` response
+    has no body by definition, and the envelope needs one to appear in. `POST
+    .../picked-up` and `.../delivered` on the Rider Service make the same change, for the
+    same reason.
 
     The access token already issued stays valid until it expires — that is the trade the
     stateless design makes, and why ACCESS_TOKEN_TTL_MINUTES is short.
@@ -85,3 +75,4 @@ def logout(
     )
     if not revoked:
         deps.logger.info("Logout presented a token that was not live for this user")
+    return ok(message="Logged out")

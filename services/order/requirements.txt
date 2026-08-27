@@ -1,6 +1,6 @@
 -r ../common/requirements.txt
 
-# httpx for the request-path lookups and the saga's outbound calls; temporalio because
-# this image also runs order-worker, which executes the saga.
+# httpx for the request-path lookups and the saga hand-off into the Orchestrator Service.
+# No temporalio (D36): this image no longer runs a worker, and holds no Temporal client of
+# its own — orchestrator/requirements.txt is the only one that needs it now.
 httpx==0.28.1
-temporalio==1.31.0

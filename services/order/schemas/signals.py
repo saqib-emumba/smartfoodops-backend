@@ -1,6 +1,7 @@
 """The one relay request a sibling service sends into the order's workflow."""
 
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -21,3 +22,13 @@ class WorkflowSignalRequest(BaseModel):
 
     signal: Literal["rider_pickup", "rider_delivery"]
     payload: dict = {}
+
+
+class SignalAcceptedResponse(BaseModel):
+    """What the relay hands back once Temporal has accepted the signal — not a resource,
+    just the acknowledgement, which is why the field names name the request that was made,
+    not anything about the order's state.
+    """
+
+    signalled: str
+    order_id: UUID

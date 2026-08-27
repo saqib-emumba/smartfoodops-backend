@@ -20,7 +20,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from common.lifespan import compose_lifespan
-from menu.apis import menus
+from common.responses import install_error_handlers
+from menu.apis import health, menus
 from menu import deps
 
 
@@ -38,7 +39,9 @@ app = FastAPI(
     title="SmartFoodOps Menu Service",
     lifespan=compose_lifespan(deps.db.lifespan, _cache_lifespan),
 )
+install_error_handlers(app)
 
+app.include_router(health.router)
 app.include_router(menus.router)
 
 

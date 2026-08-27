@@ -1,9 +1,10 @@
 """Pydantic v2 schemas for the Order Service, grouped by the area they serve.
 
-orders.py    line items, checkout request/response — the customer-facing shape
-kitchen.py   the narrower projection a restaurant admin sees, and its decision outcome
-signals.py   the one relay request from a sibling service into the workflow
-tracking.py  the append-only audit trail, in both directions
+orders.py       line items, checkout request/response — the customer-facing shape
+kitchen.py      the narrower projection a restaurant admin sees, and its decision outcome
+signals.py      the one relay request from a sibling service into the workflow
+tracking.py     the append-only audit trail, in both directions
+transitions.py  the orchestrator's one write into this service (D36)
 
 Coupling worth knowing: OrderResponse and KitchenOrderResponse both depend on
 OrderItemSnapshot (orders.py) — a kitchen still needs to see what was ordered, just not

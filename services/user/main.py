@@ -5,7 +5,7 @@ is the only service holding the RS256 private key: every other service verifies 
 none can mint them.
 
 Refresh sessions live in Redis logical database 1, kept clear of the Menu Service's cache in
-database 0 — see tokens.py.
+database 0 — see repositories/sessions.py.
 
 This module is the composition root: it builds the app, composes the two lifespans, and
 mounts the routers. Singletons live in deps.py, routes in apis/, and the password/session
@@ -17,7 +17,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from common.lifespan import compose_lifespan
-from user.apis import auth, users
+from common.responses import install_error_handlers
+from user.apis import health, sessions, users
 from user import deps
 
 
@@ -35,9 +36,11 @@ app = FastAPI(
     title="SmartFoodOps User Service",
     lifespan=compose_lifespan(deps.db.lifespan, _refresh_store_lifespan),
 )
+install_error_handlers(app)
 
+app.include_router(health.router)
 app.include_router(users.router)
-app.include_router(auth.router)
+app.include_router(sessions.router)
 
 
 if __name__ == "__main__":

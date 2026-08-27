@@ -1,4 +1,10 @@
-"""The append-only audit trail: a sibling's write, and a caller's read."""
+"""The append-only audit trail: a sibling's write, and a caller's read.
+
+Unlike signals.py, the guard here stays per-route rather than moving to the router: this
+router's two routes carry different credentials — the write is internal-key only, the read
+is a bearer token checked against the order's owner — so a single router-level dependency
+would either lock the read out from behind a bearer or leave the write unguarded.
+"""
 
 from uuid import UUID
 
@@ -6,6 +12,7 @@ from fastapi import APIRouter, Depends, status
 
 from common.auth import CurrentUser, get_current_user, require_internal, require_self_or_admin
 from common.errors import not_found
+from common.responses import Envelope, ok
 from order import deps
 from order.schemas.tracking import OrderTrackingLogCreateRequest, OrderTrackingLogResponse
 
@@ -14,11 +21,11 @@ router = APIRouter(prefix="/api/v1/orders")
 
 @router.post(
     "/logs",
-    response_model=OrderTrackingLogResponse,
+    response_model=Envelope[OrderTrackingLogResponse],
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_internal)],
 )
-def log_order_status(payload: OrderTrackingLogCreateRequest) -> OrderTrackingLogResponse:
+def log_order_status(payload: OrderTrackingLogCreateRequest) -> Envelope[OrderTrackingLogResponse]:
     """Append a status transition reported by another service.
 
     Service-to-service only, on the internal key rather than a bearer token: the Order
@@ -32,14 +39,15 @@ def log_order_status(payload: OrderTrackingLogCreateRequest) -> OrderTrackingLog
     An unknown order or an invented status is `422`: the request is well formed, and it is
     the thing it points at that is wrong.
     """
-    return OrderTrackingLogResponse(**deps.tracking.append(payload))
+    row = deps.tracking.append(payload)
+    return ok(OrderTrackingLogResponse(**row), message="Transition logged", status=201)
 
 
-@router.get("/{order_id}/logs", response_model=list[OrderTrackingLogResponse])
+@router.get("/{order_id}/logs", response_model=Envelope[list[OrderTrackingLogResponse]])
 def get_order_timeline(
     order_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
-) -> list[OrderTrackingLogResponse]:
+) -> Envelope[list[OrderTrackingLogResponse]]:
     """Return every recorded transition for one order, oldest first.
 
     Readable by the customer who placed it, or an admin — the same rule as the order
@@ -52,4 +60,5 @@ def get_order_timeline(
         raise not_found(f"Order {order_id} not found")
 
     require_self_or_admin(current_user, order["customer_id"])
-    return [OrderTrackingLogResponse(**row) for row in deps.tracking.timeline(order_id)]
+    rows = [OrderTrackingLogResponse(**row) for row in deps.tracking.timeline(order_id)]
+    return ok(rows, message="Timeline")

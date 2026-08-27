@@ -1,7 +1,7 @@
-"""The saga's fleet calls: dispatch and release, on the internal key.
+"""The order saga's fleet calls: dispatch and release, on the internal key.
 
-Used only by activities.py — see clients/__init__.py for why the internal key rather than
-a forwarded bearer token.
+Used only by activities/order.py — see clients/order/__init__.py for why the internal key
+rather than a forwarded bearer token.
 """
 
 from uuid import UUID

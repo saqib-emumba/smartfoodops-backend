@@ -1,13 +1,24 @@
 # SmartFoodOps — Order Saga: How Temporal Orchestration Actually Works
 
 This document explains **the code as it exists today** — not the plan, not the blueprint's
-intent, but what `services/order/workflows.py`, `activities.py`, `worker.py` and `main.py`
-actually do, and how the three sibling services (Payment, Restaurant, Rider) participate.
+intent, but what `services/orchestrator/workflows/order.py`, `activities/order.py`,
+`worker.py` and `services/order/apis/`'s saga-facing routes actually do, and how the sibling
+services (Payment, Restaurant, Rider, and the Order Service itself) participate.
+
+Since D36, the workflow and its worker are a separate deployable, `services/orchestrator/`,
+sharing neither the Order Service's image nor its database. Every diagram and trace below
+reflects that split — where the code used to write `sfo_order_core` directly it now makes an
+HTTP call, and the container that used to be `order-worker` is `orchestrator-worker`.
+
+`activities/`, `clients/`, `schemas/`, `workflows/` and `apis/` under `services/orchestrator/`
+are all entity-scoped — every file below named `order.py` or `order/` is that entity's own,
+so a second workflow this service might one day orchestrate gets its own set beside it
+rather than growing these.
 
 - **What to build, and why it differs from the original plan** →
   [week2-temporal-orchestration-blueprint.md](week2-temporal-orchestration-blueprint.md)
 - **Why each choice was made, against what alternative** →
-  [key-decisions.md](key-decisions.md) (D25–D32)
+  [key-decisions.md](key-decisions.md) (D25–D32, D36)
 - **This document** → how it runs, end to end, including every way it can fail
 
 ---
@@ -27,55 +38,77 @@ stays completely unaware that an orchestrator exists — they see HTTP requests 
    ▼          ▼          ▼              ▼           ▼           ▼
  User      Restaurant   Menu         Order        Payment      Rider
  :8001       :8002     :8003         :8004         :8005       :8006
-                                    │▲     gRPC
-                              gRPC  ││
+                                    │▲     HTTP, X-Internal-Key
+                              HTTP  ││     (start saga / signal saga)
                                     ▼│
+                            ┌────────────────────┐
+                            │ orchestrator-service│  :8007  Temporal front door
+                            └──────────┬──────────┘         (no database)
+                                       │▲ gRPC
+                                 gRPC  ││
+                                       ▼│
                             ┌───────────────┐
                             │ temporal-server│  :7233 gRPC
                             │               │  :8233 Web UI
                             └───────┬───────┘
                                     │ polls task queue "order-tasks"
                                     ▼
-                            ┌───────────────┐
-                            │ order-worker   │  runs every workflow + activity
-                            └───────────────┘
+                          ┌──────────────────────┐
+                          │ orchestrator-worker   │  runs every workflow + activity
+                          └──────────────────────┘         (no database either)
 ```
 
-`order-worker`'s activities and the Restaurant/Rider signal relays share the same credential
-but travel in opposite directions:
+`orchestrator-worker`'s activities and the Restaurant/Rider signal relays share the same
+credential but travel in opposite directions:
 
 ```
- order-worker ──X-Internal-Key──▶ payment-service   (authorize / refund)
- order-worker ──X-Internal-Key──▶ rider-service     (dispatch / release)
- order-worker ────── local SQL ──▶ sfo_order_core   (status, trail, kitchen decision)
+ orchestrator-worker ──X-Internal-Key──▶ payment-service   (authorize / refund)
+ orchestrator-worker ──X-Internal-Key──▶ rider-service     (dispatch / release)
+ orchestrator-worker ──X-Internal-Key──▶ order-service     (transition / read — D36; this
+                                                             was local SQL before the split)
 
  rider-service ──X-Internal-Key──▶ order-service    POST /orders/{id}/signals
                                                     (pickup / delivery only)
 
+ order-service ──X-Internal-Key──▶ orchestrator-service   POST /orchestrator/sagas
+                                                          POST .../sagas/{id}/signals
+
  restaurant admin ──bearer token──▶ order-service   POST /orders/{id}/accept|reject
-                                                    (no relay: the Order Service owns
-                                                     both the column and the workflow)
+                                                    (no relay through orchestrator-service
+                                                     for the decision itself — only the
+                                                     signal that follows it is)
 ```
 
-- **`order-service`** starts a workflow when an order is created, and exposes the one door
-  a signal can enter through: `POST /api/v1/orders/{id}/signals`.
-- **`order-worker`** is a separate container running the same image, polling the
-  `order-tasks` task queue. It hosts the workflow's *logic* and every *activity* — the actual
-  HTTP calls out to Payment and Rider. **Not Restaurant**: since D32 the saga never calls
-  that service, and `order-worker` does not even have `RESTAURANT_SERVICE_URL` in its
-  environment.
+- **`order-service`** starts a saga when an order is created and relays a signal into one,
+  both as HTTP calls into `orchestrator-service` (D36) — it holds no Temporal client of its
+  own. It also answers `orchestrator-worker`'s two calls back into it: recording a
+  transition, and reading `kitchen_decision` for the lost-signal recovery in §6.5.
+- **`orchestrator-service`** is the Temporal front door: `POST /api/v1/orchestrator/sagas`
+  starts a workflow, `POST .../sagas/{id}/signals` relays an event into a running one. It
+  is internal-key only end to end — no end user, and no sibling but the Order Service, ever
+  calls it — and the gateway proxies nothing from it but its health probe.
+- **`orchestrator-worker`** is a separate deployable from `orchestrator-service` — same
+  image, only the command differs, mirroring the shape `order-service`/`order-worker` had
+  before the split. It polls the `order-tasks` task queue and hosts the workflow's *logic*
+  and every *activity*, including the two — `transition_order_activity` and
+  `read_kitchen_decision_activity` — that used to write and read `sfo_order_core` directly
+  when the worker shared the Order Service's database. Both are HTTP calls now. Still
+  **not Restaurant**: since D32 the saga never calls that service, and neither orchestrator
+  process holds `RESTAURANT_SERVICE_URL`.
 - **Payment and Rider** never import `temporalio`. They answer plain HTTP requests, and the
   Rider Service calls back into `order-service`'s signal endpoint to report a pickup or a
-  delivery. The kitchen's decision arrives differently — an admin posts it straight to the
-  Order Service, which owns both the column it lands in and the workflow it notifies.
+  delivery — unaware an orchestrator exists at all, exactly as before the split. The
+  kitchen's decision arrives differently — an admin posts it straight to the Order Service,
+  which owns the column it lands in and relays the signal onward itself.
 
 This split is what a worker restart can prove safe: the workflow's *state* lives inside
-Temporal's own storage, not inside `order-worker`'s process memory. Kill the container, and
-the next worker to poll the same task queue picks the workflow up exactly where it left off.
+Temporal's own storage, not inside `orchestrator-worker`'s process memory — and, since D36,
+not inside any database that process can reach at all. Kill the container, and the next
+worker to poll the same task queue picks the workflow up exactly where it left off.
 
 ### The three things a workflow can do
 
-Everything in `workflows.py` reduces to three primitives, and keeping them separate is what
+Everything in `workflows/order.py` reduces to three primitives, and keeping them separate is what
 makes the workflow replayable:
 
 | Primitive | Direction | Used for | Example in this saga |
@@ -85,7 +118,7 @@ makes the workflow replayable:
 | **Query** | outside world → workflow (read-only) | asking the workflow's current state, with no side effect | `stage()` |
 
 Signal handlers in this codebase only ever set a field on `self` — they never call an
-activity directly (`workflows.py:80-100`). Only the `run()` coroutine, on its own turn,
+activity directly (`workflows/order.py:80-100`). Only the `run()` coroutine, on its own turn,
 reacts to what a signal set. That is what keeps the ordering of side effects deterministic
 regardless of exactly when a signal happens to arrive.
 
@@ -221,7 +254,7 @@ TEMPORAL  ── hands the run to ──▶  ORDER-WORKER
 Two things worth naming that this diagram can't show:
 
 - **Every `wait_condition` is a durable timer**, not a blocked thread or an open connection.
-  While the workflow is "waiting", `order-worker` holds nothing for it — no memory, no
+  While the workflow is "waiting", `orchestrator-worker` holds nothing for it — no memory, no
   socket. It could be killed and restarted a dozen times during that 120-second window and
   the wait resumes exactly where it was.
 - **Signals never call activities directly** (§1). The `run()` coroutine is what reacts to
@@ -231,7 +264,7 @@ Two things worth naming that this diagram can't show:
 
 ## 4. The two kinds of "no"
 
-The single most important discipline in `activities.py` is this rule, applied consistently:
+The single most important discipline in `activities/order.py` is this rule, applied consistently:
 
 > **A business outcome is not a transport failure.**
 
@@ -247,7 +280,7 @@ compensates on the **first** attempt rather than after three retries — the bug
 blueprint shipped (see §0.3 of the blueprint doc).
 
 The workflow unwraps the real cause when logging or recording a reason
-(`str(exc.cause or exc)` in `workflows.py`), so a cancellation's audit-trail entry names the
+(`str(exc.cause or exc)` in `workflows/order.py`), so a cancellation's audit-trail entry names the
 actual failure rather than Temporal's wrapper exception.
 
 Three retry policies, each sized to what it protects:
@@ -274,7 +307,7 @@ survive that.
 | Write | Guard | Where |
 |---|---|---|
 | Order status transition | Compare-and-set: `status <> new AND status NOT IN ('delivered','cancelled') AND (new='cancelled' OR new > status)` | `order/repository.py::OrderRepository.transition` |
-| Payment authorization | Idempotency key **derived** from the order id (`wf-pay-{order_id}`), enforced by `UNIQUE(idempotency_key)` | `activities.py::payment_key`, `payment/repository.py` |
+| Payment authorization | Idempotency key **derived** from the order id (`wf-pay-{order_id}`), enforced by `UNIQUE(idempotency_key)` | `activities/order.py::payment_key`, `payment/repositories/payments.py` |
 | Payment refund | Idempotent by **status**, not by key — a `refunded` row is returned unchanged | `payment/repository.py::mark_refunded` |
 | Joining the kitchen's rail | Capacity counted and the transition written in **one** transaction, so two orders cannot both take the last slot | `order/repository.py::transition` (`capacity_limit`) |
 | Kitchen accept / reject | `WHERE status = 'confirmed' AND kitchen_decision IS NULL` — only the first decision sticks, and a cancelled order cannot be decided at all | `order/repository.py::decide_kitchen` |
@@ -383,13 +416,13 @@ idempotency guards exist, and here is the concrete path through one of them:
 ```
  time ──▶
 
- attempt 1   order-worker: authorize_payment_activity ──▶ Payment Service
+ attempt 1   orchestrator-worker: authorize_payment_activity ──▶ Payment Service
              Payment Service: creates the row, authorizes it ── SUCCEEDS
-             order-worker: ✗ times out before the response arrives
+             orchestrator-worker: ✗ times out before the response arrives
                     │
                     │  TRANSIENT backoff: wait 2s
                     ▼
- attempt 2   order-worker: authorize_payment_activity ──▶ Payment Service
+ attempt 2   orchestrator-worker: authorize_payment_activity ──▶ Payment Service
              (same idempotency key: "wf-pay-<order_id>")
                     │
              Payment Service: UNIQUE(idempotency_key) already exists
@@ -410,18 +443,18 @@ idempotency guards exist, and here is the concrete path through one of them:
 nothing about the wait ever lived in the worker's own memory:
 
 ```
- t0  order-worker-A   transition → confirmed completes ──▶ recorded in Temporal's history
- t1  order-worker-A   parks on wait_condition(restaurant_decision, timeout=120s)
- t2  order-worker-A   ✗ container killed  (crash, or `docker compose stop`)
+ t0  orchestrator-worker-A   transition → confirmed completes ──▶ recorded in Temporal's history
+ t1  orchestrator-worker-A   parks on wait_condition(restaurant_decision, timeout=120s)
+ t2  orchestrator-worker-A   ✗ container killed  (crash, or `docker compose stop`)
               │
               │   the workflow's state lives in Temporal's history, not in
-              │   order-worker-A's process — so nothing here is actually at risk
+              │   orchestrator-worker-A's process — so nothing here is actually at risk
               ▼
- t3  order-worker-B   starts, polls task queue "order-tasks"
- t4  order-worker-B   Temporal replays the history deterministically —
+ t3  orchestrator-worker-B   starts, polls task queue "order-tasks"
+ t4  orchestrator-worker-B   Temporal replays the history deterministically —
                        reconstructs "already confirmed, now waiting on the timer"
- t5  restaurant admin accepts ──signal──▶ order-worker-B resumes run() right here
- t6  order-worker-B   dispatch_rider_activity, ... continues exactly as normal
+ t5  restaurant admin accepts ──signal──▶ orchestrator-worker-B resumes run() right here
+ t6  orchestrator-worker-B   dispatch_rider_activity, ... continues exactly as normal
 ```
 
 **Case B — the worker is killed while an activity call is actually in flight.** The
@@ -429,28 +462,28 @@ side effect may have already landed on the far end; the idempotency guard (§5) 
 re-running it safe rather than a double charge:
 
 ```
- t0  order-worker-A   authorize_payment_activity starts, calls Payment Service
+ t0  orchestrator-worker-A   authorize_payment_activity starts, calls Payment Service
  t1  Payment Service  creates the payment row, authorizes it — SUCCEEDS
- t2  order-worker-A   ✗ killed before it can report the result back to Temporal
+ t2  orchestrator-worker-A   ✗ killed before it can report the result back to Temporal
               │
               ▼
- t3  order-worker-B   Temporal never received a completion → re-executes the SAME activity
- t4  order-worker-B   → Payment Service: authorize, idempotency key "wf-pay-<order_id>"
+ t3  orchestrator-worker-B   Temporal never received a completion → re-executes the SAME activity
+ t4  orchestrator-worker-B   → Payment Service: authorize, idempotency key "wf-pay-<order_id>"
  t5  Payment Service  UNIQUE(idempotency_key) already exists → returns the SAME row
- t6  order-worker-B   sees status="authorized" → proceeds — no double charge
+ t6  orchestrator-worker-B   sees status="authorized" → proceeds — no double charge
 ```
 
 | Scenario | What happens |
 |---|---|
-| **`order-worker` killed while a workflow is mid-run** | Temporal already has the workflow's full event history. Any worker that next polls `order-tasks` replays it deterministically and resumes at the last completed step. Nothing lost, nothing repeated. |
-| **`order-worker` killed while an activity is in flight** | The activity re-executes once a worker resumes (at-least-once) — exactly why every activity in §5 is idempotent |
-| **`order-worker` killed while parked in a `wait_condition`** | No effect — the wait is state inside Temporal's own persistence, not the worker's memory |
-| **`order-worker` receives SIGTERM (`docker compose stop`)** | `worker.py` traps `SIGINT`/`SIGTERM` and stops accepting new work; `graceful_shutdown_timeout=30s` gives in-flight activities time to finish before Temporal cancels them — after which they simply get retried by the next worker |
+| **`orchestrator-worker` killed while a workflow is mid-run** | Temporal already has the workflow's full event history. Any worker that next polls `order-tasks` replays it deterministically and resumes at the last completed step. Nothing lost, nothing repeated. |
+| **`orchestrator-worker` killed while an activity is in flight** | The activity re-executes once a worker resumes (at-least-once) — exactly why every activity in §5 is idempotent |
+| **`orchestrator-worker` killed while parked in a `wait_condition`** | No effect — the wait is state inside Temporal's own persistence, not the worker's memory |
+| **`orchestrator-worker` receives SIGTERM (`docker compose stop`)** | `worker.py` traps `SIGINT`/`SIGTERM` and stops accepting new work; `graceful_shutdown_timeout=30s` gives in-flight activities time to finish before Temporal cancels them — after which they simply get retried by the next worker |
 | **`order-service` down when a signal needs to be delivered** | The Restaurant/Rider Service's `ServiceClient.post` call fails with `503`; the *caller* (an admin's browser, a rider's app) sees the failure and can retry. The saga itself is untouched and still parked on its timer. |
 | **Temporal unreachable when `POST /api/v1/orders` runs** | `_start_saga` catches the exception, logs at `error`, and returns normally — the order is still `201 created`. It sits at `created` until a client retries the same idempotency key, which re-attempts `_start_saga` (`order/main.py:158-205`). |
 
 `scripts/saga-resilience-test.sh` asserts the two properties above directly against a live
-stack: it restarts `order-worker` **twice** mid-saga (once while waiting on the kitchen, once
+stack: it restarts `orchestrator-worker` **twice** mid-saga (once while waiting on the kitchen, once
 mid-delivery) and asserts the order still reaches `delivered` with exactly one trail entry
 per transition — proving the compare-and-set in §5 absorbed the replayed activities without
 duplicating anything.
@@ -502,13 +535,18 @@ had actually been taken. So the timeout is a prompt to **go and look**, not a co
 
  t2   admin: POST /api/v1/orders/<id>/accept
  t3   order-service: UPDATE orders SET kitchen_decision='accepted'   ── COMMITTED
- t4   order-service: handle.signal(...)   ✗ LOST (Temporal unreachable, worker gone, ...)
+ t4   order-service: orchestrator_service.signal_saga_best_effort(...)
+                      ──▶ POST orchestrator-service/sagas/<id>/signals
+                          ──▶ handle.signal(...)   ✗ LOST (Temporal unreachable, orchestrator
+                                                    down, worker gone, ...)
               │
               │   the decision is on record; the workflow has no idea
               ▼
  t5   120s elapses — wait_condition raises asyncio.TimeoutError
  t6   _recover_kitchen_decision() → read_kitchen_decision_activity
-                                     SELECT kitchen_decision FROM orders WHERE id = ...
+                                     GET order-service/orders/<id>/internal   (D36; this
+                                     read `SELECT kitchen_decision FROM orders ...` directly
+                                     before the split)
  t7   the order says 'accepted'  ──▶ resume as if the signal had arrived
                                       (dispatch a rider; NO refund)
 ```

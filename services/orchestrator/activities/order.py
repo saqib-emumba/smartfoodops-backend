@@ -1,11 +1,19 @@
-"""Temporal activities for the order saga.
+"""Temporal activities for the `order` entity's saga.
 
-The non-deterministic half of the workflow: HTTP calls to sibling services, and writes to
-this service's own database. Everything here is a **sync** function, executed by the worker
-on a thread pool, so the saga reaches Postgres through the same `PostgresPool` the request
-handlers use rather than a second async engine alongside it (D21).
+The non-deterministic half of the workflow: HTTP calls to sibling services — every one of
+them, since D36 moved this worker out of the Order Service's image and database. Before
+that, `transition_order_activity` and `read_kitchen_decision_activity` were the two
+exceptions, writing and reading `sfo_order_core` directly through a shared
+`OrderRepository`; now all six activities reach every service they touch, including the
+Order Service itself, over HTTP on the internal key. See
+orchestrator/clients/order/order_service.py for what replaced the direct access.
 
-Two rules decide the shape of every function below.
+This module — like `clients/order/`, `schemas/order.py`, `apis/order.py` and
+`workflows/order.py` — is scoped to the `order` entity specifically, so a future second
+entity this service orchestrates gets its own `activities/<entity>.py` beside this one
+rather than a second class crammed in here.
+
+Two rules decide the shape of every function below, unchanged by the move.
 
 **Every activity is idempotent.** Temporal guarantees at-least-once execution, not
 exactly-once: a worker that dies after calling a service but before recording the result
@@ -29,9 +37,9 @@ from logging import Logger
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from order.clients.payment import SagaPaymentClient
-from order.clients.rider import SagaRiderClient
-from order.repositories.orders import AtCapacity, OrderRepository
+from orchestrator.clients.order.order_service import AtCapacity, OrderGone, OrderServiceClient
+from orchestrator.clients.order.payment import SagaPaymentClient
+from orchestrator.clients.order.rider import SagaRiderClient
 
 
 def payment_key(order_id: str) -> str:
@@ -45,14 +53,18 @@ def payment_key(order_id: str) -> str:
 
 
 class OrderActivities:
-    """Activity implementations, bound to one repository and one set of clients.
+    """Activity implementations, bound to one set of clients.
 
-    A class rather than module functions so the worker can hand in the same repository the
-    request handlers use, and so the HTTP clients are built once at startup instead of per
-    activity execution.
+    A class rather than module functions so the worker can build the clients once at
+    startup instead of per activity execution, and so `activity.defn`'s default name
+    derivation — `ClassName.method_name` never appears; Temporal names an activity by its
+    *method*, and `OrderActivities` supplies the shared state each method needs. Before
+    D36 this took an injected `OrderRepository`; now it takes `OrderServiceClient`, the
+    HTTP client that replaced it — the constructor's shape changed, the six method names
+    Temporal has recorded in every workflow's history did not.
     """
 
-    def __init__(self, *, orders: OrderRepository, logger: Logger):
+    def __init__(self, *, orders: OrderServiceClient, logger: Logger):
         self._orders = orders
         self._logger = logger
         self._payments = SagaPaymentClient(logger)
@@ -62,19 +74,22 @@ class OrderActivities:
 
     @activity.defn
     def transition_order_activity(self, details: dict) -> dict:
-        """Move the order to a new status and append the transition, in one transaction.
+        """Move the order to a new status and append the transition.
 
-        Delegates to `OrderRepository.transition`, which does the compare-and-set and
-        derives `old_status` from the preceding trail entry rather than accepting it from
-        the workflow (D24). A replay changes nothing and writes no duplicate entry.
+        Delegates to `OrderServiceClient.transition`, an HTTP call into the endpoint that
+        does the compare-and-set and derives `old_status` from the preceding trail entry
+        rather than accepting it from the workflow (D24) — the same guarantee
+        `OrderRepository.transition` made when this was a direct database write. A replay
+        changes nothing and writes no duplicate entry.
 
         Returns the resulting status rather than a bare bool so the workflow can tell a
         real transition from a no-op without a second read.
         """
+        order_id = details["order_id"]
         try:
-            order, changed = self._orders.transition(
-                order_id=details["order_id"],
-                new_status=details["status"],
+            return self._orders.transition(
+                order_id,
+                status=details["status"],
                 updated_by=details.get("updated_by", "order-workflow"),
                 event=details.get("event"),
                 metadata=details.get("metadata"),
@@ -85,16 +100,10 @@ class OrderActivities:
             # A full kitchen is the restaurant's answer, not a malfunction. Non-retryable:
             # asking again cannot change a refusal already given, and the saga compensates.
             raise ApplicationError(str(exc), non_retryable=True) from exc
-
-        if order is None:
+        except OrderGone as exc:
             # The order is gone. Nothing a retry can fix, and the saga cannot continue —
             # so fail it outright rather than looping until the retry policy gives up.
-            raise ApplicationError(
-                f"Order {details['order_id']} no longer exists",
-                non_retryable=True,
-            )
-
-        return {"status": order["status"], "changed": changed}
+            raise ApplicationError(str(exc), non_retryable=True) from exc
 
     # --- payment ------------------------------------------------------------------------
 
@@ -148,17 +157,17 @@ class OrderActivities:
         very different reasons — the kitchen ignored the order, or it answered and the signal
         never landed — and refunding the second case is a real customer-visible failure.
 
-        Since D32 this is a local read of `orders.kitchen_decision` rather than an HTTP call
-        into another service, which removes the failure mode the old version had to guess
-        around: "the Restaurant Service is unreachable so we cannot tell" is no longer one of
-        the possible answers.
+        Since D32 this is a read of `orders.kitchen_decision`, and since D36 that read
+        crosses an HTTP boundary it did not used to: the worker no longer shares a database
+        with the Order Service. The internal read endpoint it hits is the same one the
+        request path already relies on for the saga hand-off, so nothing new opened for
+        this — see `orchestrator/clients/order/order_service.py::read`.
         """
         order_id = details["order_id"]
-        order = self._orders.find(order_id)
-        if order is None:
-            raise ApplicationError(
-                f"Order {order_id} no longer exists", non_retryable=True
-            )
+        try:
+            order = self._orders.read(order_id)
+        except OrderGone as exc:
+            raise ApplicationError(str(exc), non_retryable=True) from exc
         decision = order.get("kitchen_decision")
         self._logger.info(
             "Kitchen decision for order %s reads '%s'", order_id, decision

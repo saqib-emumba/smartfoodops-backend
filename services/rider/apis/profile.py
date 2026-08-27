@@ -1,14 +1,14 @@
 """Rider-facing profile routes: enrol, read, move, go on or off shift.
 
-All four address the caller's own row via the token's subject — there is no path that takes
-a rider id from the client (D13).
+The health probe lives in health.py instead. All four routes here address the caller's own
+row via the token's subject — there is no path that takes a rider id from the client (D13).
 """
 
 from fastapi import APIRouter, Depends, status
 
 from common.auth import CurrentUser, require_role
 from common.errors import conflict, not_found
-from common.health import health_payload
+from common.responses import Envelope, ok
 from rider import deps
 from rider.fleet import own_profile
 from rider.schemas.riders import (
@@ -21,43 +21,33 @@ from rider.schemas.riders import (
 router = APIRouter(prefix="/api/v1/riders")
 
 
-@router.get("/health")
-def health():
-    return health_payload(
-        deps.SERVICE_NAME,
-        deps.db,
-        status="Rider Service is operational",
-        user_service_url=deps.user_service.base_url,
-        order_service_url=deps.order_service.base_url,
-    )
-
-
-@router.post("", response_model=RiderResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=Envelope[RiderResponse], status_code=status.HTTP_201_CREATED)
 def register_rider(
     payload: RiderRegisterRequest,
     current_user: CurrentUser = Depends(require_role("rider")),
-) -> RiderResponse:
+) -> Envelope[RiderResponse]:
     """Enrol the calling account into the delivery fleet.
 
     The rider is the token's subject. There is no way to enrol anybody else — `user_id` is
     not a field a client can send (D13).
     """
     deps.user_service.verify_rider(current_user.user_id, current_user.token)
-    return RiderResponse(**deps.riders.register(payload, current_user.user_id))
+    row = deps.riders.register(payload, current_user.user_id)
+    return ok(RiderResponse(**row), message="Rider enrolled", status=201)
 
 
-@router.get("/me", response_model=RiderResponse)
+@router.get("/me", response_model=Envelope[RiderResponse])
 def get_own_profile(
     current_user: CurrentUser = Depends(require_role("rider")),
-) -> RiderResponse:
-    return RiderResponse(**own_profile(deps.riders, current_user))
+) -> Envelope[RiderResponse]:
+    return ok(RiderResponse(**own_profile(deps.riders, current_user)), message="Rider found")
 
 
-@router.patch("/me/location", response_model=RiderResponse)
+@router.patch("/me/location", response_model=Envelope[RiderResponse])
 def update_location(
     payload: RiderLocationRequest,
     current_user: CurrentUser = Depends(require_role("rider")),
-) -> RiderResponse:
+) -> Envelope[RiderResponse]:
     """Report the rider's current position.
 
     Until a rider has reported one they are invisible to dispatch: the partial index that
@@ -71,14 +61,14 @@ def update_location(
         raise not_found(
             "You have no rider profile; register one with POST /api/v1/riders first"
         )
-    return RiderResponse(**updated)
+    return ok(RiderResponse(**updated), message="Location updated")
 
 
-@router.patch("/me/availability", response_model=RiderResponse)
+@router.patch("/me/availability", response_model=Envelope[RiderResponse])
 def set_availability(
     payload: RiderAvailabilityRequest,
     current_user: CurrentUser = Depends(require_role("rider")),
-) -> RiderResponse:
+) -> Envelope[RiderResponse]:
     """Go on or off shift.
 
     Refused while an order is in hand: a rider cannot go off shift holding somebody's
@@ -87,7 +77,7 @@ def set_availability(
     """
     updated = deps.riders.set_availability(current_user.user_id, payload.is_available)
     if updated is not None:
-        return RiderResponse(**updated)
+        return ok(RiderResponse(**updated), message="Availability updated")
 
     # The UPDATE matched no row. Either there is no profile, or there is one mid-delivery.
     # Distinguishing them costs one read and is the difference between "register first"

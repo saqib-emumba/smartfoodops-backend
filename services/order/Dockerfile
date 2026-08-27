@@ -4,8 +4,9 @@ WORKDIR /app
 
 # Pins live in requirements.txt rather than here: the repo had no dependency manifest
 # at all, so nothing could feed a vulnerability scan or answer "what is in this image".
-# (httpx for the request-path lookups and the saga's outbound calls, temporalio because
-#  this image also runs order-worker, PyJWT[crypto] to verify RS256 tokens (never signs).)
+# (httpx for the request-path lookups and the saga hand-off; PyJWT[crypto] to verify RS256
+#  tokens, never to sign them. No temporalio — see requirements.txt; D36 moved the worker,
+#  and this image's Temporal client, to services/orchestrator/.)
 #
 # Requirements are copied before the source so editing a .py file does not invalidate
 # the pip layer. The service file `-r`s the shared chassis list, and the two land in the

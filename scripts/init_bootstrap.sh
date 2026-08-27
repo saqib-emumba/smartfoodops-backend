@@ -627,7 +627,7 @@ services:
       - --db-filename
       - /home/temporal/temporal.db
     ports:
-      - "7233:7233" # gRPC workflow API, used by the order service and its worker
+      - "7233:7233" # gRPC workflow API, used by the orchestrator service and its worker
       - "8233:8233" # Web UI. Deliberately not behind the gateway: it has no auth.
       - "9233:9233" # Prometheus metrics (Week 3)
     volumes:
@@ -657,6 +657,7 @@ services:
       - order-service
       - payment-service
       - rider-service
+      - orchestrator-service
     networks:
       - smartfoodops-network
 
@@ -729,14 +730,14 @@ services:
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
-      # This service starts the saga and relays signals into it. It runs no activities —
-      # that is order-worker's job, below.
-      TEMPORAL_ADDRESS: temporal-server:7233
+      # This service starts the saga and relays signals into it, both as HTTP calls into
+      # the Orchestrator Service (D36) — it holds no Temporal client of its own any more.
+      ORCHESTRATOR_SERVICE_URL: http://orchestrator-service:8007
     depends_on:
       db-order-postgres:
         condition: service_healthy
-      temporal-server:
-        condition: service_healthy
+      orchestrator-service:
+        condition: service_started
     networks:
       - smartfoodops-network
 
@@ -776,32 +777,52 @@ services:
     networks:
       - smartfoodops-network
 
-  # --- 4. TEMPORAL WORKER ---
-  # Executes the workflow and its activities. It shares the Order Service's image because
-  # the order lifecycle is that service's code and its fact; only the command differs.
-  #
-  # It needs every sibling URL that order-service does not, because the activities are what
-  # actually call payments, restaurants and riders — and it needs the order database
-  # directly, since a status transition and its trail entry are one local transaction.
-  order-worker:
+  # --- 4. ORCHESTRATOR (D36) ---
+  # The order saga's Temporal front door and its worker. Split out of the Order Service:
+  # before D36 `order-service` held a Temporal client directly and `order-worker` shared
+  # its image and database. Neither is true any more — this pair owns no database at all,
+  # and reaches every fact it needs, including the order itself, over HTTP on the internal
+  # key. See orchestrator/clients/order.py and order/apis/transitions.py for the boundary
+  # that replaced the direct database access.
+  orchestrator-service:
     build:
       context: ./services
-      dockerfile: order/Dockerfile
-    container_name: sfo-order-worker
+      dockerfile: orchestrator/Dockerfile
+    container_name: sfo-orchestrator-service
     restart: always
-    command: ["python", "-m", "order.worker"]
     environment:
-      <<: [*order-db-env, *jwt-env]
+      <<: *jwt-env
       TEMPORAL_ADDRESS: temporal-server:7233
-      # No RESTAURANT_SERVICE_URL: since D32 the saga never calls that service. The
-      # kitchen's decision is a column in the order database, and the restaurant's capacity
-      # and coordinates ride in the workflow payload, captured once at checkout. Its absence
-      # here is the dependency reduction, made structural rather than merely true in code.
+    depends_on:
+      temporal-server:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # Executes the workflow and its activities. Shares this pair's image, not the Order
+  # Service's — only the command differs between the two.
+  #
+  # It needs every sibling URL the activities actually call, including the Order Service
+  # itself now: `transition_order_activity` and `read_kitchen_decision_activity` used to
+  # write and read `sfo_order_core` directly; both are HTTP calls now, so ORDER_SERVICE_URL
+  # joins PAYMENT_SERVICE_URL and RIDER_SERVICE_URL here for the first time. Still no
+  # RESTAURANT_SERVICE_URL: since D32 the saga never calls that service at all — the
+  # kitchen's decision is a column on `orders`, and the restaurant's capacity and
+  # coordinates ride in the workflow payload, captured once at checkout.
+  orchestrator-worker:
+    build:
+      context: ./services
+      dockerfile: orchestrator/Dockerfile
+    container_name: sfo-orchestrator-worker
+    restart: always
+    command: ["python", "-m", "orchestrator.worker"]
+    environment:
+      <<: *jwt-env
+      TEMPORAL_ADDRESS: temporal-server:7233
+      ORDER_SERVICE_URL: http://order-service:8004
       PAYMENT_SERVICE_URL: http://payment-service:8005
       RIDER_SERVICE_URL: http://rider-service:8006
     depends_on:
-      db-order-postgres:
-        condition: service_healthy
       temporal-server:
         condition: service_healthy
     networks:
@@ -879,14 +900,28 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         }
 
+        # 🎼 Route only the Orchestrator Service's health probe. `location =` is an exact
+        # match, not a prefix — /api/v1/orchestrator/sagas stays unroutable from here on
+        # purpose (D36): the only caller of that surface is the Order Service, over the
+        # internal network, and publishing it through the gateway would add public surface
+        # the split never needed to add.
+        location = /api/v1/orchestrator/health {
+            proxy_pass http://orchestrator-service:8007;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
         # The Temporal Web UI (localhost:8233) is deliberately absent. It is an operator
         # tool with no authentication of its own, so proxying it through the public gateway
         # would publish every workflow's history — including the arguments each was started
         # with. Reach it directly on the host instead.
 
-        # Global health check endpoint
+        # Global health check endpoint. Enveloped the same as every service response
+        # (D35), so a client does not need a special case for the one health probe that
+        # isn't behind a service's own router.
         location /health {
-            return 200 '{"status": "gateway_is_healthy"}';
+            return 200 '{"status": 200, "body": {"service": "api-gateway"}, "message": "gateway is healthy", "errors": null}';
             add_header Content-Type application/json;
         }
     }

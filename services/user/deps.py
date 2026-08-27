@@ -9,8 +9,8 @@ Routers should `from user import deps` and reference `deps.users`, not
 
 from common.bootstrap import bootstrap
 from common.config import DEFAULT_AUTH_REDIS_URL, service_url
+from user.repositories.sessions import RefreshTokenStore
 from user.repositories.users import UserRepository
-from user.tokens import RefreshTokenStore
 
 AUTH_REDIS_URL = service_url("AUTH_REDIS_URL", DEFAULT_AUTH_REDIS_URL)
 

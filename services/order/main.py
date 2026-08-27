@@ -9,52 +9,33 @@ Menu Service's published menu.
 The customer and restaurant an order names live in other services' databases, so they are
 verified over HTTP before the insert — see clients/.
 
-This module is the composition root: it builds the app, composes the two lifespans, and
-mounts the four routers. Singletons live in deps.py, the saga hand-off in saga.py, and the
-routes are grouped by domain area in api/.
+This module is the composition root: it builds the app and mounts the six routers.
+Singletons live in deps.py, the saga hand-off in clients/orchestrator.py, and the routes
+are grouped by domain area in apis/.
+
+One lifespan now, not two (D36): the Temporal client this service used to hold directly —
+alongside `db.lifespan` — moved with the worker to the Orchestrator Service, so there is
+only `PostgresPool`'s left to compose.
 """
 
 from fastapi import FastAPI
 
-from common.health import health_payload
-from common.lifespan import compose_lifespan
+from common.responses import install_error_handlers
 from order import deps
-from order.apis import checkout, kitchen, signals, tracking
+from order.apis import checkout, health, kitchen, signals, tracking, transitions
 
-# FastAPI takes a single lifespan and this service has two dependencies that need one.
-# compose_lifespan enters them in order and exits in reverse, so neither has to know about
-# the other and `PostgresPool` stays reusable by the services that need no orchestrator.
-app = FastAPI(
-    title="SmartFoodOps Order Service",
-    lifespan=compose_lifespan(deps.db.lifespan, deps.temporal.lifespan),
-)
+app = FastAPI(title="SmartFoodOps Order Service", lifespan=deps.db.lifespan)
+install_error_handlers(app)
 
-
-@app.get("/api/v1/orders/health")
-async def health():
-    return health_payload(
-        deps.SERVICE_NAME,
-        deps.db,
-        status="Orders Service operational",
-        # Unlike `database_reachable`, this being false does not mean the service is
-        # degraded for reads: orders can still be placed and fetched. What stops is the
-        # saga advancing them, which a retry repairs once the orchestrator returns.
-        temporal_reachable=await deps.temporal.is_reachable(),
-        temporal_address=deps.temporal.address,
-        user_service_url=deps.user_service.base_url,
-        restaurant_service_url=deps.restaurant_service.base_url,
-        menu_service_url=deps.menu_service.base_url,
-    )
-
-
-# health is declared directly above, before any router is included, because it and
-# checkout.router's GET /{order_id} are both single-segment GET paths under this prefix —
-# Starlette matches by registration order, and a parameterised route registered first would
-# swallow /health and answer 422 trying to parse "health" as a UUID.
+# health first: it and checkout.router's GET /{order_id} are both single-segment GET paths
+# under this prefix, and Starlette matches by registration order — a parameterised route
+# registered first would swallow /health and answer 422 trying to parse "health" as a UUID.
+app.include_router(health.router)
 app.include_router(checkout.router)
 app.include_router(kitchen.router)
 app.include_router(signals.router)
 app.include_router(tracking.router)
+app.include_router(transitions.router)
 
 
 if __name__ == "__main__":

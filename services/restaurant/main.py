@@ -18,11 +18,14 @@ singletons live in deps.py and the routes in apis/ — see deps.py for why that 
 
 from fastapi import FastAPI
 
-from restaurant.apis import restaurants
+from common.responses import install_error_handlers
+from restaurant.apis import health, restaurants
 from restaurant import deps
 
 app = FastAPI(title="SmartFoodOps Restaurant Service", lifespan=deps.db.lifespan)
+install_error_handlers(app)
 
+app.include_router(health.router)
 app.include_router(restaurants.router)
 
 

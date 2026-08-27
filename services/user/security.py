@@ -11,7 +11,7 @@ import bcrypt
 
 from common.auth import generate_refresh_token, issue_access_token
 from common.config import ACCESS_TOKEN_TTL_MINUTES
-from user.schemas.users import TokenResponse
+from user.schemas.sessions import TokenResponse
 
 # One message for every failed login. Saying which half was wrong would turn the login
 # endpoint into a way to test whether an email address has an account here.

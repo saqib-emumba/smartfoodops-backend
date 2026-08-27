@@ -23,13 +23,16 @@ import os
 
 from fastapi import FastAPI
 
+from common.responses import install_error_handlers
 from rider import deps
-from rider.apis import delivery, dispatch, profile
+from rider.apis import delivery, dispatch, health, profile
 
 app = FastAPI(title="SmartFoodOps Rider Service", lifespan=deps.db.lifespan)
+install_error_handlers(app)
 
-# `profile` first because it owns /health, and a literal segment must be registered before
-# any parameterised sibling that could shadow it. Starlette matches in registration order.
+# `health` first: a literal segment must be registered before any parameterised sibling
+# that could shadow it, and Starlette matches in registration order.
+app.include_router(health.router)
 app.include_router(profile.router)
 app.include_router(delivery.router)
 app.include_router(dispatch.router)

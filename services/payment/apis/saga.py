@@ -9,10 +9,10 @@ routes carry no `Depends(require_role(...))` at all — see common/auth.py's `re
 from fastapi import APIRouter, Depends, Response, status
 
 from common.auth import require_internal
-from common.errors import unprocessable
+from common.errors import internal_error, unprocessable
+from common.responses import Envelope, REPLAY_RESPONSE, ok
 from payment import deps
 from payment.amounts import to_cents
-from payment.apis.payments import REPLAY_RESPONSE
 from payment.authorise import authorise
 from payment.schemas.payments import PaymentAuthorizeRequest, PaymentRefundRequest, PaymentResponse
 
@@ -21,13 +21,13 @@ router = APIRouter(prefix="/api/v1/payments", dependencies=[Depends(require_inte
 
 @router.post(
     "/authorize",
-    response_model=PaymentResponse,
+    response_model=Envelope[PaymentResponse],
     status_code=status.HTTP_201_CREATED,
     responses=REPLAY_RESPONSE,
 )
 def authorize_for_saga(
     payload: PaymentAuthorizeRequest, response: Response
-) -> PaymentResponse:
+) -> Envelope[PaymentResponse]:
     """Authorise a payment on behalf of the order saga.
 
     The same steps as `payments.process_payment`, on the internal key instead of a
@@ -59,11 +59,12 @@ def authorize_for_saga(
     )
     if replayed:
         response.status_code = status.HTTP_200_OK
-    return PaymentResponse(**payment)
+        return ok(PaymentResponse(**payment), message="Replayed", status=200)
+    return ok(PaymentResponse(**payment), message="Payment authorised for saga", status=201)
 
 
-@router.post("/refund", response_model=PaymentResponse)
-def refund_for_saga(payload: PaymentRefundRequest) -> PaymentResponse:
+@router.post("/refund", response_model=Envelope[PaymentResponse])
+def refund_for_saga(payload: PaymentRefundRequest) -> Envelope[PaymentResponse]:
     """Release a hold the saga can no longer honour — its compensating action.
 
     Idempotent by status rather than by key, and that distinction matters: Temporal retries
@@ -87,7 +88,7 @@ def refund_for_saga(payload: PaymentRefundRequest) -> PaymentResponse:
         deps.logger.info(
             "Payment for order %s was already refunded", payload.order_id
         )
-        return PaymentResponse(**existing)
+        return ok(PaymentResponse(**existing), message="Already refunded")
 
     refund = deps.gateway.refund(
         order_id=payload.order_id,
@@ -99,11 +100,22 @@ def refund_for_saga(payload: PaymentRefundRequest) -> PaymentResponse:
         # A concurrent refund won the race between the read above and this update. Its
         # result is the correct answer, so return that rather than failing the activity.
         deps.logger.info("Concurrent refund resolved order %s", payload.order_id)
-        return PaymentResponse(**deps.payments.find_by_order(payload.order_id))
+        refunded = deps.payments.find_by_order(payload.order_id)
+        if refunded is None:
+            # No delete path exists on this table, so this means the concurrent writer's
+            # own transaction has not yet become visible to this read — a narrower race
+            # than the one above. Surfaced as a clean 500 rather than a bare TypeError on
+            # `**None`, which is what this route (and the analogous one in kitchen.py)
+            # answered before the envelope pass gave every route a matching exception
+            # handler to fall through to.
+            raise internal_error(
+                f"Refund for order {payload.order_id} settled but could not be re-read"
+            )
+        return ok(PaymentResponse(**refunded), message="Already refunded")
 
     deps.logger.info(
         "Refunded payment for order %s (%s)",
         payload.order_id,
         payload.reason or "no reason given",
     )
-    return PaymentResponse(**refunded)
+    return ok(PaymentResponse(**refunded), message="Refunded")

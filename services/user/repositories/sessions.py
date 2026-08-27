@@ -1,4 +1,7 @@
-"""Refresh-token storage for the User Service.
+"""Refresh-token storage for the User Service — the `session` entity's repository.
+
+Redis-backed rather than SQL-backed, which is why this sat at the service root before the
+layout was made uniform: it is a repository in every sense but the file's old location.
 
 Access tokens are stateless and cannot be withdrawn once signed, so the refresh token is
 what a session actually hangs on: revoke it and the session dies within one access-token

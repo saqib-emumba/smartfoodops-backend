@@ -58,6 +58,8 @@ DEFAULT_MENU_SERVICE_URL = "http://menu-service:8003"
 DEFAULT_ORDER_SERVICE_URL = "http://order-service:8004"
 DEFAULT_PAYMENT_SERVICE_URL = "http://payment-service:8005"
 DEFAULT_RIDER_SERVICE_URL = "http://rider-service:8006"
+# D36: the workflow orchestrator, split out of the Order Service's own image and database.
+DEFAULT_ORCHESTRATOR_SERVICE_URL = "http://orchestrator-service:8007"
 
 # The workflow orchestrator. gRPC, so no scheme.
 DEFAULT_TEMPORAL_ADDRESS = "temporal-server:7233"

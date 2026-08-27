@@ -10,8 +10,13 @@ its audit trail written in the same transaction (D24). The first revision of the
 blueprint began by setting the status to `created` again, recording a `created -> created`
 transition that never happened.
 
-Read alongside activities.py: the division of labour is that activities decide what a
-*service* said, and this file decides what the *saga* does about it.
+Read alongside activities/order.py: the division of labour is that activities decide what
+a *service* said, and this file decides what the *saga* does about it.
+
+Lives at `workflows/order.py`, not a flat `workflows.py`, so a future second entity this
+service orchestrates gets its own `workflows/<entity>.py` beside this one — see
+`workflows/__init__.py` for why that package boundary carries the same sandbox constraint
+this file's own import block does.
 """
 
 import asyncio
@@ -23,18 +28,21 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     # Every service-local import belongs inside this block, and the reason is not
-    # style. Reaching `activities` pulls in `clients` and `repositories`, and through
-    # them `common.auth`, which calls `required("JWT_PUBLIC_KEY_B64")` at import
-    # time. Passed through, the sandbox reuses the already-loaded modules; outside
-    # the block it would re-execute them under restriction and fail the workflow
-    # task — forever, since Temporal retries it. Add imports here, never above.
+    # style. Reaching `activities` pulls in `clients`, and through them `common.auth`,
+    # which calls `required("JWT_PUBLIC_KEY_B64")` at import time. Passed through, the
+    # sandbox reuses the already-loaded modules; outside the block it would re-execute
+    # them under restriction and fail the workflow task — forever, since Temporal
+    # retries it. Add imports here, never above.
     #
-    # (`order` is a real package since the layout change, so these are absolute.
-    # What is *not* safe is putting anything in order/__init__.py, order/activities/
-    # __init__.py, order/repositories/__init__.py or order/clients/__init__.py: all
-    # four are executed by the sandbox before or as part of this block is reached,
-    # and all four stay docstring-only for exactly that reason. See their docstrings.)
-    from order.activities.activities import OrderActivities
+    # (`orchestrator` is a real package, so these are absolute. What is *not* safe is
+    # putting anything in orchestrator/__init__.py, orchestrator/workflows/__init__.py,
+    # orchestrator/activities/__init__.py, orchestrator/clients/__init__.py or
+    # orchestrator/clients/order/__init__.py: all five are executed by the sandbox
+    # before or as part of this block is reached — the last two because entity-scoping
+    # clients/ added a directory to the path `orchestrator.activities.order`'s own
+    # imports resolve through — and all five stay docstring-only for exactly that
+    # reason. See their docstrings.)
+    from orchestrator.activities.order import OrderActivities
     from common.config import (
         DELIVERY_TIMEOUT_SECONDS,
         RESTAURANT_DECISION_TIMEOUT_SECONDS,

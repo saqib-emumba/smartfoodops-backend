@@ -1,42 +1,41 @@
-"""HTTP routes for the `users` resource: the health probe and reading a profile.
+"""HTTP routes for the `users` resource: registration and reading a profile.
 
-Session lifecycle (register, login, refresh, logout) lives in auth.py instead — the two
-files split on what a route answers, not on which repository method it calls: every route
-here and there reads or writes through `deps.users`, but "give me a session" and "read a
-profile" are different questions to a caller.
+The health probe lives in health.py instead — see that module's docstring. Registration
+lives here rather than in sessions.py because it is a `users` write — it inserts a row in
+the table this file's other route reads — even though it also opens the account's first
+session as a side effect (see `issue_session` inside `login`, which `register` does not
+call: a new account signs in separately, matching D13's rule that identity is never assumed
+from a request that just created it).
 """
 
-import os
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 
 from common.auth import CurrentUser, get_current_user, require_self_or_admin
 from common.errors import not_found
-from common.health import health_payload
+from common.responses import Envelope, ok
 from user import deps
-from user.schemas.users import UserResponse
+from user.schemas.users import UserRegisterRequest, UserResponse
+from user.security import hash_password
 
 router = APIRouter(prefix="/api/v1/users")
 
 
-@router.get("/health")
-def health():
-    """Liveness probe that also proves the database round-trips."""
-    return health_payload(
-        deps.SERVICE_NAME,
-        deps.db,
-        status="User Service is up and connected",
-        database_configured=bool(os.getenv("DATABASE_URL")),
-        refresh_store_reachable=deps.refresh_tokens.is_reachable(),
-    )
+@router.post(
+    "/register", response_model=Envelope[UserResponse], status_code=status.HTTP_201_CREATED
+)
+def register_user(payload: UserRegisterRequest) -> Envelope[UserResponse]:
+    """Register a user, mapping the incoming role name to roles.id via a DB lookup."""
+    row = deps.users.register(payload, hash_password(payload.password))
+    return ok(UserResponse(**row), message="User registered", status=201)
 
 
-@router.get("/{user_id}", response_model=UserResponse)
+@router.get("/{user_id}", response_model=Envelope[UserResponse])
 def get_user(
     user_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
-) -> UserResponse:
+) -> Envelope[UserResponse]:
     """Resolve a single profile — the boundary other services read instead of `users`.
 
     Restricted to the subject and admins. Sibling services reach it while forwarding the
@@ -49,4 +48,4 @@ def get_user(
     row = deps.users.find(user_id)
     if row is None:
         raise not_found(f"User {user_id} not found")
-    return UserResponse(**row)
+    return ok(UserResponse(**row), message="User found")

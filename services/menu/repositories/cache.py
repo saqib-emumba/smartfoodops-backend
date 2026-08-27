@@ -1,4 +1,7 @@
-"""Redis cache-aside layer in front of the `menus` table.
+"""Redis cache-aside layer in front of the `menus` table — the `menus` entity's read path.
+
+Sat at the service root before the layout was made uniform; it is a repository in every
+sense but the file's old location, same as the User Service's session store.
 
 A menu is read on every checkout — the Order Service re-prices each cart against it (D06)
 — and written only when a restaurant publishes. That read/write ratio is what makes a

@@ -75,8 +75,15 @@ bad()     {
   printf '  %sFAIL%s  %s\n        %s%s%s\n' "$RED" "$RESET" "$1" "$DIM" "$2" "$RESET"
 }
 
-# Extract a field from the last response body, e.g. jfield "['id']"
+# Extract a field from the last response's envelope body, e.g. jfield "['id']" reads
+# body['id']. Every response is `{status, body, message, errors}` (D35) — jfield always
+# indexes through `body`, since that is where every entity/list/result shape actually lives.
 jfield() {
+  python3 -c "import json,sys; print(json.load(sys.stdin)['body']$1)" <<<"$BODY" 2>/dev/null
+}
+
+# Extract a field from the envelope itself rather than its body — e.g. efield "['message']".
+efield() {
   python3 -c "import json,sys; print(json.load(sys.stdin)$1)" <<<"$BODY" 2>/dev/null
 }
 
@@ -101,6 +108,15 @@ expect() {
   else
     bad "$name" "expected HTTP $want, got $code: ${BODY:0:200}"
   fi
+
+  # D35: every response is enveloped, and the envelope's own `status` must match the HTTP
+  # status line actually returned — the one new failure mode the envelope itself can
+  # introduce (a route passing the wrong `status=` to `ok()`). Skipped when the body isn't
+  # the envelope shape at all, which should not happen post-D35 but is cheap to guard.
+  local env_status
+  env_status=$(efield "['status']")
+  [[ -n "$env_status" ]] && assert "  $name: envelope status matches HTTP status" "$env_status" "$code"
+
   (( VERBOSE )) && printf '        %s%s%s\n' "$DIM" "${BODY:0:400}" "$RESET"
   return 0
 }
@@ -124,7 +140,7 @@ poll_status() {
   local waited=0 got=""
   while (( waited < limit )); do
     got=$(curl -sS -m 10 "$BASE_URL/api/v1/orders/$oid" "$@" 2>/dev/null \
-          | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',{}).get('status',''))" 2>/dev/null)
     [[ "$got" == "$want" ]] && { ok "order reaches '$want' (${waited}s)"; return 0; }
     sleep 2; waited=$((waited + 2))
   done
@@ -140,7 +156,7 @@ poll_field() {
   local waited=0 got=""
   while (( waited < limit )); do
     got=$(curl -sS -m 10 "$BASE_URL/api/v1/orders/$oid" "$@" 2>/dev/null \
-          | python3 -c "import json,sys; print(json.load(sys.stdin)$expr or '')" 2>/dev/null)
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',{})$expr or '')" 2>/dev/null)
     [[ -n "$got" && "$got" != "None" ]] && { POLLED="$got"; return 0; }
     sleep 2; waited=$((waited + 2))
   done
@@ -157,7 +173,7 @@ poll_either() {
   local waited=0 got=""
   while (( waited < limit )); do
     got=$(curl -sS -m 10 "$BASE_URL/api/v1/orders/$oid" "$@" 2>/dev/null \
-          | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('body',{}).get('status',''))" 2>/dev/null)
     if [[ "$got" == "$a" || "$got" == "$b" ]]; then POLLED="$got"; return 0; fi
     sleep 2; waited=$((waited + 2))
   done
@@ -201,8 +217,8 @@ do_login() {
   out=$(curl -sS -m 20 -X POST "$BASE_URL/api/v1/users/login" \
         -H 'Content-Type: application/json' \
         -d "{\"email\":\"$1\",\"password\":\"$2\"}" 2>&1)
-  ACCESS_TOKEN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('access_token',''))" <<<"$out" 2>/dev/null)
-  REFRESH_TOKEN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('refresh_token',''))" <<<"$out" 2>/dev/null)
+  ACCESS_TOKEN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('body',{}).get('access_token',''))" <<<"$out" 2>/dev/null)
+  REFRESH_TOKEN=$(python3 -c "import json,sys; print(json.load(sys.stdin).get('body',{}).get('refresh_token',''))" <<<"$out" 2>/dev/null)
 }
 
 wait_for_stack() {
@@ -212,7 +228,10 @@ wait_for_stack() {
     for p in users restaurants menus orders payments riders; do
       [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/$p/health")" == "200" ]] && up=$((up + 1))
     done
-    if [[ $up -eq 6 ]]; then printf ' ready.\n'; return 0; fi
+    # Orchestrator's path doesn't fit the plural-resource pattern above, so it's checked
+    # on its own — the gateway routes only this one path of it (D36).
+    [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/orchestrator/health")" == "200" ]] && up=$((up + 1))
+    if [[ $up -eq 7 ]]; then printf ' ready.\n'; return 0; fi
     printf '.'; sleep 2
   done
   printf '\n%sServices did not become ready.%s Try: docker compose ps\n' "$RED" "$RESET"
@@ -259,8 +278,11 @@ for p in users restaurants menus orders payments riders; do
   expect "$p health" 200 GET "/api/v1/$p/health"
 done
 # The saga cannot advance an order without the orchestrator, so this is worth asserting
-# rather than discovering later as a timeout in the lifecycle section.
-expect "order service reports Temporal" 200 GET /api/v1/orders/health
+# rather than discovering later as a timeout in the lifecycle section. Since D36 the
+# Order Service holds no Temporal client of its own to ask, so this checks the
+# Orchestrator Service directly — the gateway routes only its health probe, on purpose
+# (api-gateway/nginx.conf), so this is the one orchestrator route reachable from outside.
+expect "orchestrator service reports Temporal" 200 GET /api/v1/orchestrator/health
 assert "  temporal reachable" "$(jfield "['temporal_reachable']")" "True"
 
 # ---------------------------------------------------------- authentication
@@ -306,10 +328,11 @@ assert "  token type is bearer" "$(jfield "['token_type']")" "bearer"
 
 expect "wrong password -> 401" 401 POST /api/v1/users/login \
   "{\"email\":\"$OWNER_EMAIL\",\"password\":\"WrongPassword!\"}"
-WRONG_PASS_MSG=$(jfield "['detail']")
+# The error's wording lives in the envelope's `message`, not `body` — errors carry no body.
+WRONG_PASS_MSG=$(efield "['message']")
 expect "unknown email -> 401" 401 POST /api/v1/users/login \
   "{\"email\":\"nobody_${TAG}@example.com\",\"password\":\"$PASSWORD\"}"
-assert "  same message either way (no user enumeration)" "$(jfield "['detail']")" "$WRONG_PASS_MSG"
+assert "  same message either way (no user enumeration)" "$(efield "['message']")" "$WRONG_PASS_MSG"
 
 do_login "$OWNER_EMAIL" "$PASSWORD"; OWNER_TOKEN="$ACCESS_TOKEN"
 do_login "$CUST_EMAIL" "$PASSWORD";  CUST_TOKEN="$ACCESS_TOKEN"; CUST_REFRESH="$REFRESH_TOKEN"
@@ -458,7 +481,7 @@ expect "the consumed refresh token is dead -> 401" 401 POST /api/v1/users/refres
 expect "the rotated access token works" 200 GET "/api/v1/users/$CUST_ID" "" \
   -H "Authorization: Bearer $ROTATED_ACCESS"
 
-expect "logout" 204 POST /api/v1/users/logout \
+expect "logout" 200 POST /api/v1/users/logout \
   "{\"refresh_token\":\"$ROTATED_REFRESH\"}" -H "Authorization: Bearer $ROTATED_ACCESS"
 expect "refreshing after logout -> 401" 401 POST /api/v1/users/refresh \
   "{\"refresh_token\":\"$ROTATED_REFRESH\"}"
@@ -708,9 +731,9 @@ assert "  the order awaiting a decision is this one" "$(jfield "[0]['id']")" "$O
 # The kitchen projection is narrower than OrderResponse on purpose: moving the queue onto
 # `orders` must not widen what a restaurant can see about a customer's order.
 assert "  the kitchen is not shown what was paid" \
-  "$(python3 -c "import json,sys; print('total_amount' in json.load(sys.stdin)[0])" <<<"$BODY")" "False"
+  "$(python3 -c "import json,sys; print('total_amount' in json.load(sys.stdin)['body'][0])" <<<"$BODY")" "False"
 assert "  nor who ordered it" \
-  "$(python3 -c "import json,sys; print('customer_id' in json.load(sys.stdin)[0])" <<<"$BODY")" "False"
+  "$(python3 -c "import json,sys; print('customer_id' in json.load(sys.stdin)['body'][0])" <<<"$BODY")" "False"
 
 expect "kitchen accepts the order" 200 POST "/api/v1/orders/$ORDER_ID/accept" \
   "" "${OWNER_AUTH[@]}"
@@ -744,11 +767,11 @@ expect "the other rider cannot report this delivery -> 403" 403 \
 expect "a rider cannot go off shift mid-order -> 409" 409 \
   PATCH /api/v1/riders/me/availability '{"is_available":true}' "${CARRIER[@]}"
 
-expect "rider reports the pickup" 204 POST "/api/v1/riders/me/orders/$ORDER_ID/picked-up" \
+expect "rider reports the pickup" 200 POST "/api/v1/riders/me/orders/$ORDER_ID/picked-up" \
   "" "${CARRIER[@]}"
 poll_status "$ORDER_ID" picked_up 40 "${CUST_AUTH[@]}"
 
-expect "rider reports the delivery" 204 POST "/api/v1/riders/me/orders/$ORDER_ID/delivered" \
+expect "rider reports the delivery" 200 POST "/api/v1/riders/me/orders/$ORDER_ID/delivered" \
   "" "${CARRIER[@]}"
 poll_status "$ORDER_ID" delivered 40 "${CUST_AUTH[@]}"
 
@@ -757,7 +780,7 @@ expect "the trail records the full lifecycle" 200 GET "/api/v1/orders/$ORDER_ID/
 LIFECYCLE=$(python3 -c "
 import json,sys
 seen, out = None, []
-for e in json.load(sys.stdin):
+for e in json.load(sys.stdin)['body']:
     if e['status'] != seen: out.append(e['status']); seen = e['status']
 print(','.join(out))" <<<"$BODY" 2>/dev/null)
 assert "  created -> confirmed -> assigned -> picked_up -> delivered" \

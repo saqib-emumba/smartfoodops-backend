@@ -16,11 +16,14 @@ run in authorise.py.
 
 from fastapi import FastAPI
 
-from payment.apis import payments, saga
+from common.responses import install_error_handlers
+from payment.apis import health, payments, saga
 from payment import deps
 
 app = FastAPI(title="SmartFoodOps Payment Service", lifespan=deps.db.lifespan)
+install_error_handlers(app)
 
+app.include_router(health.router)
 app.include_router(payments.router)
 app.include_router(saga.router)
 

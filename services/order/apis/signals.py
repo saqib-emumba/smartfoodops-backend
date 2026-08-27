@@ -1,55 +1,48 @@
-"""Relaying an event from a sibling service into the order's workflow."""
+"""Relaying an event from a sibling service into the order's workflow.
+
+The only route this router carries is internal-key only, so the guard sits on the router
+itself — the same shape as payment/apis/saga.py and rider/apis/dispatch.py, both entirely
+one audience. tracking.py can't do the same: its two routes carry different credentials.
+"""
 
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
-from temporalio.service import RPCError, RPCStatusCode
 
 from common.auth import require_internal
-from common.errors import conflict, not_found
-from common.temporal import workflow_id_for
+from common.responses import Envelope, ok
 from order import deps
-from order.schemas.signals import WorkflowSignalRequest
+from order.schemas.signals import SignalAcceptedResponse, WorkflowSignalRequest
 
-router = APIRouter(prefix="/api/v1/orders")
+router = APIRouter(prefix="/api/v1/orders", dependencies=[Depends(require_internal)])
 
 
 @router.post(
     "/{order_id}/signals",
+    response_model=Envelope[SignalAcceptedResponse],
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_internal)],
 )
-async def signal_workflow(order_id: UUID, payload: WorkflowSignalRequest) -> dict:
+async def signal_workflow(
+    order_id: UUID, payload: WorkflowSignalRequest
+) -> Envelope[SignalAcceptedResponse]:
     """Relay an event from a sibling service into this order's workflow.
 
-    One endpoint rather than one per event, and internal-key only. Two consequences worth
-    stating: a Temporal client exists in exactly two processes in this platform — this
-    service and its worker — and the Restaurant and Rider Services stay unaware that an
-    orchestrator exists at all. They report what they observed to the service that owns the
-    order lifecycle, exactly as they would report any other status transition.
-
-    No handle is stored anywhere. The workflow id is derived from the order id, so finding
-    the running saga is a pure function of the thing the caller already named.
+    One endpoint rather than one per event, and internal-key only. Since D36, no process in
+    this service holds a Temporal client at all — this is now a thin proxy into the
+    Orchestrator Service's own relay, which does the actual lookup and the `404`/`409`
+    mapping (see `order/clients/orchestrator.py::signal` and
+    `orchestrator/apis/sagas.py::signal_saga`). The Restaurant and Rider Services stay
+    unaware any of this exists: they report what they observed to the service that owns the
+    order lifecycle, exactly as they would report any other status transition, and it is
+    this service's job — not theirs — to know who runs the saga.
 
     `202`, not `200`: a signal is delivered to the workflow, not executed by it. By the time
     this returns the saga has been told, not necessarily acted.
     """
-    handle = deps.temporal.client.get_workflow_handle(workflow_id_for(order_id))
-    try:
-        await handle.signal(payload.signal, payload.payload)
-    except RPCError as exc:
-        # NOT_FOUND covers both "no such workflow" and "it already finished", and the two
-        # are worth separating for the caller: a rider marking a cancelled order delivered
-        # is a different problem from an order that never existed.
-        if exc.status is RPCStatusCode.NOT_FOUND:
-            raise not_found(
-                f"Order {order_id} has no running saga to signal; it may have already "
-                "finished or been cancelled"
-            ) from exc
-        deps.logger.error("Could not signal saga for order %s: %s", order_id, exc)
-        raise conflict(
-            f"The saga for order {order_id} would not accept signal '{payload.signal}'"
-        ) from exc
-
+    await deps.orchestrator_service.signal(order_id, payload.signal, payload.payload)
     deps.logger.info("Signalled '%s' to the saga for order %s", payload.signal, order_id)
-    return {"signalled": payload.signal, "order_id": str(order_id)}
+    return ok(
+        SignalAcceptedResponse(signalled=payload.signal, order_id=order_id),
+        message="Signal accepted",
+        status=202,
+    )

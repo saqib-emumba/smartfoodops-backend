@@ -1,9 +1,10 @@
 # SmartFoodOps — Backend (Weeks 1–2)
 
-A containerised, six-service food-ordering backend fronted by an Nginx API gateway, with the
-order lifecycle driven by a durable Temporal workflow. Everything runs locally through Docker
-Compose: six PostgreSQL databases, Redis, the Temporal dev server, the gateway, six FastAPI
-services and one workflow worker.
+A containerised, seven-service food-ordering backend fronted by an Nginx API gateway, with
+the order lifecycle driven by a durable Temporal workflow that runs in its own deployable —
+the Orchestrator Service and its worker (D36), sharing neither image nor database with any
+other service. Everything runs locally through Docker Compose: six PostgreSQL databases,
+Redis, the Temporal dev server, the gateway, seven FastAPI services and one workflow worker.
 
 ---
 
@@ -29,16 +30,24 @@ would need does not exist.
  Postgres  Postgres  PG  Redis       Postgres  Postgres  Postgres
   :5432     :5433  :5436 :6379        :5434     :5435     :5437
                   (menus)(cache)   (+ tracking)         (fleet)
-                                        │
-                          ┌─────────────┴──────────────┐
-                          │   Temporal dev server      │
-                          │   :7233 gRPC  :8233 UI     │
-                          │   :9233 /metrics           │
-                          └─────────────┬──────────────┘
+                                        │▲ HTTP, X-Internal-Key
+                                  HTTP  ││ (start saga / signal saga /
+                                        ▼│  transition / read — D36)
+                          ┌──────────────────────┐
+                          │ orchestrator-service │  :8007 — no database
+                          └─────────┬────────────┘
+                                    │▲ gRPC
+                              gRPC  ││
+                                    ▼│
+                          ┌─────────────────────────┐
+                          │   Temporal dev server    │
+                          │   :7233 gRPC  :8233 UI   │
+                          │   :9233 /metrics         │
+                          └─────────────┬─────────────┘
                                         │ polls "order-tasks"
-                                 ┌──────┴───────┐
-                                 │ order-worker │  ← runs the saga
-                                 └──────────────┘
+                              ┌─────────┴──────────┐
+                              │ orchestrator-worker │  ← runs the saga,
+                              └─────────────────────┘    no database either
 ```
 
 Arrows between services are **HTTP calls, not shared tables**. Each service owns its data:
@@ -48,10 +57,11 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | `user-service` | 8001 | `roles`, `users` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
 | `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
-| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal |
+| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Orchestrator Service (start/signal a saga) |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
 | `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (pickup/delivery signal relay) |
-| `order-worker` | — | nothing | reads/writes `sfo_order_core` | Payment and Rider Services only — the saga does not call the Restaurant Service at all (D32) |
+| `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; the gateway proxies just its `/health` |
+| `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
 
 Rules the code enforces deliberately:
 
@@ -59,13 +69,15 @@ Rules the code enforces deliberately:
 - The Order Service never reads the `menus` table — it calls `GET /api/v1/menus/{id}`.
 - The Payment Service never reads the `orders` table — it calls `GET /api/v1/orders/{id}`.
 - The Rider Service never reads the `users` table — it calls `GET /api/v1/users/{id}`.
-- No service holds credentials for a database it does not own.
+- No service holds credentials for a database it does not own — including the Orchestrator
+  Service and its worker, which hold none for any database (D36).
 - The kitchen's queue is a query over `orders`, not a table of its own. A restaurant
   admin reads and decides it on the Order Service; whether they *own* that restaurant is
   still resolved against the Restaurant Service over HTTP (D32).
-- Only two processes hold a Temporal client: `order-service` (starts sagas, relays signals)
-  and `order-worker` (runs them). Every other service reports what it observed over HTTP and
-  is unaware an orchestrator exists.
+- Only two processes hold a Temporal client: `orchestrator-service` (starts sagas, relays
+  signals) and `orchestrator-worker` (runs them). Every other service — including
+  `order-service` itself, since D36 — reports what it observed over HTTP and is unaware an
+  orchestrator exists.
 
 ### The order saga
 
@@ -187,6 +199,7 @@ MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
 RIDER_SERVICE_URL=http://rider-service:8006
+ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8007
 
 # Workflow orchestrator (gRPC, so no scheme). docker-compose.yml also sets this
 # per-container; it is here for scripts and for a worker run outside Compose.
@@ -252,7 +265,7 @@ in a secrets manager, not in this file.
 ## Quick start
 
 ```bash
-docker compose up --build -d      # build images and start all 16 containers
+docker compose up --build -d      # build images and start all 17 containers
 docker compose ps                 # all should read "Up" / "healthy"
 ```
 
@@ -263,7 +276,7 @@ its own schema — [db/user/init.sql](db/user/init.sql),
 [db/rider/init.sql](db/rider/init.sql) — automatically on the **first** boot of its volume.
 See [Resetting the databases](#resetting-the-databases) if you change one.
 
-Two things to look at once it is up: `docker compose logs order-worker` should show
+Two things to look at once it is up: `docker compose logs orchestrator-worker` should show
 `Worker polling task queue 'order-tasks'`, and the **Temporal Web UI** is at
 <http://localhost:8233>, where every order's workflow history is browsable. The UI is
 deliberately *not* behind the gateway — it has no authentication of its own, so proxying it
@@ -304,12 +317,12 @@ orchestrator returns.
 
 ### Run the test suite
 
-[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all six services through the gateway
+[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all seven services through the gateway
 exactly as a client would — the full checkout chain, the whole order lifecycle, and every
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 174 assertions against http://localhost
+./scripts/smoke-test.sh            # 315 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -692,7 +705,14 @@ services:
   rider-service:
     volumes: ["./services/rider:/app/rider", "./services/common:/app/common"]
     command: ["uvicorn", "rider.main:app", "--host", "0.0.0.0", "--port", "8006", "--reload"]
+  orchestrator-service:
+    volumes: ["./services/orchestrator:/app/orchestrator", "./services/common:/app/common"]
+    command: ["uvicorn", "orchestrator.main:app", "--host", "0.0.0.0", "--port", "8007", "--reload"]
 ```
+
+`orchestrator-worker` is a long-running process rather than a request handler, so `--reload`
+does not apply the same way; restart it by hand (`docker compose restart orchestrator-worker`)
+after editing `workflows/order.py` or `activities/order.py`.
 
 Then `docker compose up -d` — saving a `.py` file restarts that worker in about a second.
 
@@ -868,22 +888,37 @@ smartfoodops-backend/
 │   │   │                      #   refresh store both need
 │   │   ├── repository.py      # Repository base: one()/all()/write_one() over a leased cursor
 │   │   ├── service_client.py  # Inter-service HTTP, failure translation, and ServiceFacade
-│   │   └── temporal.py        # TemporalGateway + workflow_id_for() (Order Service + worker only)
-│   ├── user/                  # main.py, deps.py, apis/{users,auth}.py, security.py,
-│   │                          #   repositories/users.py, schemas/users.py, tokens.py (:8001)
+│   │   └── temporal.py        # TemporalGateway + workflow_id_for() (Orchestrator Service +
+│   │                          #   worker only, since D36 — see below)
+│   ├── user/                  # main.py, deps.py, apis/{users,sessions,health}.py,
+│   │                          #   security.py, repositories/{users,sessions}.py,
+│   │                          #   schemas/{users,sessions}.py                     (:8001)
 │   ├── restaurant/            # + clients/user.py                                (:8002)
-│   ├── menu/                  # + clients/restaurant.py, cache.py                (:8003)
-│   ├── order/                 # + apis/{checkout,kitchen,signals,tracking}.py,
-│   │                          #   clients/{user,restaurant,menu,payment,rider}.py,
-│   │                          #   schemas/{orders,kitchen,signals,tracking}.py,
-│   │                          #   repositories/{orders,tracking,sql}.py, saga.py,
-│   │                          #   activities/activities.py, pricing.py, workflows.py,
-│   │                          #   worker.py                                      (:8004)
+│   ├── menu/                  # + clients/restaurant.py, repositories/cache.py    (:8003)
+│   ├── order/                 # + apis/{checkout,kitchen,signals,tracking,
+│   │                          #   transitions}.py, clients/{user,restaurant,menu,
+│   │                          #   orchestrator}.py, schemas/{orders,kitchen,signals,
+│   │                          #   tracking,transitions}.py,
+│   │                          #   repositories/{orders,tracking,sql}.py, pricing.py
+│   │                          #   No Temporal client and no worker (D36) — see the
+│   │                          #   Orchestrator entry below                        (:8004)
 │   ├── payment/                # + apis/{payments,saga}.py, clients/order.py,
 │   │                            #   authorise.py, gateway.py, amounts.py           (:8005)
-│   └── rider/                  # + apis/{profile,delivery,dispatch}.py,
-│                                #   clients/{user,order}.py, fleet.py, eta.py     (:8006)
-├── scripts/smoke-test.sh      # End-to-end assertions across all six services
+│   ├── rider/                  # + apis/{profile,delivery,dispatch}.py,
+│   │                            #   clients/{user,order}.py, fleet.py, eta.py     (:8006)
+│   └── orchestrator/           # main.py, deps.py, worker.py, apis/{health,order}.py,
+│                                #   schemas/order.py, activities/order.py,
+│                                #   workflows/order.py, clients/order/{order_service,
+│                                #   payment,rider}.py
+│                                #   Split out of the Order Service (D36): its own image,
+│                                #   its own deployable, no database of its own at all —
+│                                #   the API side starts/signals sagas over HTTP, the
+│                                #   worker runs them, and both reach every fact they need,
+│                                #   including the order itself, over HTTP too. Every
+│                                #   subdirectory is entity-scoped (today: `order` only),
+│                                #   so a second workflow this service orchestrates adds
+│                                #   files beside these rather than growing them.  (:8007)
+├── scripts/smoke-test.sh      # End-to-end assertions across all seven services
 ├── readme/                    # Blueprints, contracts, and the decision record
 ├── docker-compose.yml         # Orchestration
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
@@ -899,13 +934,20 @@ worth of content — `restaurant/apis/restaurants.py` is a one-file package, kep
 for the same reason `restaurant/clients/user.py` already was: uniformity across services
 matters more here than the ceremony of an extra folder for one file.
 
-Four `__init__.py` files in `services/order/` carry a warning worth reading before editing
-them — `order/__init__.py`, `order/clients/__init__.py`, `order/repositories/__init__.py`
-and `order/activities/__init__.py`. Temporal's workflow sandbox imports all four while
-resolving `order.activities.activities` from inside `workflows.py`'s
-`imports_passed_through()` block, and a re-export in any of them would put more than the
-saga needs back in the worker's import graph — the request-path clients, `deps.py`, or
-`required("DATABASE_URL")` among them. All four stay docstring-only, forever; see D34.
+Five `__init__.py` files in `services/orchestrator/` carry a warning worth reading before
+editing them — `orchestrator/__init__.py`, `orchestrator/workflows/__init__.py`,
+`orchestrator/activities/__init__.py`, `orchestrator/clients/__init__.py` and
+`orchestrator/clients/order/__init__.py`. Temporal's workflow sandbox imports all five while
+resolving `orchestrator.activities.order` from inside `workflows/order.py`'s
+`imports_passed_through()` block — the last two because entity-scoping `clients/` added a
+directory to that import path — and a re-export in any of them would put more than the
+saga needs back in the worker's import graph — the FastAPI app, `deps.py`, or every sibling
+client instead of the two the worker actually calls, among them. All five stay
+docstring-only, forever; see D34 and D36. Before D36 this constraint lived on
+`services/order/`'s equivalent four files — `repositories/__init__.py` has no counterpart
+here because the orchestrator owns no database at all, and two more were added when
+`activities/`, `clients/`, `schemas/`, `workflows/` and `apis/` were all made entity-scoped
+so a future second workflow gets its own files instead of crowding into `order`'s.
 
 A service's schema lives under `db/<service>/`, not next to its code, because it is consumed
 by that service's *database container* at first boot — the service image never reads it.
@@ -925,12 +967,15 @@ and one file even when there is not:
 | `schemas/` | Pydantic request/response models (the service's public contract) |
 | `pricing.py`, `cache.py`, `amounts.py`, `gateway.py`, `authorise.py`, `fleet.py`, `eta.py`, `security.py` | Service-specific domain or infrastructure detail, extracted only where two or more routes share it |
 
-The Order Service additionally has `saga.py` (handing an order to Temporal and signalling
-it afterward — request-path only) and the Temporal pair `workflows.py` / `worker.py`,
-plus `activities/activities.py` — wrapped in a package purely for naming consistency with
-`apis/`, `clients/`, `repositories/` and `schemas/`, but never split further: Temporal
-records every `@activity.defn` method's name in durable workflow history, so the class
-inside stays exactly as it was before this refactor touched anything else; see D34.
+The Order Service's `clients/orchestrator.py` (handing an order to the saga and signalling
+it afterward, both as HTTP calls — request-path only) replaced its old `saga.py`, which held
+a Temporal client directly. That client, the Temporal pair `workflows/order.py` /
+`worker.py`, and `activities/order.py` all now live in `services/orchestrator/` instead,
+split out as their own deployable (D36) — `activities/order.py` stays one module per entity
+purely for naming consistency with `clients/order/`, never split further within an entity:
+Temporal records every `@activity.defn` method's name in durable workflow history, so
+`OrderActivities` stays exactly as it was before either refactor touched anything else; see
+D34.
 
 `services/common/` is a shared *chassis*, not a shared domain. It holds connection
 pooling, logging, error mapping, HTTP transport, and now a handful of mechanical patterns
@@ -938,7 +983,7 @@ that repeated across every service verbatim (health payloads, the bootstrap sequ
 lifespan composition, the cursor/execute/fetch shape) — the plumbing that would otherwise
 be copy-pasted into every new service. Domain models, business rules, and table knowledge
 stay inside their owning service, so no service can reason about another's data. Because
-all six images need it, the Docker build context is `./services` (not the individual
+all seven images need it, the Docker build context is `./services` (not the individual
 service directory) and each `Dockerfile` copies `common/` alongside its own source.
 
 The trade-off: a change to `common/` requires rebuilding every service. That is acceptable

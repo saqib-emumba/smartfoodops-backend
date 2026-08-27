@@ -1,8 +1,8 @@
-"""HTTP routes for the `menus` resource.
+"""HTTP routes for the `menus` resource: publish and read.
 
-Two routes and a health probe, so one module. The publish path and the read path share
-`_as_response` and nothing else, so it stays here beside both of them rather than moving to
-a file of its own.
+The health probe lives in health.py instead — see that module's docstring. The publish path
+and the read path share `_as_response` and nothing else, so it stays here beside both of them
+rather than moving to a file of its own.
 """
 
 from uuid import UUID
@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from common.auth import CurrentUser, get_current_user, require_role
 from common.errors import forbidden, not_found
-from common.health import health_payload
+from common.responses import Envelope, ok
 from menu import deps
 from menu.schemas.menus import MenuResponse, MenuUpsertRequest
 
@@ -25,22 +25,11 @@ def _as_response(row: dict) -> MenuResponse:
     )
 
 
-@router.get("/health")
-def health():
-    return health_payload(
-        deps.SERVICE_NAME,
-        deps.db,
-        status="Menu Service running with PostgreSQL + Redis cache",
-        cache_reachable=deps.cache.is_reachable(),
-        restaurant_service_url=deps.restaurant_service.base_url,
-    )
-
-
-@router.post("", response_model=MenuResponse)
+@router.post("", response_model=Envelope[MenuResponse])
 async def upsert_menu(
     payload: MenuUpsertRequest,
     current_user: CurrentUser = Depends(require_role("restaurant_admin")),
-) -> MenuResponse:
+) -> Envelope[MenuResponse]:
     """Upsert the full category/item/customization tree for one restaurant.
 
     Holding the `restaurant_admin` role is not enough — the caller must own *this*
@@ -62,14 +51,14 @@ async def upsert_menu(
     # concurrent reader repopulate the cache from the old row and leave the stale copy
     # behind the write that was supposed to replace it.
     deps.cache.invalidate(payload.restaurant_id)
-    return _as_response(row)
+    return ok(_as_response(row), message="Menu published")
 
 
-@router.get("/{restaurant_id}", response_model=MenuResponse)
+@router.get("/{restaurant_id}", response_model=Envelope[MenuResponse])
 def get_menu(
     restaurant_id: UUID,
     _: CurrentUser = Depends(get_current_user),
-) -> MenuResponse:
+) -> Envelope[MenuResponse]:
     """Serve the active menu tree — used by the Order Service to price a checkout.
 
     Cache-aside: Redis, then Postgres, then populate. Every checkout reads this endpoint,
@@ -78,11 +67,15 @@ def get_menu(
 
     Any authenticated caller: customers browse it, and the Order Service reads it while
     forwarding the customer's own token.
+
+    The cache still stores the bare `MenuResponse` JSON, not the envelope — envelope
+    wrapping happens once, here, at the HTTP boundary; the cached shape is this service's
+    own business and unrelated to what a caller sees on the wire.
     """
     cached = deps.cache.get(restaurant_id)
     if cached is not None:
         try:
-            return MenuResponse.model_validate_json(cached)
+            return ok(MenuResponse.model_validate_json(cached), message="Menu found")
         except ValidationError as exc:
             # A payload written by an older build of this service. Treat it as a miss and
             # let the read below overwrite it rather than failing a request over it.
@@ -96,4 +89,4 @@ def get_menu(
 
     menu = _as_response(row)
     deps.cache.store(restaurant_id, menu.model_dump_json())
-    return menu
+    return ok(menu, message="Menu found")

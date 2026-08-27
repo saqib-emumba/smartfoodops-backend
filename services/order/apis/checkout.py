@@ -6,21 +6,26 @@ from fastapi import APIRouter, Depends, Header, Response, status
 
 from common.auth import CurrentUser, get_current_user, require_internal, require_role, require_self_or_admin
 from common.errors import not_found
+from common.responses import Envelope, REPLAY_RESPONSE, ok
 from order import deps
 from order.pricing import build_order_snapshot
-from order.saga import start_saga
 from order.schemas.orders import OrderCreateRequest, OrderResponse
 
 router = APIRouter(prefix="/api/v1/orders")
 
 
-@router.post("", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=Envelope[OrderResponse],
+    status_code=status.HTTP_201_CREATED,
+    responses=REPLAY_RESPONSE,
+)
 async def create_order(
     payload: OrderCreateRequest,
     response: Response,
     x_idempotency_key: str = Header(..., alias="X-Idempotency-Key"),
     current_user: CurrentUser = Depends(require_role("customer")),
-) -> OrderResponse:
+) -> Envelope[OrderResponse]:
     """Create an order idempotently after re-pricing it against the live menu.
 
     The order is placed for the token's subject. There is no way to place one for anybody
@@ -42,13 +47,13 @@ async def create_order(
         # a saga that is already running is left alone, and one that never began now does.
         # The restaurant is re-read because a replay has none in hand — the cost of making
         # this path self-healing, paid only on an actual retry.
-        await start_saga(
+        await deps.orchestrator_service.start_saga(
             existing,
             deps.restaurant_service.verify_restaurant(
                 existing["restaurant_id"], current_user.token
             ),
         )
-        return OrderResponse(**existing)
+        return ok(OrderResponse(**existing), message="Replayed", status=200)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
     menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user.token)
@@ -76,16 +81,16 @@ async def create_order(
     )
 
     # (f) The order exists; the saga runs it from here.
-    await start_saga(order, restaurant)
+    await deps.orchestrator_service.start_saga(order, restaurant)
 
-    return OrderResponse(**order)
+    return ok(OrderResponse(**order), message="Order placed", status=201)
 
 
-@router.get("/{order_id}", response_model=OrderResponse)
+@router.get("/{order_id}", response_model=Envelope[OrderResponse])
 def get_order(
     order_id: UUID,
     current_user: CurrentUser = Depends(get_current_user),
-) -> OrderResponse:
+) -> Envelope[OrderResponse]:
     """Expose an order — including its server-recalculated `total_amount`.
 
     Added for the Payment Service: `payments.order_id` used to be a foreign key into this
@@ -101,15 +106,15 @@ def get_order(
         raise not_found(f"Order {order_id} not found")
 
     require_self_or_admin(current_user, row["customer_id"])
-    return OrderResponse(**row)
+    return ok(OrderResponse(**row), message="Order found")
 
 
 @router.get(
     "/{order_id}/internal",
-    response_model=OrderResponse,
+    response_model=Envelope[OrderResponse],
     dependencies=[Depends(require_internal)],
 )
-def get_order_internally(order_id: UUID) -> OrderResponse:
+def get_order_internally(order_id: UUID) -> Envelope[OrderResponse]:
     """The same order as the endpoint above, for callers with no user behind them.
 
     The Payment Service's saga path needs the authoritative `total_amount` but holds no
@@ -124,4 +129,4 @@ def get_order_internally(order_id: UUID) -> OrderResponse:
     row = deps.orders.find(order_id)
     if row is None:
         raise not_found(f"Order {order_id} not found")
-    return OrderResponse(**row)
+    return ok(OrderResponse(**row), message="Order found")
