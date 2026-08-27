@@ -63,7 +63,7 @@ def _signing_key() -> str:
     return _private_key
 
 
-class Principal(BaseModel):
+class CurrentUser(BaseModel):
     """The verified identity behind a request."""
 
     user_id: UUID
@@ -95,9 +95,9 @@ def issue_access_token(user_id: UUID, role: str) -> str:
 _scheme = HTTPBearer(auto_error=False)
 
 
-def current_principal(
+def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(_scheme),
-) -> Principal:
+) -> CurrentUser:
     """Verify the bearer token and return who is calling. 401 on anything unusable."""
     if credentials is None:
         raise unauthorized("Authorization header with a Bearer token is required")
@@ -118,28 +118,33 @@ def current_principal(
         # logged nowhere and never returned: it would tell an attacker which part to fix.
         raise unauthorized("Access token is invalid") from exc
 
-    return Principal(user_id=UUID(claims["sub"]), role=claims["role"], token=token)
+    return CurrentUser(user_id=UUID(claims["sub"]), role=claims["role"], token=token)
 
 
 def require_role(*allowed: str):
     """Build a dependency admitting only the listed roles.
 
-    Usage: ``principal = Depends(require_role("restaurant_admin"))``. `system_admin` is
+    Usage: ``current_user = Depends(require_role("restaurant_admin"))``. `system_admin` is
     always admitted so an operator is never locked out of an endpoint.
     """
 
-    def dependency(principal: Principal = Depends(current_principal)) -> Principal:
-        if principal.role not in allowed and not principal.is_admin:
+    def dependency(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
+        if current_user.role not in allowed and not current_user.is_admin:
             raise forbidden(
-                f"Role '{principal.role}' may not perform this action "
+                f"Role '{current_user.role}' may not perform this action "
                 f"(requires one of: {', '.join(sorted(allowed))})"
             )
-        return principal
+        return current_user
 
     return dependency
 
 
-def require_self_or_admin(principal: Principal, subject_id: UUID | str) -> None:
+def require_self_or_admin(
+    current_user: CurrentUser,
+    subject_id: UUID | str,
+    *,
+    detail: str = "You may only access your own record",
+) -> None:
     """Guard a resource that only its owner (or an admin) may read.
 
     Called in the handler body rather than as a dependency because it needs the path
@@ -148,9 +153,29 @@ def require_self_or_admin(principal: Principal, subject_id: UUID | str) -> None:
     Compared as strings: psycopg2 hands back UUID columns as plain strings unless
     register_uuid() is called, so a caller passing `row["customer_id"]` and one passing a
     parsed path parameter would otherwise never match each other.
+
+    `detail` exists so ownership rules that are not about *your own record* — owning the
+    restaurant an order was placed with, for instance — can reuse this comparison instead of
+    hand-rolling it and getting the admin bypass wrong.
     """
-    if str(principal.user_id) != str(subject_id) and not principal.is_admin:
-        raise forbidden("You may only access your own record")
+    if str(current_user.user_id) != str(subject_id) and not current_user.is_admin:
+        raise forbidden(detail)
+
+
+def assert_account_role(account: dict, *, required: str, detail: str) -> dict:
+    """Assert a fetched account currently holds a role, independent of its token.
+
+    Three services do this after reading `GET /api/v1/users/{id}`, and the reason is the
+    same in all three: the role claim in a token was true when the token was signed, so an
+    account demoted since then still presents a valid one until it expires (D18).
+
+    The comparison is shared; the route, the role literal and the message are not. Which URL
+    produced this dict and how a rejection is worded belong to the calling service — those
+    messages are distinct response bodies, not boilerplate.
+    """
+    if account.get("role") != required:
+        raise forbidden(detail)
+    return account
 
 
 def require_internal(x_internal_key: str | None = Header(None, alias="X-Internal-Key")):

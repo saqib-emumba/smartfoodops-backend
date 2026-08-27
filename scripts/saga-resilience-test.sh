@@ -34,7 +34,7 @@ note() { printf '  %s%s%s\n' "$DIM" "$1" "$RESET"; }
 ENV_FILE="$(dirname "$0")/../.env"
 INTERNAL_KEY=$(grep -m1 '^INTERNAL_API_KEY=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
 
-for c in sfo-rider-db sfo-order-db sfo-payment-db sfo-order-worker sfo-temporal-server; do
+for c in sfo-rider-db sfo-order-db sfo-payment-db sfo-orchestrator-worker sfo-temporal-server; do
   docker ps --format '{{.Names}}' | grep -q "^$c$" || {
     printf '%sNeeds the local stack running (%s not found).%s Try: docker compose up -d\n' \
       "$RED" "$c" "$RESET"; exit 1; }
@@ -48,7 +48,7 @@ api() { # api <method> <path> <body> [curl args...]
     curl -sS -m 25 -X "$m" "$BASE_URL$p" "$@"
   fi
 }
-jf() { python3 -c "import json,sys; print(json.load(sys.stdin)$1)" 2>/dev/null; }
+jf() { python3 -c "import json,sys; print(json.load(sys.stdin)['body']$1)" 2>/dev/null; }
 
 order_status() {
   api GET "/api/v1/orders/$1" "" -H "X-Internal-Key: $INTERNAL_KEY" 2>/dev/null | jf "['status']"
@@ -183,11 +183,11 @@ STAGE_BEFORE=$(docker exec sfo-temporal-server temporal workflow query \
   | grep -o '"stage":"[^"]*"' | cut -d'"' -f4)
 note "saga stage before restart: ${STAGE_BEFORE:-unknown}"
 
-printf '  %s...restarting sfo-order-worker...%s\n' "$DIM" "$RESET"
-docker restart sfo-order-worker >/dev/null 2>&1
+printf '  %s...restarting sfo-orchestrator-worker...%s\n' "$DIM" "$RESET"
+docker restart sfo-orchestrator-worker >/dev/null 2>&1
 # Wait for it to be polling again before doing anything that needs an activity.
 for _ in $(seq 1 30); do
-  docker logs --tail 20 sfo-order-worker 2>&1 | grep -q "Worker polling" && break
+  docker logs --tail 20 sfo-orchestrator-worker 2>&1 | grep -q "Worker polling" && break
   sleep 2
 done
 ok "worker came back up"
@@ -208,9 +208,9 @@ RID=$(api GET "/api/v1/orders/$DUR/internal" "" -H "X-Internal-Key: $INTERNAL_KE
 printf '  %s...restarting again, mid-delivery...%s\n' "$DIM" "$RESET"
 api POST "/api/v1/riders/me/orders/$DUR/picked-up" "" "${RA[@]}" >/dev/null
 wait_status "$DUR" picked_up 45 >/dev/null
-docker restart sfo-order-worker >/dev/null 2>&1
+docker restart sfo-orchestrator-worker >/dev/null 2>&1
 for _ in $(seq 1 30); do
-  docker logs --tail 20 sfo-order-worker 2>&1 | grep -q "Worker polling" && break
+  docker logs --tail 20 sfo-orchestrator-worker 2>&1 | grep -q "Worker polling" && break
   sleep 2
 done
 api POST "/api/v1/riders/me/orders/$DUR/delivered" "" "${RA[@]}" >/dev/null

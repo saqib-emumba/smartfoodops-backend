@@ -124,7 +124,7 @@ issue_access_token(user_id, role)
    signed RS256 with JWT_PRIVATE_KEY_B64, decoded from base64 on first use
 ```
 
-That is the entire claim set — no email, no name, nothing else. `current_principal`
+That is the entire claim set — no email, no name, nothing else. `get_current_user`
 requires exactly `["sub", "role", "exp", "iss"]` to be present
 (`common/auth.py:98-121`); anything missing, expired, or signed with the wrong key is a
 `401` with no detail beyond "invalid" or "expired" — the specific reason is never returned,
@@ -138,7 +138,7 @@ so an attacker probing a token can't learn which part to fix.
 Authorization: Bearer <token>
         │
         ▼
-current_principal(credentials = Depends(HTTPBearer(auto_error=False)))
+get_current_user(credentials = Depends(HTTPBearer(auto_error=False)))
         │
         ├─ credentials is None ──────────────────▶ 401  "Bearer token is required"
         │
@@ -151,10 +151,10 @@ jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"], issuer=ISSUER,
         │   issuer, malformed, wrong algorithm)      (one message for all of these)
         │
         ▼
-Principal(user_id=sub, role=role, token=<the raw bearer string>)
+CurrentUser(user_id=sub, role=role, token=<the raw bearer string>)
 ```
 
-`Principal.token` is kept specifically so a handler can **forward the caller's own
+`CurrentUser.token` is kept specifically so a handler can **forward the caller's own
 credential** to a sibling service (`common/auth.py::bearer`) — see §5.
 
 `auto_error=False` on `HTTPBearer` is a small but load-bearing choice: FastAPI's own default
@@ -169,7 +169,7 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 `auth.py` exports three guards, and no endpoint reaches for more than one of them at once:
 
 ```
- require_role(*allowed)          — a FastAPI dependency; wraps current_principal;
+ require_role(*allowed)          — a FastAPI dependency; wraps get_current_user;
                                     401 unauthenticated, 403 wrong role.
                                     `system_admin` is ALWAYS admitted, everywhere.
 
@@ -189,15 +189,15 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 
 | Service | Endpoint | Guard |
 |---|---|---|
-| User | `POST /users/logout` | `current_principal` |
-| User | `GET /users/{id}` | `current_principal` + `require_self_or_admin` |
+| User | `POST /users/logout` | `get_current_user` |
+| User | `GET /users/{id}` | `get_current_user` + `require_self_or_admin` |
 | Restaurant | `POST /restaurants/onboard` | `require_role("restaurant_admin")` |
-| Restaurant | `GET /restaurants/{id}` | `current_principal` (any authenticated caller) |
+| Restaurant | `GET /restaurants/{id}` | `get_current_user` (any authenticated caller) |
 | Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service |
 | Menu | `POST /menus` | `require_role("restaurant_admin")` |
-| Menu | `GET /menus/{id}` | `current_principal` (any authenticated caller) |
+| Menu | `GET /menus/{id}` | `get_current_user` (any authenticated caller) |
 | Order | `POST /orders` | `require_role("customer")` |
-| Order | `GET /orders/{id}`, `GET /orders/{id}/logs` | `current_principal` + `require_self_or_admin` on `customer_id` |
+| Order | `GET /orders/{id}`, `GET /orders/{id}/logs` | `get_current_user` + `require_self_or_admin` on `customer_id` |
 | Order | `GET /orders/{id}/internal`, `POST /orders/logs`, `POST /orders/{id}/signals` | `require_internal` |
 | Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service (D32) |
 | Payment | `POST /payments`, `GET /payments/{id}` | `require_role("customer")` (ownership settled by reading the order, §4.2) |
@@ -218,7 +218,7 @@ by forwarding the caller's own token to `GET /api/v1/orders/{id}`, and *that* en
 customer ──Bearer token──▶ Payment Service ──same Bearer token──▶ Order Service
                                                                        │
                                                           require_self_or_admin(
-                                                            principal, order.customer_id)
+                                                            current_user, order.customer_id)
                                                                        │
                                                           403 if it's not their order
 ```
@@ -233,7 +233,7 @@ owns the fact, never re-decided by a caller.
 
 `RestaurantServiceClient.verify_owner` (called from `restaurant/main.py`) and
 `RiderServiceClient` (`rider/main.py`) both re-fetch the account from the User Service and
-check its **current** role — even though `principal.role` already came out of the token.
+check its **current** role — even though `current_user.role` already came out of the token.
 
 ```
  token minted at 09:00, role="restaurant_admin", exp=09:15
@@ -263,7 +263,7 @@ Two distinct mechanisms, never mixed on a single call:
 ```
  ON BEHALF OF A USER                          AS A SIBLING SERVICE
  ────────────────────                         ─────────────────────
- bearer(principal.token)                      internal_headers()
+ bearer(current_user.token)                      internal_headers()
    → {"Authorization": "Bearer <same JWT>"}     → {"X-Internal-Key": <shared secret>}
 
  used for: any lookup the caller could have    used for: writes and reads no end user
@@ -337,10 +337,10 @@ gets a token the old one can no longer redeem.
 POST /api/v1/users/logout  {refresh_token}      Authorization: Bearer <access token>
         │
         ▼
-current_principal(access_token)   → who is asking
+get_current_user(access_token)   → who is asking
         │
         ▼
-RefreshTokenStore.revoke_owned(refresh_token, principal.user_id)
+RefreshTokenStore.revoke_owned(refresh_token, current_user.user_id)
         │  GET refresh:<hash>  →  does the stored value == this user_id?
         │       no  → return False (logged, not raised — logout is still 204)
         │       yes → DELETE refresh:<hash>

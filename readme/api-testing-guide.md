@@ -29,11 +29,14 @@ docker compose up -d
 export BASE=http://localhost
 ```
 
-Two helpers used throughout — `pretty` formats a JSON response, `field` pulls one value out:
+Every response — success or failure — is wrapped the same way:
+`{"status": <int>, "body": <the actual result, or null>, "message": <str>, "errors": <list
+or null>}` (D35). Two helpers used throughout — `pretty` formats a JSON response, `field`
+reaches into the envelope's `body` for one value:
 
 ```bash
 pretty() { python3 -m json.tool; }
-field()  { python3 -c "import json,sys; print(json.load(sys.stdin)$1)"; }
+field()  { python3 -c "import json,sys; print(json.load(sys.stdin)['body']$1)"; }
 ```
 
 Registration enforces unique email **and** phone, so re-running section 1 verbatim returns
@@ -380,7 +383,8 @@ curl -s "$BASE/api/v1/menus/$REST_ID" -H "Authorization: Bearer $CUSTOMER" | pre
 
 | Scenario | Expected |
 |---|---|
-| `restaurant_id` unknown or inactive | `404` |
+| `restaurant_id` unknown | `404` |
+| `restaurant_id` exists but is inactive | `422` |
 | `min_selection` greater than `max_selection` | `422` |
 | `base_price` of 0 or less | `422` |
 | No menu published for that restaurant | `404` |
@@ -645,7 +649,7 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/payments" \
   -H 'Content-Type: application/json' \
   -H "X-Idempotency-Key: $PAY_IDEM" \
   -d "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM\"}"
-# -> 409 {"detail":"Order ... has already been paid for"}
+# -> 409 {"status":409,"body":null,"message":"Order ... has already been paid for","errors":null}
 ```
 
 One payment per order is a unique constraint, not a convention. `X-Idempotency-Key` is still
@@ -1098,16 +1102,15 @@ docker exec sfo-temporal-server temporal workflow show \
 
 | Code | Meaning in this system |
 |---|---|
-| `200` | Read succeeded, or an idempotent replay returned the stored order or payment. Also a *business* answer the saga acts on rather than retries — a full kitchen (`queued: false`) or an empty fleet (`assigned: false`) |
+| `200` | Read succeeded, an idempotent replay returned the stored order or payment, or a route with nothing to return (logout, a rider reporting a pickup or delivery — `body: null`, not `204`, since a `204` cannot carry the envelope; see D35). Also a *business* answer the saga acts on rather than retries — a full kitchen (`queued: false`) or an empty fleet (`assigned: false`) |
 | `201` | Resource created |
 | `202` | A signal was delivered to a running saga — told, not necessarily acted on |
-| `204` | Done, nothing to return: logout, and a rider reporting a pickup or delivery |
 | `400` | Missing required header, or a role name absent from the `roles` table |
 | `401` | No usable identity: no bearer token, or one malformed, expired or badly signed; a failed login; a spent refresh token; an internal endpoint reached without `X-Internal-Key`. Carries `WWW-Authenticate: Bearer` |
 | `403` | Authenticated, but not permitted: the wrong role for the action, or someone else's user, order, payment, restaurant queue or delivery. Also what a downstream refusal becomes when a forwarded token is rejected |
-| `404` | Resource does not exist, a restaurant is inactive, or an order has no running saga to signal |
+| `404` | Resource does not exist, or an order has no running saga to signal |
 | `409` | Unique constraint or state conflict — duplicate email, phone or vehicle number; an idempotency key race; an order that already has a payment (including one the saga paid for); a rider trying to go off shift mid-delivery |
-| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item, payment that does not settle its order, an undefined order status, or an invented signal name |
+| `422` | Well-formed but unsatisfiable: schema violation, pricing mismatch, unavailable item, a restaurant that exists but is inactive, payment that does not settle its order, an undefined order status, or an invented signal name |
 | `500` | This service failed its own job (e.g. connection pool starved) |
 | `502` | A dependency replied with something unusable |
 | `503` | A dependency is unreachable — safe to retry |

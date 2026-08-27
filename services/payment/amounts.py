@@ -11,14 +11,9 @@ Amounts are Decimal everywhere in between, and only become float at the JSON bou
 from decimal import Decimal, InvalidOperation
 
 from common.errors import bad_gateway, unprocessable
+from common.money import to_cents
 
-# Currency resolution used for every rounding step.
-CENTS = Decimal("0.01")
-
-
-def to_cents(amount: float) -> Decimal:
-    """Convert a JSON amount into an exact two-decimal Decimal."""
-    return Decimal(str(amount)).quantize(CENTS)
+__all__ = ["to_cents", "order_total", "assert_settles_order"]
 
 
 def order_total(order: dict) -> Decimal:

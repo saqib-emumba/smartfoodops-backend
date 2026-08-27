@@ -49,6 +49,11 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409) | The saga owns payment authorisation | 2026-08-21 | Accepted |
 | [D31](#d31--a-status-transition-is-a-compare-and-set-and-the-enum-supplies-the-ordering) | A status transition is a compare-and-set | 2026-08-21 | Accepted |
 | [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) | The kitchen queue collapsed into the `orders` table | 2026-08-21 | Accepted |
+| [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass) | The Order Service's kitchen routes now honour the `system_admin` bypass | 2026-08-27 | Accepted |
+| [D34](#d34--each-service-is-a-layered-python-package-not-a-flat-module-list) | Each service is a layered Python package, not a flat module list | 2026-08-27 | Accepted |
+| [D35](#d35--every-response-is-an-envelope-status-body-message-errors) | Every response is an envelope: `{status, body, message, errors}` | 2026-08-27 | Accepted |
+| [D36](#d36--the-order-sagas-workflow-and-worker-split-into-their-own-deployable) | The order saga's workflow and worker split into their own deployable | 2026-08-27 | Accepted |
+| [D37](#d37--the-orchestrator-services-subdirectories-are-entity-scoped) | The Orchestrator Service's subdirectories are entity-scoped | 2026-08-27 | Accepted |
 
 ---
 
@@ -790,6 +795,312 @@ transaction, or two orders can both take the last slot.
 
 ---
 
+### D33 — The Order Service's kitchen routes now honour the `system_admin` bypass
+
+**Decided:** `order/clients/restaurant.py::verify_owner` now takes the caller's
+`CurrentUser` and checks ownership through `common.auth.require_self_or_admin`, the same
+helper every other ownership check in the platform already used. A `system_admin` calling
+`GET /api/v1/orders/kitchen/{restaurant_id}`, `POST /{order_id}/accept` or
+`POST /{order_id}/reject` for a restaurant they do not own now gets `200`/the decision,
+not `403`.
+
+**Instead of:** `verify_owner` comparing `restaurant["owner_id"]` to the caller's
+`user_id` directly and raising `forbidden()` on any mismatch — a hand-rolled comparison
+that never consulted `current_user.is_admin`.
+
+**Why:** the platform's stated rule is that `system_admin` bypasses ownership checks
+*everywhere* (see the Open Questions entry this settles, and D16's "one place" principle).
+That was true of `require_role` and of `require_self_or_admin`'s other callers, and false
+of exactly this one function — which made the two route guards on these endpoints disagree
+with each other: `require_role("restaurant_admin")` admits an admin (D18's bypass), and
+`verify_owner` then refused them behind it. A `system_admin` could pass the gate and be
+turned away by the lock on the other side of it. This was found, not designed: a router
+refactor moved these call sites without changing their behaviour, and reading them next to
+`require_self_or_admin` made the divergence visible.
+
+**Cost, and why it is one worth naming:** this is a privilege *expansion*, not a pure
+refactor. Before this decision, no `system_admin` token could read a foreign restaurant's
+kitchen queue or decide its orders; after, every one can, matching what the role has always
+been able to do on every other ownership-gated endpoint in the platform. It shipped gated
+on new coverage rather than on trust: `scripts/smoke-test.sh` had no `system_admin`
+principal and no second `restaurant_admin` before this decision, so neither the bypass nor
+the ownership check it sits beside was under test. Both were added first — a `system_admin`
+reading a foreign kitchen queue and republishing a foreign menu (`200`), and a second,
+non-owning `restaurant_admin` refused the same two calls (`403`) — and confirmed to fail
+against the old code before the fix landed, and pass after.
+
+---
+
+### D34 — Each service is a layered Python package, every concern its own directory
+
+**Decided:** every service under `services/` is now a real Python package
+(`services/<svc>/__init__.py` exists, and its Dockerfile does
+`COPY <svc>/ /app/<svc>/` + `CMD uvicorn <svc>.main:app`, not the flat `/app/` copy of
+before). Inside, each service follows the same shape: `main.py` is a composition root that
+builds the app and mounts routers; `deps.py` holds the process-lifetime singletons; and
+four concerns are *always* a directory, never a bare `.py` file, regardless of how much
+each one holds — `apis/` (routes, grouped by domain area or by caller audience),
+`repositories/` (database access, one module per table or per shared SQL seam), `clients/`
+(outbound calls, one module per sibling service called) and `schemas/` (request/response
+models, one module per domain area). `restaurant/apis/restaurants.py` is a one-file package
+holding exactly what `restaurant/api.py` held before; the file moved, nothing about it
+changed. The Order Service additionally has `activities/`, wrapping `OrderActivities`
+alone — see the note on it below.
+
+**Instead of:** the flat layout D21 inherited from the Week 1/2 blueprint — one `main.py`
+per service with every route, and every domain-area helper, declared inline on `app`, and
+(for one revision of this decision) a middle state where a concern became a directory only
+once it held three or more files, so `user/api.py` and `restaurant/repository.py` stayed
+bare modules while `order/`'s equivalents were packages. `services/order/main.py` had
+reached 485 lines across four unrelated areas (checkout, kitchen, saga-relay, tracking)
+before either revision.
+
+**Why:** the flat layout was the right shape for a service with three routes and wrong for
+one with ten — that much motivated the first revision. The uniform-directory rule that
+finished it is a readability argument, not a technical one: six services that agree
+`services/<svc>/repositories/` is always where database access lives are six services a new
+contributor can navigate identically, without first checking whether *this* service earned
+a directory or stayed a file. The split by area still earned its keep on its own terms.
+Splitting `order/clients.py` by which sibling each client called has one concrete, verified
+payoff beyond readability: `order/worker.py` imports `order.activities`, which used to
+import the whole of `clients.py` to reach the saga's two clients, pulling
+`MenuServiceClient` and `RestaurantServiceClient` (and their `os.getenv` URL resolution)
+into the worker process, which is never given `MENU_SERVICE_URL` or `RESTAURANT_SERVICE_URL`
+(see D32's dependency-reduction). Splitting `clients.py` into one file per sibling made that
+absence structural rather than merely true in code — confirmed by inspecting `sys.modules`
+inside the running `order-worker` container, which loads `order.clients.payment` and
+`order.clients.rider` and nothing else under `order.clients`, before and after the
+directory-uniformity pass.
+
+**Cost:** more files and more directories to navigate per service — a two-route service
+now has an `apis/` folder holding one file — and four footguns specific to Temporal instead
+of two, mitigated the same way each time: a docstring-only rule held everywhere rather than
+an exception carved out where it happens to matter today. `order/__init__.py`,
+`order/clients/__init__.py`, `order/repositories/__init__.py` and
+`order/activities/__init__.py` are all imported by the workflow sandbox while resolving
+`order.activities.activities` from inside `workflows.py`'s `imports_passed_through()`
+block — the first because importing any submodule imports its parent package first, the
+other three because they sit on the same import path. A re-export in any of them would drag
+something the worker does not need back into the sandbox: `deps.py` and
+`required("DATABASE_URL")` through the first, every client instead of two through the
+second, nothing through the third and fourth today, but the rule is held on all four anyway
+so it never has to be remembered selectively. None has ever held anything but a docstring.
+
+`OrderActivities` was deliberately **not** split along the same lines, and this is the one
+place "every concern is its own directory" does not mean "one file per thing this concern
+does." Temporal records each `@activity.defn` method's name and the `OrderWorkflow` class
+name in durable workflow history; splitting the class into per-domain classes would risk a
+rename during the split, and any workflow started before such a deploy would fail to find
+its registered activity — retried forever, the order stuck. `activities/` holds exactly one
+module, `activities.py`, and that module holds exactly the one class it always did, sectioned
+internally by domain (state, payment, kitchen, fleet). Wrapping it in a directory was for
+naming consistency with `apis/`, `repositories/`, `clients/` and `schemas/` alone — moving
+the module was safe, and splitting the class inside it was never attempted.
+
+---
+
+### D35 — Every response is an envelope: `{status, body, message, errors}`
+
+**Decided:** every route in every service — success or failure — answers
+`{"status": <int>, "body": <the result, or null>, "message": <str>, "errors": <list[str] |
+null>}`. `common/responses.py::ok()` builds the success form; `install_error_handlers()`
+registers three FastAPI exception handlers (`HTTPException`, `RequestValidationError`, and a
+catch-all `Exception`) so every failure path — a deliberate rejection, a validation error, an
+unhandled bug — answers through the same shape. `common/service_client.py::_payload` unwraps
+`body` at the one place every cross-service call passes through, so no client above that
+layer has to know the envelope exists. The gateway's own `/health` literal in
+`api-gateway/nginx.conf` is enveloped too, so there is no second shape anywhere in the
+platform's public surface.
+
+**Instead of:** seven distinct top-level shapes with no shared base — a bare entity object, a
+bare array, a hand-built `dict` with no schema, a bespoke result object, and `None`/`204` —
+and, worse, two *structurally different* `422` bodies depending on which layer rejected the
+request: `common/errors.py::unprocessable()` put a string under `detail`, and FastAPI's own
+`RequestValidationError` handler put a list of objects under the same key. A client could not
+parse a `422` without first guessing which kind it was looking at.
+
+**Why:** three concrete defects, not a taste preference. First, the two-shaped `422` — closed
+by giving `message` a string always and `errors` a list-or-null always, regardless of which
+layer rejected the request. Second, an unhandled exception answered Starlette's default
+plain-text `Internal Server Error` with **no JSON body at all** — a shape no client's
+envelope-parsing code could even attempt to read — which is what the catch-all `Exception`
+handler now prevents; auditing for this surfaced two live `None`-dereference bugs
+(`order/apis/kitchen.py::_decide_kitchen`, `payment/apis/saga.py::refund_for_saga`) that had
+been crashing with a bare `TypeError` instead of answering cleanly, both fixed in the same
+pass. Third, `POST /api/v1/orders` declared `201` in its OpenAPI schema but answered `200` on
+an idempotent replay with no `responses=` entry documenting it — an omission of a pattern
+`payment/apis/payments.py` had already established (`REPLAY_RESPONSE`, now shared from
+`common/responses.py`).
+
+**Cost:** three 204 routes (`POST /users/logout`, `.../riders/me/orders/{id}/picked-up`,
+`.../delivered`) became `200` with `body: null`, since a `204` has no body to carry the
+envelope in. Health payloads dropped their inner free-text `status` field (six different
+sentences, three different spellings, and the one key present on every probe was the one a
+client could not parse) — the sentence now travels as the envelope's `message` instead, so
+it is not lost, only relocated. And one inconsistency was left standing rather than
+"fixed": `X-Idempotency-Key` is required on Order Service writes (missing → `422`) but
+optional-then-checked on Payment Service writes (missing → `400`) — D08 records that
+divergence as a deliberate Week-1 contract, not an oversight, so unifying it here would have
+overridden an accepted decision rather than closed a genuine gap.
+
+A defect found and fixed during the rollout, worth recording because it explains why
+`common/service_client.py::_payload` logs a warning rather than raising when a response has
+no `body` key: the first deploy of this decision enveloped three services
+(restaurant, menu, user) and rebuilt the callers that read them (order, rider) without
+updating `_payload` to unwrap the new shape. Every cross-service read of an enveloped
+account or restaurant — `assert_account_role`, `verify_owner`, `verify_active` — silently
+read the *outer* envelope's non-existent `role`/`owner_id`/`is_active` keys, and a rider
+registering with a genuinely valid, correctly-signed token was refused with "role 'None'".
+Caught by a full smoke run before any commit, not by a review — the fix is the unwrap plus a
+same-service fallback: a 2xx body with no `body` key is treated as unenveloped rather than
+raising, so a stack mid-rollout degrades to "reads the old shape" instead of every
+cross-service call failing at once.
+
+---
+
+### D36 — The order saga's workflow and worker split into their own deployable
+
+**Decided:** `services/orchestrator/` is a new service — its own image, its own two
+containers (`orchestrator-service` for the API side, `orchestrator-worker` for the Temporal
+worker) — holding the workflow (`workflows/order.py`), the activities
+(`activities/order.py`), and the Temporal client the Order Service used to hold directly
+(file paths as entity-scoped by D37, written the same day; the shape at first landing was
+`workflows.py` and `activities/activities.py`, flat). Neither orchestrator
+process has a database of its own. `transition_order_activity` and
+`read_kitchen_decision_activity`, the two activities that used to write and read
+`sfo_order_core` directly through a shared `OrderRepository`, now do both over HTTP: a new
+internal route, `POST /api/v1/orders/{id}/transitions` (`order/apis/transitions.py`), and the
+existing internal read, `GET /api/v1/orders/{id}/internal`. The Order Service's own
+`saga.py` — which held a Temporal client to start workflows and relay signals — became
+`clients/orchestrator.py`, an `HTTPX`-based client like every other sibling call it makes.
+`common/service_client.py` gained `apost`/`passthrough` to support this: an async POST (real
+callers this time, unlike the `apost` a prior revision deleted as dead code) and a mechanism
+for a downstream status code — a full kitchen answering `409` — to cross the HTTP boundary as
+something more specific than the blanket `502` "unexpected response" every other non-2xx
+became.
+
+**Instead of:** `order-worker` sharing the Order Service's image and, through it, its
+database — the shape since D25. The two processes differed only in `command:`, and the
+worker's direct `psycopg2` access to `sfo_order_core` was the one exception to "every
+cross-service fact is reached over HTTP" anywhere in the platform.
+
+**Why:** the review that asked for this named the goal directly — clear service boundaries —
+and the boundary that mattered was the database. `order-worker` reading and writing
+`sfo_order_core` outside any service's own request path was the one place a comment in
+`worker.py` had to explain why an apparent violation of database-per-service was actually
+fine ("this is the Order Service's own code"); after the split, it no longer needs to be
+explained, because it is no longer true. The knock-on effect the audit called out
+independently is now fixed too: `order/saga.py` used to import `order.workflows`, which
+imported `order.activities.activities`, which loaded `order.clients.payment` and `.rider`
+**inside the API process** — with neither `PAYMENT_SERVICE_URL` nor `RIDER_SERVICE_URL` set
+there, silently falling back to the in-network defaults in `common/config.py`. Moving the
+saga hand-off to an HTTP client removes the import edge entirely; `order-service` holds no
+`temporalio` import at all now, confirmed the same way D34's equivalent claim was — reading
+`sys.modules` inside the running container.
+
+**Cost, named rather than hidden:**
+
+* **A two-way HTTP dependency that did not exist before.** `order-service` calls
+  `orchestrator-service` to start and signal a saga; `orchestrator-worker` calls
+  `order-service` to record a transition and read the kitchen's decision. Neither call
+  cycles back to itself and both are the kind of request that can retry, so this is judged
+  acceptable coupling rather than a design smell — but it is coupling a single-image
+  arrangement did not have.
+* **`read_kitchen_decision_activity` reintroduces a failure mode D32 explicitly removed.**
+  D32's dependency-reduction argument was that a *local* read of `orders.kitchen_decision`
+  eliminated "the Order Service is unreachable so we cannot tell" as a possible answer.
+  Reading it over HTTP now brings that failure mode back — mitigated, not eliminated, by the
+  activity's `STATE` retry policy and by the same safe-default bias D32 already chose:
+  a database (now a service) that will not answer is treated as no decision and the order is
+  compensated, because refunding an accepted order is recoverable by a human and leaving a
+  charged customer on a saga that never finishes is not.
+* **`order_tracking_logs.service` needed a second constructor parameter.** The column used
+  to be stamped from a *fixed* value baked into whichever `OrderRepository` instance handled
+  the write (`"order-service"` or `"order-worker"`, chosen at process start). Once the write
+  arrives over HTTP from a process this service does not construct the repository for,
+  `OrderRepository.transition()` takes an optional per-call `service` override — the internal
+  transition request carries `"orchestrator-worker"` explicitly, or the column would
+  silently start recording `"order-service"` for every saga transition, an audit-trail
+  regression no test in either suite would have caught (confirmed: neither script asserts
+  this column).
+* **~6 extra in-network HTTP hops per order** — two to start/signal the saga (down from
+  zero HTTP, previously in-process gRPC calls to a local Temporal client) and one each for
+  the two activities that used to touch Postgres directly. Not measured against a latency
+  budget, because none exists yet for this platform; recorded as a cost to weigh if one is
+  ever set.
+
+**Durable-history safety, unchanged:** the workflow type (`OrderWorkflow`), all six
+`@activity.defn` method names, the task queue (`"order-tasks"`), the workflow-id prefix
+(`"order-"`), the three signal names, and the `stage` query are all identical to before the
+move — only module *paths* changed, verified by running the full saga-resilience suite
+(worker restart mid-saga, twice) against the new topology before this was considered done.
+`OrderActivities` was not split, for the same reason D34 already gave it a package of its
+own rather than one file per activity: a class split risks a rename, and a workflow started
+before such a deploy would fail to find its registered activity, retried forever.
+
+---
+
+### D37 — The Orchestrator Service's subdirectories are entity-scoped
+
+**Decided:** `services/orchestrator/apis/`, `schemas/`, `activities/`, `clients/` and
+`workflows/` all hold one file (or, for `clients/`, one subdirectory) per *entity this
+service orchestrates* — today that is only `order`, so every one of them holds exactly one
+`order.py` (or `order/`). `workflows.py`, previously a flat module at the package root,
+became a package — `workflows/order.py` — for the same reason `activities/activities.py`
+became `activities/order.py`: a name that said "this is the code", not "this is the order
+entity's code". `clients/` went one level deeper than the others, into
+`clients/order/{order_service,payment,rider}.py`, because unlike `apis/`, `schemas/`,
+`activities/` and `workflows/` — each already a single class or a handful of request
+models with no real chance of collision — the three client classes are HTTP facades whose
+every method is shaped around `order_id` specifically (`OrderServiceClient.transition`,
+`SagaPaymentClient.authorize(order_id, amount, ...)`, `SagaRiderClient.dispatch(order_id,
+...)`); a second entity calling the same sibling services would need different methods, not
+a shared client, so entity-scoping here prevents a real collision rather than a
+hypothetical one. `schemas/order.py`'s four models were renamed `OrderSaga*Request`/
+`*Response` (from bare `Saga*`) to match the platform's own convention of naming a class for
+its entity even when the file already does (`OrderCreateRequest` in `order/schemas/orders.py`,
+`RiderRegisterRequest` in `rider/schemas/riders.py`).
+
+**Instead of:** the flat shape D36 shipped hours earlier — `workflows.py`,
+`activities/activities.py`, `clients/{order,payment,rider}.py`, `schemas/sagas.py`,
+`apis/sagas.py` — which was correct for a service with exactly one workflow and would have
+forced an awkward choice the moment a second one arrived: cram a second entity's activities
+into `OrderActivities`'s file, or invent the entity-scoping this decision does anyway, but
+later and around code already depended on elsewhere.
+
+**Why:** raised directly — "so that in future if the orchestrator has to support other
+entities then it can." The Order Service went through the equivalent shape change once
+already (D34: `apis/` and `schemas/` split from a monolithic `main.py` into one file per
+domain area), and the lesson transfers: the right time to draw the boundary is before a
+second occupant needs it, not after, when every existing file's imports have to be
+untangled from the one that used to be alone. Naming every file for its entity rather than
+its role — `order.py` inside `activities/`, not `order_activities.py` inside a flat
+`activities.py` — also matches how `apis/`, `schemas/`, `repositories/` already read
+platform-wide: the directory says what kind of file this is, the filename says which thing
+it's about.
+
+**Cost:** two more docstring-only `__init__.py` files on the Temporal sandbox's import path
+— `workflows/__init__.py` (new, because `workflows.py` becoming a package puts a parent
+package on the path that did not exist before) and `clients/order/__init__.py` (new, because
+entity-scoping `clients/` added a directory `activities/order.py`'s own imports now resolve
+through). Both inherit the exact constraint `orchestrator/__init__.py`,
+`orchestrator/activities/__init__.py` and `orchestrator/clients/__init__.py` already carried
+— see `orchestrator/__init__.py`'s docstring for the full, now five-file list — so this is
+one more instance of an existing rule, not a new kind of risk. Verified the same way every
+sandbox-sensitive change in this codebase has been: draining in-flight workflows first,
+then a full smoke and saga-resilience run against the restructured service before treating
+this as done.
+
+**What this does *not* do:** invent a route, a database, or a shared abstraction for a
+second entity that does not exist yet. `apis/order.py`'s URLs (`/api/v1/orchestrator/sagas`,
+`.../sagas/{id}/signals`) are unchanged — a second entity would need its own prefix, added
+when it exists, not reserved in advance. No `clients/shared/` was created for the case where
+two entities might one day want the *same* payment or rider client: today's three clients
+are order-shaped and duplicating a genuinely reusable client, if one turns out to be needed,
+is a decision for when a second entity's requirements are known, not a guess made now.
+
+---
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -798,8 +1109,10 @@ Not yet decided, and worth settling before the code forces an answer:
   There is no overlap mechanism (`kid` header, multiple accepted public keys) yet.
 - **Where the private key lives outside a laptop.** `.env` is right locally and wrong for
   anything shared; a secrets manager or mounted key file is the Week 3 answer.
-- **Whether `system_admin` should bypass ownership checks.** It currently does, everywhere,
-  via `require_role` and `require_self_or_admin`. Convenient, and unaudited.
+- ~~**Whether `system_admin` should bypass ownership checks.**~~ Settled by
+  [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass): it
+  does, everywhere, via `require_role` and `require_self_or_admin` — the Order Service's
+  kitchen routes were the one exception, and no longer are.
 - ~~**Sweeping payments stranded at `pending`** (D10).~~ Settled by D30: the saga's refund
   endpoint resolves `pending` as well as `authorized`.
 - ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24 for the opening

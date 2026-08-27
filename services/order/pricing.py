@@ -9,10 +9,13 @@ from collections.abc import Iterable
 from decimal import Decimal
 
 from common.errors import unprocessable
-from schemas import OrderCreateRequest, OrderItemSelection
+from common.money import CENTS, to_cents
+from order.schemas.orders import OrderCreateRequest, OrderItemSelection
 
-# Currency resolution used for every rounding step.
-CENTS = Decimal("0.01")
+# CENTS and to_cents come from common.money so this service and the Payment Service round
+# identically. They sit either side of a boundary where a disagreement rejects a *correct*
+# payment: this file computes the total, and payment/amounts.py refuses anything that does
+# not settle it to the cent.
 
 
 def flatten_catalogue(menu: dict) -> dict:
@@ -136,7 +139,7 @@ def build_order_snapshot(
         total += line_total
 
     total = total.quantize(CENTS)
-    claimed = Decimal(str(payload.total_amount)).quantize(CENTS)
+    claimed = to_cents(payload.total_amount)
     if total != claimed:
         raise unprocessable(
             f"total_amount mismatch: client sent {claimed}, server recalculated {total}"

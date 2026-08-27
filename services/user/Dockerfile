@@ -2,21 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install service dependencies (bcrypt for password hashing, email-validator via
-# pydantic[email], PyJWT[crypto] to sign RS256 access tokens, redis for refresh sessions)
-RUN pip install --no-cache-dir \
-    fastapi==0.115.6 \
-    uvicorn==0.34.0 \
-    "pydantic[email]==2.10.4" \
-    psycopg2-binary==2.9.10 \
-    bcrypt==4.2.1 \
-    "PyJWT[crypto]==2.10.1" \
-    redis==5.2.1
+# Pins live in requirements.txt rather than here: the repo had no dependency manifest
+# at all, so nothing could feed a vulnerability scan or answer "what is in this image".
+# (bcrypt for password hashing, email-validator via pydantic[email], PyJWT[crypto] to
+#  sign RS256 access tokens (the only service that signs any), redis for refresh sessions.)
+#
+# Requirements are copied before the source so editing a .py file does not invalidate
+# the pip layer. The service file `-r`s the shared chassis list, and the two land in the
+# same relative positions they occupy in the source tree so that reference resolves.
+COPY common/requirements.txt /app/common/requirements.txt
+COPY user/requirements.txt /app/user/requirements.txt
+RUN pip install --no-cache-dir -r /app/user/requirements.txt
 
-# Build context is ./services so the shared chassis can be copied alongside this service.
+# Build context is ./services so the shared chassis can be copied alongside this
+# service, and the service is copied as a package so its own modules import absolutely.
 COPY common/ /app/common/
-COPY user/ /app/
+COPY user/ /app/user/
 
 EXPOSE 8001
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "user.main:app", "--host", "0.0.0.0", "--port", "8001"]

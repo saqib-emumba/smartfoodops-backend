@@ -1,0 +1,8 @@
+-r ../common/requirements.txt
+
+# bcrypt for password hashing; pydantic[email] adds email-validator on top of the chassis
+# pin; redis for refresh sessions. No httpx: the User Service is the identity provider and
+# calls no sibling.
+bcrypt==4.2.1
+pydantic[email]==2.10.4
+redis==5.2.1

@@ -1,0 +1,4 @@
+-r ../common/requirements.txt
+
+# httpx for order verification against the Order Service.
+httpx==0.28.1
