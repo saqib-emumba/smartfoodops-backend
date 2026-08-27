@@ -1,0 +1,4 @@
+-r ../common/requirements.txt
+
+# httpx for the User Service account check and the Order Service signal relay.
+httpx==0.28.1

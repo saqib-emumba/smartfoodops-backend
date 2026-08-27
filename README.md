@@ -689,6 +689,9 @@ services:
   payment-service:
     volumes: ["./services/payment:/app/payment", "./services/common:/app/common"]
     command: ["uvicorn", "payment.main:app", "--host", "0.0.0.0", "--port", "8005", "--reload"]
+  rider-service:
+    volumes: ["./services/rider:/app/rider", "./services/common:/app/common"]
+    command: ["uvicorn", "rider.main:app", "--host", "0.0.0.0", "--port", "8006", "--reload"]
 ```
 
 Then `docker compose up -d` — saving a `.py` file restarts that worker in about a second.
@@ -713,7 +716,7 @@ Point the URLs at `localhost` and keep the rest of the stack in Compose:
 ```bash
 cd services
 python3 -m venv .venv && source .venv/bin/activate
-pip install fastapi uvicorn "pydantic[email]" psycopg2-binary bcrypt
+pip install -r user/requirements.txt
 
 # No PYTHONPATH juggling: `user` and `common` are both packages in this directory,
 # which is the same shape the image has at /app.
@@ -815,7 +818,7 @@ A schema file runs **only** when its own Postgres volume is empty. After editing
 docker compose down -v && docker compose up --build -d
 ```
 
-This wipes all five Postgres volumes plus Redis. To reset a single database,
+This wipes all six Postgres volumes plus Redis. To reset a single database,
 target its volume — the others keep their data:
 
 ```bash
@@ -828,9 +831,13 @@ There is no migration tooling in Week 1 — schema changes mean a volume reset.
 
 ### Adding a dependency
 
-Dependencies are pinned inline in each service's `Dockerfile` (no `requirements.txt` in
-Week 1). Add the package to that service's `pip install` block and rebuild with
-`--build`. Keep versions pinned so local builds stay reproducible.
+Pins live in `services/<service>/requirements.txt`, which `-r`s the shared chassis list at
+`services/common/requirements.txt`. Add a chassis-wide dependency (one every service needs,
+like `fastapi`) to `common/requirements.txt`; add a service-specific one (like `redis` for
+Menu's cache) to that service's own file. Keep versions pinned so local builds stay
+reproducible, and rebuild with `--build` after editing either file — the Dockerfiles copy
+requirements in before the source, so a dependency change invalidates the pip layer but not
+the whole image.
 
 ---
 
@@ -840,25 +847,43 @@ Week 1). Add the package to that service's `pip install` block and rebuild with
 smartfoodops-backend/
 ├── api-gateway/nginx.conf     # Path-based routing + /health
 ├── db/                        # One schema per physical database, mounted into its container
-│   ├── user/init.sql          # roles (+ seed data), users, riders
+│   ├── user/init.sql          # roles (+ seed data), users
 │   ├── restaurant/init.sql    # restaurants
-│   ├── order/init.sql         # order_status enum, orders
-│   └── payment/init.sql       # payment_status enum, payments
+│   ├── menu/init.sql          # menus (category tree as JSONB)
+│   ├── order/init.sql         # order_status enum, orders, order_tracking_logs
+│   ├── payment/init.sql       # payment_status enum, payments
+│   └── rider/init.sql         # riders
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
+│   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_role, require_self_or_admin
+│   │   ├── bootstrap.py       # ServiceRuntime: logging + a service's own DB pool, in one call
 │   │   ├── config.py          # Env defaults, timeouts, pool bounds
 │   │   ├── errors.py          # HTTPException factories (400/403/404/409/422/500/502/503)
+│   │   ├── health.py          # health_payload(): the {status, service, database_reachable} shape
+│   │   ├── lifespan.py        # compose_lifespan(): chain several ASGI lifespans into one
 │   │   ├── logging_config.py  # Uniform log format
-│   │   ├── postgres.py        # PostgresPool: lifespan, cursor, health probe
-│   │   └── service_client.py  # Inter-service HTTP + failure translation
-│   ├── user/                  # main.py, repository.py, schemas.py, tokens.py (:8001)
-│   ├── restaurant/            # + clients.py (User Service)                   (:8002)
-│   ├── menu/                  # + clients.py, cache.py (Redis cache-aside)    (:8003)
-│   ├── order/                 # + clients.py, pricing.py, workflows.py,       (:8004)
-│   │                          #   activities.py, worker.py (the saga)
-│   ├── payment/               # + clients.py, gateway.py, amounts.py          (:8005)
-│   └── rider/                 # + clients.py (fleet + proximity dispatch)     (:8006)
-├── scripts/smoke-test.sh      # End-to-end assertions across all five services
+│   │   ├── money.py           # Decimal currency resolution shared by Order and Payment
+│   │   ├── postgres.py        # PostgresPool: lifespan, cursor, health probe, constraint_of()
+│   │   ├── redis_store.py     # RedisStore: the connection lifecycle Menu's cache and User's
+│   │   │                      #   refresh store both need
+│   │   ├── repository.py      # Repository base: one()/all()/write_one() over a leased cursor
+│   │   ├── service_client.py  # Inter-service HTTP, failure translation, and ServiceFacade
+│   │   └── temporal.py        # TemporalGateway + workflow_id_for() (Order Service + worker only)
+│   ├── user/                  # main.py, deps.py, apis/{users,auth}.py, security.py,
+│   │                          #   repositories/users.py, schemas/users.py, tokens.py (:8001)
+│   ├── restaurant/            # + clients/user.py                                (:8002)
+│   ├── menu/                  # + clients/restaurant.py, cache.py                (:8003)
+│   ├── order/                 # + apis/{checkout,kitchen,signals,tracking}.py,
+│   │                          #   clients/{user,restaurant,menu,payment,rider}.py,
+│   │                          #   schemas/{orders,kitchen,signals,tracking}.py,
+│   │                          #   repositories/{orders,tracking,sql}.py, saga.py,
+│   │                          #   activities/activities.py, pricing.py, workflows.py,
+│   │                          #   worker.py                                      (:8004)
+│   ├── payment/                # + apis/{payments,saga}.py, clients/order.py,
+│   │                            #   authorise.py, gateway.py, amounts.py           (:8005)
+│   └── rider/                  # + apis/{profile,delivery,dispatch}.py,
+│                                #   clients/{user,order}.py, fleet.py, eta.py     (:8006)
+├── scripts/smoke-test.sh      # End-to-end assertions across all six services
 ├── readme/                    # Blueprints, contracts, and the decision record
 ├── docker-compose.yml         # Orchestration
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
@@ -866,31 +891,54 @@ smartfoodops-backend/
 ```
 
 Each service directory is a Python *package* — it has an `__init__.py`, and its modules
-import each other absolutely (`from order.repository import ...`). The Dockerfile copies it
-to `/app/<service>/` alongside `/app/common/`, so the two are never confusable and no
-top-level dependency can shadow a module named `schemas` or `clients`.
+import each other absolutely (`from order.repositories.orders import ...`). The Dockerfile
+copies it to `/app/<service>/` alongside `/app/common/`, so the two are never confusable and
+no top-level dependency can shadow a module named `schemas` or `clients` (D34). Concerns are
+always a directory, never a bare `.py` file, even where one service has only one module's
+worth of content — `restaurant/apis/restaurants.py` is a one-file package, kept a package
+for the same reason `restaurant/clients/user.py` already was: uniformity across services
+matters more here than the ceremony of an extra folder for one file.
 
-`services/order/__init__.py` carries a warning worth reading before editing it: Temporal's
-workflow sandbox executes that file, so it must stay a docstring.
+Four `__init__.py` files in `services/order/` carry a warning worth reading before editing
+them — `order/__init__.py`, `order/clients/__init__.py`, `order/repositories/__init__.py`
+and `order/activities/__init__.py`. Temporal's workflow sandbox imports all four while
+resolving `order.activities.activities` from inside `workflows.py`'s
+`imports_passed_through()` block, and a re-export in any of them would put more than the
+saga needs back in the worker's import graph — the request-path clients, `deps.py`, or
+`required("DATABASE_URL")` among them. All four stay docstring-only, forever; see D34.
 
 A service's schema lives under `db/<service>/`, not next to its code, because it is consumed
 by that service's *database container* at first boot — the service image never reads it.
 
-Every service follows the same layering, so any one of them can be read the same way:
+Every service follows the same layering, so any one of them can be read the same way — the
+five concerns below are always a directory, holding one file per domain area (or, for
+`clients/`, one file per sibling service called) once there is more than one to separate,
+and one file even when there is not:
 
-| File | Responsibility |
+| Package | Responsibility |
 |---|---|
-| `main.py` | Wiring and route handlers only — no SQL, no HTTP calls |
-| `repository.py` | All database access for the tables this service owns |
-| `clients.py` | Outbound calls to sibling services |
-| `schemas.py` | Pydantic request/response models (the service's public contract) |
-| `pricing.py`, `cache.py`, `amounts.py`, `gateway.py` | Service-specific domain or infrastructure detail |
+| `main.py` | Composition root: builds the app, composes lifespans, mounts routers — no logic |
+| `deps.py` | The process-lifetime singletons (db pool, repositories, clients) |
+| `apis/` | Route handlers, grouped by domain area or by caller audience |
+| `repositories/` | All database access for the tables this service owns |
+| `clients/` | Outbound calls to sibling services — one module per sibling called |
+| `schemas/` | Pydantic request/response models (the service's public contract) |
+| `pricing.py`, `cache.py`, `amounts.py`, `gateway.py`, `authorise.py`, `fleet.py`, `eta.py`, `security.py` | Service-specific domain or infrastructure detail, extracted only where two or more routes share it |
+
+The Order Service additionally has `saga.py` (handing an order to Temporal and signalling
+it afterward — request-path only) and the Temporal pair `workflows.py` / `worker.py`,
+plus `activities/activities.py` — wrapped in a package purely for naming consistency with
+`apis/`, `clients/`, `repositories/` and `schemas/`, but never split further: Temporal
+records every `@activity.defn` method's name in durable workflow history, so the class
+inside stays exactly as it was before this refactor touched anything else; see D34.
 
 `services/common/` is a shared *chassis*, not a shared domain. It holds connection
-pooling, logging, error mapping, and HTTP transport — the plumbing that would otherwise be
-copy-pasted into every new service. Domain models, business rules, and table knowledge
+pooling, logging, error mapping, HTTP transport, and now a handful of mechanical patterns
+that repeated across every service verbatim (health payloads, the bootstrap sequence,
+lifespan composition, the cursor/execute/fetch shape) — the plumbing that would otherwise
+be copy-pasted into every new service. Domain models, business rules, and table knowledge
 stay inside their owning service, so no service can reason about another's data. Because
-all five images need it, the Docker build context is `./services` (not the individual
+all six images need it, the Docker build context is `./services` (not the individual
 service directory) and each `Dockerfile` copies `common/` alongside its own source.
 
 The trade-off: a change to `common/` requires rebuilding every service. That is acceptable

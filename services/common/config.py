@@ -27,6 +27,15 @@ def required(name: str) -> str:
     return value
 
 
+def service_url(env_var: str, default: str) -> str:
+    """A sibling's base URL: the override if set, otherwise the in-network default.
+
+    Every clients.py opened with this same `os.getenv(name, DEFAULT_X_SERVICE_URL)` line.
+    Unlike `required()`, a missing value is fine — the defaults below are credential-free.
+    """
+    return os.getenv(env_var, default)
+
+
 # Credential-free datastore endpoints (mirrored by docker-compose.yml).
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
 

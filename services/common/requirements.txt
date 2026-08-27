@@ -1,0 +1,19 @@
+# The shared chassis: what every SmartFoodOps service needs to start and serve.
+#
+# Referenced by each service's own requirements.txt via `-r ../common/requirements.txt`,
+# which resolves relative to that file. The Docker build context is ./services, so both
+# files are reachable from every service's Dockerfile.
+#
+# Deliberately NOT here:
+#   httpx       — only services that call a sibling import common.service_client, and the
+#                 User Service calls nobody. Listed by the five that do.
+#   temporalio  — only common.temporal needs it, and only the Order Service imports that.
+#
+# Anything added here is added to all six images, so a dependency belongs here only when
+# a module in common/ imports it unconditionally.
+
+fastapi==0.115.6
+uvicorn==0.34.0
+pydantic==2.10.4
+psycopg2-binary==2.9.10
+PyJWT[crypto]==2.10.1

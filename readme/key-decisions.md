@@ -49,6 +49,8 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409) | The saga owns payment authorisation | 2026-08-21 | Accepted |
 | [D31](#d31--a-status-transition-is-a-compare-and-set-and-the-enum-supplies-the-ordering) | A status transition is a compare-and-set | 2026-08-21 | Accepted |
 | [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) | The kitchen queue collapsed into the `orders` table | 2026-08-21 | Accepted |
+| [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass) | The Order Service's kitchen routes now honour the `system_admin` bypass | 2026-08-27 | Accepted |
+| [D34](#d34--each-service-is-a-layered-python-package-not-a-flat-module-list) | Each service is a layered Python package, not a flat module list | 2026-08-27 | Accepted |
 
 ---
 
@@ -790,6 +792,110 @@ transaction, or two orders can both take the last slot.
 
 ---
 
+### D33 — The Order Service's kitchen routes now honour the `system_admin` bypass
+
+**Decided:** `order/clients/restaurant.py::verify_owner` now takes the caller's
+`CurrentUser` and checks ownership through `common.auth.require_self_or_admin`, the same
+helper every other ownership check in the platform already used. A `system_admin` calling
+`GET /api/v1/orders/kitchen/{restaurant_id}`, `POST /{order_id}/accept` or
+`POST /{order_id}/reject` for a restaurant they do not own now gets `200`/the decision,
+not `403`.
+
+**Instead of:** `verify_owner` comparing `restaurant["owner_id"]` to the caller's
+`user_id` directly and raising `forbidden()` on any mismatch — a hand-rolled comparison
+that never consulted `current_user.is_admin`.
+
+**Why:** the platform's stated rule is that `system_admin` bypasses ownership checks
+*everywhere* (see the Open Questions entry this settles, and D16's "one place" principle).
+That was true of `require_role` and of `require_self_or_admin`'s other callers, and false
+of exactly this one function — which made the two route guards on these endpoints disagree
+with each other: `require_role("restaurant_admin")` admits an admin (D18's bypass), and
+`verify_owner` then refused them behind it. A `system_admin` could pass the gate and be
+turned away by the lock on the other side of it. This was found, not designed: a router
+refactor moved these call sites without changing their behaviour, and reading them next to
+`require_self_or_admin` made the divergence visible.
+
+**Cost, and why it is one worth naming:** this is a privilege *expansion*, not a pure
+refactor. Before this decision, no `system_admin` token could read a foreign restaurant's
+kitchen queue or decide its orders; after, every one can, matching what the role has always
+been able to do on every other ownership-gated endpoint in the platform. It shipped gated
+on new coverage rather than on trust: `scripts/smoke-test.sh` had no `system_admin`
+principal and no second `restaurant_admin` before this decision, so neither the bypass nor
+the ownership check it sits beside was under test. Both were added first — a `system_admin`
+reading a foreign kitchen queue and republishing a foreign menu (`200`), and a second,
+non-owning `restaurant_admin` refused the same two calls (`403`) — and confirmed to fail
+against the old code before the fix landed, and pass after.
+
+---
+
+### D34 — Each service is a layered Python package, every concern its own directory
+
+**Decided:** every service under `services/` is now a real Python package
+(`services/<svc>/__init__.py` exists, and its Dockerfile does
+`COPY <svc>/ /app/<svc>/` + `CMD uvicorn <svc>.main:app`, not the flat `/app/` copy of
+before). Inside, each service follows the same shape: `main.py` is a composition root that
+builds the app and mounts routers; `deps.py` holds the process-lifetime singletons; and
+four concerns are *always* a directory, never a bare `.py` file, regardless of how much
+each one holds — `apis/` (routes, grouped by domain area or by caller audience),
+`repositories/` (database access, one module per table or per shared SQL seam), `clients/`
+(outbound calls, one module per sibling service called) and `schemas/` (request/response
+models, one module per domain area). `restaurant/apis/restaurants.py` is a one-file package
+holding exactly what `restaurant/api.py` held before; the file moved, nothing about it
+changed. The Order Service additionally has `activities/`, wrapping `OrderActivities`
+alone — see the note on it below.
+
+**Instead of:** the flat layout D21 inherited from the Week 1/2 blueprint — one `main.py`
+per service with every route, and every domain-area helper, declared inline on `app`, and
+(for one revision of this decision) a middle state where a concern became a directory only
+once it held three or more files, so `user/api.py` and `restaurant/repository.py` stayed
+bare modules while `order/`'s equivalents were packages. `services/order/main.py` had
+reached 485 lines across four unrelated areas (checkout, kitchen, saga-relay, tracking)
+before either revision.
+
+**Why:** the flat layout was the right shape for a service with three routes and wrong for
+one with ten — that much motivated the first revision. The uniform-directory rule that
+finished it is a readability argument, not a technical one: six services that agree
+`services/<svc>/repositories/` is always where database access lives are six services a new
+contributor can navigate identically, without first checking whether *this* service earned
+a directory or stayed a file. The split by area still earned its keep on its own terms.
+Splitting `order/clients.py` by which sibling each client called has one concrete, verified
+payoff beyond readability: `order/worker.py` imports `order.activities`, which used to
+import the whole of `clients.py` to reach the saga's two clients, pulling
+`MenuServiceClient` and `RestaurantServiceClient` (and their `os.getenv` URL resolution)
+into the worker process, which is never given `MENU_SERVICE_URL` or `RESTAURANT_SERVICE_URL`
+(see D32's dependency-reduction). Splitting `clients.py` into one file per sibling made that
+absence structural rather than merely true in code — confirmed by inspecting `sys.modules`
+inside the running `order-worker` container, which loads `order.clients.payment` and
+`order.clients.rider` and nothing else under `order.clients`, before and after the
+directory-uniformity pass.
+
+**Cost:** more files and more directories to navigate per service — a two-route service
+now has an `apis/` folder holding one file — and four footguns specific to Temporal instead
+of two, mitigated the same way each time: a docstring-only rule held everywhere rather than
+an exception carved out where it happens to matter today. `order/__init__.py`,
+`order/clients/__init__.py`, `order/repositories/__init__.py` and
+`order/activities/__init__.py` are all imported by the workflow sandbox while resolving
+`order.activities.activities` from inside `workflows.py`'s `imports_passed_through()`
+block — the first because importing any submodule imports its parent package first, the
+other three because they sit on the same import path. A re-export in any of them would drag
+something the worker does not need back into the sandbox: `deps.py` and
+`required("DATABASE_URL")` through the first, every client instead of two through the
+second, nothing through the third and fourth today, but the rule is held on all four anyway
+so it never has to be remembered selectively. None has ever held anything but a docstring.
+
+`OrderActivities` was deliberately **not** split along the same lines, and this is the one
+place "every concern is its own directory" does not mean "one file per thing this concern
+does." Temporal records each `@activity.defn` method's name and the `OrderWorkflow` class
+name in durable workflow history; splitting the class into per-domain classes would risk a
+rename during the split, and any workflow started before such a deploy would fail to find
+its registered activity — retried forever, the order stuck. `activities/` holds exactly one
+module, `activities.py`, and that module holds exactly the one class it always did, sectioned
+internally by domain (state, payment, kitchen, fleet). Wrapping it in a directory was for
+naming consistency with `apis/`, `repositories/`, `clients/` and `schemas/` alone — moving
+the module was safe, and splitting the class inside it was never attempted.
+
+---
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -798,8 +904,10 @@ Not yet decided, and worth settling before the code forces an answer:
   There is no overlap mechanism (`kid` header, multiple accepted public keys) yet.
 - **Where the private key lives outside a laptop.** `.env` is right locally and wrong for
   anything shared; a secrets manager or mounted key file is the Week 3 answer.
-- **Whether `system_admin` should bypass ownership checks.** It currently does, everywhere,
-  via `require_role` and `require_self_or_admin`. Convenient, and unaudited.
+- ~~**Whether `system_admin` should bypass ownership checks.**~~ Settled by
+  [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass): it
+  does, everywhere, via `require_role` and `require_self_or_admin` — the Order Service's
+  kitchen routes were the one exception, and no longer are.
 - ~~**Sweeping payments stranded at `pending`** (D10).~~ Settled by D30: the saga's refund
   endpoint resolves `pending` as well as `authorized`.
 - ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24 for the opening

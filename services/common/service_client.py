@@ -15,12 +15,12 @@ the same regardless of which service is calling.
 """
 
 from logging import Logger
-from typing import Callable
+from typing import Callable, ClassVar
 
 import httpx
 from fastapi import HTTPException, status
 
-from common.config import HTTP_TIMEOUT
+from common.config import HTTP_TIMEOUT, service_url
 from common.errors import bad_gateway, forbidden, not_found, service_unavailable
 
 # Builds the exception raised when the downstream answers 404. Callers that reference an
@@ -184,27 +184,34 @@ class ServiceClient:
             bad_gateway_hint=bad_gateway_hint,
         )
 
-    async def apost(
-        self,
-        path: str,
-        *,
-        json: dict,
-        missing: str,
-        unreachable_hint: str,
-        bad_gateway_hint: str | None = None,
-        missing_error: MissingError = not_found,
-        headers: dict | None = None,
-    ) -> dict:
-        """Async counterpart to :meth:`post`, for services with async route handlers."""
-        url = self._url(path)
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(url, json=json, headers=headers)
-        except httpx.RequestError as exc:
-            raise self._unreachable(url, exc, unreachable_hint) from exc
-        return self._payload(
-            response,
-            missing=missing,
-            missing_error=missing_error,
-            bad_gateway_hint=bad_gateway_hint,
+
+class ServiceFacade:
+    """Base for a service's view of one sibling: a named client at a configurable URL.
+
+    Eight client classes across five services opened with the same three things — a
+    module-level `os.getenv("X_SERVICE_URL", DEFAULT_X_SERVICE_URL)`, an `__init__` building
+    one `ServiceClient`, and a `base_url` property for the health endpoint. Subclasses
+    declare *which* sibling and add the calls they make.
+
+    No route, message, or credential choice lives here. Which paths a sibling exposes and
+    how a 404 against it should be worded belong to the service doing the calling — see
+    `common/__init__.py` on why that line is where it is.
+    """
+
+    display_name: ClassVar[str]
+    env_var: ClassVar[str]
+    default_url: ClassVar[str]
+    timeout: ClassVar[float] = HTTP_TIMEOUT
+
+    def __init__(self, logger: Logger):
+        self._client = ServiceClient(
+            self.display_name,
+            service_url(self.env_var, self.default_url),
+            logger=logger,
+            timeout=self.timeout,
         )
+
+    @property
+    def base_url(self) -> str:
+        """The resolved base URL, surfaced by every service's health endpoint."""
+        return self._client.base_url

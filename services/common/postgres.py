@@ -19,6 +19,15 @@ from common.errors import internal_error
 DEFAULT_EXHAUSTED_DETAIL = "Database connection pool exhausted"
 
 
+def constraint_of(exc) -> str:
+    """The unique constraint a UniqueViolation names, or '' when the driver reported none.
+
+    Only the accessor is shared. Which constraint maps to which 409 message stays in the
+    repository that owns the table — those messages are the content, not boilerplate.
+    """
+    return getattr(exc.diag, "constraint_name", None) or ""
+
+
 class PostgresPool:
     """A bounded connection pool bound to one service's FastAPI lifespan."""
 

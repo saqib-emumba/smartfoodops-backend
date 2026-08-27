@@ -1,7 +1,7 @@
 """SmartFoodOps Order Service — checkout and the order saga (Port 8004).
 
 A package rather than loose modules so its own modules import absolutely
-(`from order.repository import ...`) and cannot be shadowed by a top-level
+(`from order.repositories.orders import ...`) and cannot be shadowed by a top-level
 dependency of the same name. The Dockerfile copies it to /app/order/.
 
 KEEP THIS FILE A DOCSTRING. Do not add imports or re-exports.

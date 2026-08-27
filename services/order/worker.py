@@ -21,30 +21,27 @@ from datetime import timedelta
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from order.activities import OrderActivities
+from common.bootstrap import bootstrap
 from common.config import (
     DEFAULT_TEMPORAL_ADDRESS,
     ORDER_TASK_QUEUE,
     POOL_MAX_CONNECTIONS,
-    required,
 )
-from common.logging_config import configure_logging
-from common.postgres import PostgresPool
-from order.repository import OrderRepository
+from order.activities.activities import OrderActivities
+from order.repositories.orders import OrderRepository
 from order.workflows import OrderWorkflow
 
 SERVICE_NAME = "order-worker"
 
 
 async def main() -> None:
-    logger = configure_logging(SERVICE_NAME)
     address = os.getenv("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
 
-    db = PostgresPool(
-        required("DATABASE_URL"),
-        logger=logger,
+    runtime = bootstrap(
+        SERVICE_NAME,
         exhausted_detail="Database connection pool exhausted; saga step deferred",
     )
+    logger, db = runtime.logger, runtime.db
 
     # PostgresPool.lifespan is an async context manager written for FastAPI, and reusing it
     # here rather than opening the pool by hand is the point: the worker gets the same

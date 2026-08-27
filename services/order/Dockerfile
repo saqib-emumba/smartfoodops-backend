@@ -2,17 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install service dependencies (httpx for Menu Service menu lookups and saga activities,
-# PyJWT[crypto] to verify RS256 access tokens — this service never signs any, and
-# temporalio for the order saga: this image also runs order-worker, which executes it)
-RUN pip install --no-cache-dir \
-    fastapi==0.115.6 \
-    uvicorn==0.34.0 \
-    pydantic==2.10.4 \
-    psycopg2-binary==2.9.10 \
-    httpx==0.28.1 \
-    temporalio==1.31.0 \
-    "PyJWT[crypto]==2.10.1"
+# Pins live in requirements.txt rather than here: the repo had no dependency manifest
+# at all, so nothing could feed a vulnerability scan or answer "what is in this image".
+# (httpx for the request-path lookups and the saga's outbound calls, temporalio because
+#  this image also runs order-worker, PyJWT[crypto] to verify RS256 tokens (never signs).)
+#
+# Requirements are copied before the source so editing a .py file does not invalidate
+# the pip layer. The service file `-r`s the shared chassis list, and the two land in the
+# same relative positions they occupy in the source tree so that reference resolves.
+COPY common/requirements.txt /app/common/requirements.txt
+COPY order/requirements.txt /app/order/requirements.txt
+RUN pip install --no-cache-dir -r /app/order/requirements.txt
 
 # Build context is ./services so the shared chassis can be copied alongside this
 # service, and the service is copied as a package so its own modules import absolutely.

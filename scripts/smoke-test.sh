@@ -148,6 +148,23 @@ poll_field() {
   return 1
 }
 
+# Wait until an order settles on either of two statuses, and report which. Used where the
+# platform guarantees that one of two outcomes happens but not which — asserting a specific
+# one would be asserting thread scheduling.
+#   poll_either <order-id> <status-a> <status-b> [timeout] [auth-args...]
+poll_either() {
+  local oid="$1" a="$2" b="$3" limit="${4:-60}" ; shift 4
+  local waited=0 got=""
+  while (( waited < limit )); do
+    got=$(curl -sS -m 10 "$BASE_URL/api/v1/orders/$oid" "$@" 2>/dev/null \
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',''))" 2>/dev/null)
+    if [[ "$got" == "$a" || "$got" == "$b" ]]; then POLLED="$got"; return 0; fi
+    sleep 2; waited=$((waited + 2))
+  done
+  POLLED="$got"
+  return 1
+}
+
 # Is a named container available to exec into? Several assertions can only be made from
 # inside a database, and the suite has to stay runnable against a remote BASE_URL where
 # there are no local containers at all.
@@ -217,6 +234,10 @@ CUST_PHONE="+1666${RANDOM}${RANDOM}"
 OTHER_PHONE="+1444${RANDOM}${RANDOM}"
 RIDER_PHONE="+1777${RANDOM}${RANDOM}"
 RIDER2_PHONE="+1888${RANDOM}${RANDOM}"
+ADMIN_EMAIL="admin_${TAG}@example.com"
+ADMIN_PHONE="+1999${RANDOM}${RANDOM}"
+OWNER2_EMAIL="owner2_${TAG}@example.com"
+OWNER2_PHONE="+1222${RANDOM}${RANDOM}"
 
 # The restaurant every order in this run is placed against, and the coordinates dispatch
 # measures from. Riders are seeded close to it so the 10km radius is satisfied.
@@ -269,6 +290,16 @@ expect "register second rider" 201 POST /api/v1/users/register \
   "{\"email\":\"$RIDER2_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Second Rider\",\"phone\":\"$RIDER2_PHONE\",\"role\":\"rider\"}"
 RIDER2_USER_ID=$(jfield "['id']")
 
+# A platform operator, and a second restaurant owner who owns nothing this run touches —
+# the pair needed to prove the system_admin bypass and the ownership check both hold, as
+# distinct from each other, on the Order Service's kitchen routes.
+expect "register system admin" 201 POST /api/v1/users/register \
+  "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Admin\",\"phone\":\"$ADMIN_PHONE\",\"role\":\"system_admin\"}"
+assert "  admin role resolved from roles table" "$(jfield "['role']")" "system_admin"
+
+expect "register second restaurant owner" 201 POST /api/v1/users/register \
+  "{\"email\":\"$OWNER2_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Other Owner\",\"phone\":\"$OWNER2_PHONE\",\"role\":\"restaurant_admin\"}"
+
 expect "login with correct credentials" 200 POST /api/v1/users/login \
   "{\"email\":\"$OWNER_EMAIL\",\"password\":\"$PASSWORD\"}"
 assert "  token type is bearer" "$(jfield "['token_type']")" "bearer"
@@ -285,12 +316,16 @@ do_login "$CUST_EMAIL" "$PASSWORD";  CUST_TOKEN="$ACCESS_TOKEN"; CUST_REFRESH="$
 do_login "$OTHER_EMAIL" "$PASSWORD"; OTHER_TOKEN="$ACCESS_TOKEN"
 do_login "$RIDER_EMAIL" "$PASSWORD"; RIDER_TOKEN="$ACCESS_TOKEN"
 do_login "$RIDER2_EMAIL" "$PASSWORD"; RIDER2_TOKEN="$ACCESS_TOKEN"
+do_login "$ADMIN_EMAIL" "$PASSWORD";  ADMIN_TOKEN="$ACCESS_TOKEN"
+do_login "$OWNER2_EMAIL" "$PASSWORD"; OWNER2_TOKEN="$ACCESS_TOKEN"
 
 OWNER_AUTH=(-H "Authorization: Bearer $OWNER_TOKEN")
 CUST_AUTH=(-H "Authorization: Bearer $CUST_TOKEN")
 OTHER_AUTH=(-H "Authorization: Bearer $OTHER_TOKEN")
 RIDER_AUTH=(-H "Authorization: Bearer $RIDER_TOKEN")
 RIDER2_AUTH=(-H "Authorization: Bearer $RIDER2_TOKEN")
+ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_TOKEN")
+OWNER2_AUTH=(-H "Authorization: Bearer $OWNER2_TOKEN")
 INTERNAL=(-H "X-Internal-Key: $INTERNAL_KEY")
 
 expect "no token -> 401" 401 GET "/api/v1/users/$OWNER_ID"
@@ -642,6 +677,20 @@ expect "the kitchen queue needs the admin role -> 403" 403 \
 expect "deciding an order that does not exist -> 404" 404 \
   POST /api/v1/orders/00000000-0000-0000-0000-000000000000/accept "" "${OWNER_AUTH[@]}"
 
+# The system_admin bypass and the ownership check are two different guards, and this is
+# the pair that tells them apart. Both hold `restaurant_admin`-or-better; only one owns
+# this restaurant, and only the other is the platform operator. Read-only against a shared
+# order and a re-publish of the unchanged menu, so neither mutates state the rest of the
+# suite depends on.
+expect "a system_admin reads a kitchen queue for a restaurant they do not own -> 200" 200 \
+  GET "/api/v1/orders/kitchen/$REST_ID" "" "${ADMIN_AUTH[@]}"
+expect "a restaurant_admin who does not own this restaurant is still refused -> 403" 403 \
+  GET "/api/v1/orders/kitchen/$REST_ID" "" "${OWNER2_AUTH[@]}"
+expect "a system_admin may republish a menu for a restaurant they do not own -> 200" 200 \
+  POST /api/v1/menus "$MENU" "${ADMIN_AUTH[@]}"
+expect "a restaurant_admin who does not own this restaurant cannot publish its menu -> 403" 403 \
+  POST /api/v1/menus "$MENU" "${OWNER2_AUTH[@]}"
+
 if [[ -n "$INTERNAL_KEY" ]]; then
   # The relay now carries rider events only: a kitchen decision has its own authenticated
   # endpoint, and leaving it reachable here too would be a second way to do one thing.
@@ -826,23 +875,49 @@ expect "second order is placed too" 201 POST /api/v1/orders "$TIGHT_ORDER" \
   -H "X-Idempotency-Key: $IDEM-cap2" "${CUST_AUTH[@]}"
 CAP2=$(jfield "['id']")
 
-poll_status "$CAP1" confirmed 45 "${CUST_AUTH[@]}"
-poll_status "$CAP2" cancelled 60 "${CUST_AUTH[@]}"
+# WHICH of the two takes the slot is not defined behaviour, so it is not asserted. Both
+# orders are placed milliseconds apart; each saga authorises a payment through a gateway
+# that sleeps MOCK_GATEWAY_LATENCY_SECONDS, and whichever of those two concurrent calls
+# returns first reaches the capacity gate first and wins. Submitting first usually wins,
+# which is exactly what makes hardcoding it a test that passes until it doesn't.
+#
+# What the platform actually guarantees is that *exactly one* gets in — so that is what is
+# checked here, and the refusal assertions below follow whichever one lost.
+poll_either "$CAP1" confirmed cancelled 60 "${CUST_AUTH[@]}"; CAP1_STATUS="$POLLED"
+poll_either "$CAP2" confirmed cancelled 60 "${CUST_AUTH[@]}"; CAP2_STATUS="$POLLED"
 
-CAP2_PAY=$(docker_payment_row "$CAP2")
-[[ -n "$CAP2_PAY" ]] && assert "  the refused order was refunded" "$(cut -d'|' -f1 <<<"$CAP2_PAY")" "refunded"
+if [[ "$CAP1_STATUS" == "confirmed" && "$CAP2_STATUS" == "cancelled" ]]; then
+  WINNER="$CAP1"; LOSER="$CAP2"
+elif [[ "$CAP2_STATUS" == "confirmed" && "$CAP1_STATUS" == "cancelled" ]]; then
+  WINNER="$CAP2"; LOSER="$CAP1"
+else
+  WINNER=""; LOSER=""
+fi
 
-if have_container sfo-order-db; then
+if [[ -n "$WINNER" ]]; then
+  ok "exactly one of the two orders took the only slot"
+  printf '        %sslot won by %s, refused %s%s\n' "$DIM" "${WINNER:0:8}" "${LOSER:0:8}" "$RESET"
+else
+  bad "exactly one of the two orders took the only slot" \
+      "expected one 'confirmed' and one 'cancelled', got '$CAP1_STATUS' and '$CAP2_STATUS'"
+fi
+
+if [[ -n "$LOSER" ]]; then
+  LOSER_PAY=$(docker_payment_row "$LOSER")
+  [[ -n "$LOSER_PAY" ]] && assert "  the refused order was refunded" "$(cut -d'|' -f1 <<<"$LOSER_PAY")" "refunded"
+fi
+
+if have_container sfo-order-db && [[ -n "$LOSER" ]]; then
   # It never reached 'confirmed' at all: the gate is *entry* to the rail, so the refused
   # order goes created -> cancelled without ever occupying a slot.
-  CAP2_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
-    "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$CAP2';" \
+  LOSER_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$LOSER';" \
     2>/dev/null | tr -d '[:space:]')
-  assert "  it never joined the rail" "$CAP2_TRAIL" "created,cancelled"
-  CAP2_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
-    "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$CAP2' AND new_status='cancelled';" \
+  assert "  it never joined the rail" "$LOSER_TRAIL" "created,cancelled"
+  LOSER_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$LOSER' AND new_status='cancelled';" \
     2>/dev/null | tr -d '[:space:]')
-  assert "  and the trail names why" "$CAP2_REASON" "kitchen_at_capacity"
+  assert "  and the trail names why" "$LOSER_REASON" "kitchen_at_capacity"
   RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
     "SELECT count(*) FROM orders WHERE restaurant_id='$TIGHT_ID' AND status='confirmed' AND kitchen_decision IS NULL;" \
     2>/dev/null | tr -d '[:space:]')

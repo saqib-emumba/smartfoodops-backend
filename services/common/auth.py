@@ -139,7 +139,12 @@ def require_role(*allowed: str):
     return dependency
 
 
-def require_self_or_admin(current_user: CurrentUser, subject_id: UUID | str) -> None:
+def require_self_or_admin(
+    current_user: CurrentUser,
+    subject_id: UUID | str,
+    *,
+    detail: str = "You may only access your own record",
+) -> None:
     """Guard a resource that only its owner (or an admin) may read.
 
     Called in the handler body rather than as a dependency because it needs the path
@@ -148,9 +153,29 @@ def require_self_or_admin(current_user: CurrentUser, subject_id: UUID | str) -> 
     Compared as strings: psycopg2 hands back UUID columns as plain strings unless
     register_uuid() is called, so a caller passing `row["customer_id"]` and one passing a
     parsed path parameter would otherwise never match each other.
+
+    `detail` exists so ownership rules that are not about *your own record* — owning the
+    restaurant an order was placed with, for instance — can reuse this comparison instead of
+    hand-rolling it and getting the admin bypass wrong.
     """
     if str(current_user.user_id) != str(subject_id) and not current_user.is_admin:
-        raise forbidden("You may only access your own record")
+        raise forbidden(detail)
+
+
+def assert_account_role(account: dict, *, required: str, detail: str) -> dict:
+    """Assert a fetched account currently holds a role, independent of its token.
+
+    Three services do this after reading `GET /api/v1/users/{id}`, and the reason is the
+    same in all three: the role claim in a token was true when the token was signed, so an
+    account demoted since then still presents a valid one until it expires (D18).
+
+    The comparison is shared; the route, the role literal and the message are not. Which URL
+    produced this dict and how a rejection is worded belong to the calling service — those
+    messages are distinct response bodies, not boilerplate.
+    """
+    if account.get("role") != required:
+        raise forbidden(detail)
+    return account
 
 
 def require_internal(x_internal_key: str | None = Header(None, alias="X-Internal-Key")):

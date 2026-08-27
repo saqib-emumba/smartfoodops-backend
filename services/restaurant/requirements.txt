@@ -1,0 +1,4 @@
+-r ../common/requirements.txt
+
+# httpx for the ownership lookup against the User Service.
+httpx==0.28.1

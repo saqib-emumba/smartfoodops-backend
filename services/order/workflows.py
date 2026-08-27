@@ -23,16 +23,18 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     # Every service-local import belongs inside this block, and the reason is not
-    # style. Reaching `activities` pulls in `clients` and `repository`, and through
+    # style. Reaching `activities` pulls in `clients` and `repositories`, and through
     # them `common.auth`, which calls `required("JWT_PUBLIC_KEY_B64")` at import
     # time. Passed through, the sandbox reuses the already-loaded modules; outside
     # the block it would re-execute them under restriction and fail the workflow
     # task — forever, since Temporal retries it. Add imports here, never above.
     #
     # (`order` is a real package since the layout change, so these are absolute.
-    # What is *not* safe is putting anything in order/__init__.py: that file is
-    # executed by the sandbox before this block is reached. See its docstring.)
-    from order.activities import OrderActivities
+    # What is *not* safe is putting anything in order/__init__.py, order/activities/
+    # __init__.py, order/repositories/__init__.py or order/clients/__init__.py: all
+    # four are executed by the sandbox before or as part of this block is reached,
+    # and all four stay docstring-only for exactly that reason. See their docstrings.)
+    from order.activities.activities import OrderActivities
     from common.config import (
         DELIVERY_TIMEOUT_SECONDS,
         RESTAURANT_DECISION_TIMEOUT_SECONDS,

@@ -20,9 +20,8 @@ import hashlib
 from logging import Logger
 from uuid import UUID
 
-import redis
-
-from common.config import REDIS_TIMEOUT, REFRESH_TOKEN_TTL_DAYS
+from common.config import REFRESH_TOKEN_TTL_DAYS
+from common.redis_store import RedisStore
 
 REFRESH_TTL_SECONDS = REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60
 
@@ -34,34 +33,13 @@ def _key(token: str) -> str:
     return _KEY_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-class RefreshTokenStore:
-    """Redis-backed session store, opened for the life of the process."""
+class RefreshTokenStore(RedisStore):
+    """Redis-backed session store. The connection lifecycle comes from RedisStore; the key
+    scheme — SHA-256 of the token, never the token itself — and rotate-on-refresh stay here.
+    """
 
     def __init__(self, url: str, *, logger: Logger):
-        self._url = url
-        self._logger = logger
-        self._client: redis.Redis | None = None
-
-    def connect(self) -> None:
-        self._client = redis.Redis.from_url(
-            self._url,
-            socket_timeout=REDIS_TIMEOUT,
-            socket_connect_timeout=REDIS_TIMEOUT,
-            decode_responses=True,
-        )
-        self._logger.info("Refresh token store initialised")
-
-    def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
-
-    def is_reachable(self) -> bool:
-        try:
-            return bool(self._client and self._client.ping())
-        except redis.RedisError as exc:  # pragma: no cover - health must never raise
-            self._logger.warning("Refresh store health probe failed: %s", exc)
-            return False
+        super().__init__(url, logger=logger, name="Refresh token store")
 
     def store(self, token: str, user_id: UUID) -> None:
         """Record an issued token against its user, expiring with the session."""

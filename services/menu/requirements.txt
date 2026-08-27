@@ -1,0 +1,6 @@
+-r ../common/requirements.txt
+
+# httpx for the Restaurant Service lookup; redis for the cache-aside layer in front of
+# the `menus` table.
+httpx==0.28.1
+redis==5.2.1

@@ -22,7 +22,8 @@ from uuid import UUID
 
 import redis
 
-from common.config import MENU_CACHE_TTL_SECONDS, REDIS_TIMEOUT
+from common.config import MENU_CACHE_TTL_SECONDS
+from common.redis_store import RedisStore
 
 _KEY_PREFIX = "menu:"
 
@@ -31,41 +32,20 @@ def _key(restaurant_id: UUID) -> str:
     return f"{_KEY_PREFIX}{restaurant_id}"
 
 
-class MenuCache:
-    """Redis-backed menu cache, opened for the life of the process.
-
-    Blocking client and plain methods: this service is synchronous throughout — psycopg2
-    and `def` handlers — so FastAPI already runs each request in a worker thread.
+class MenuCache(RedisStore):
+    """Redis-backed menu cache. The connection lifecycle comes from RedisStore; what is in
+    the cache — the key scheme, the TTL, and the invalidate-rather-than-update rule — stays
+    here, because that is this service's business and not the chassis's.
     """
 
     def __init__(
         self, url: str, *, logger: Logger, ttl_seconds: int = MENU_CACHE_TTL_SECONDS
     ):
-        self._url = url
-        self._logger = logger
+        super().__init__(url, logger=logger, name="Menu cache")
         self._ttl = ttl_seconds
-        self._client: redis.Redis | None = None
 
     def connect(self) -> None:
-        self._client = redis.Redis.from_url(
-            self._url,
-            socket_timeout=REDIS_TIMEOUT,
-            socket_connect_timeout=REDIS_TIMEOUT,
-            decode_responses=True,
-        )
-        self._logger.info("Menu cache initialised (TTL %ss)", self._ttl)
-
-    def close(self) -> None:
-        if self._client is not None:
-            self._client.close()
-            self._client = None
-
-    def is_reachable(self) -> bool:
-        try:
-            return bool(self._client and self._client.ping())
-        except redis.RedisError as exc:  # pragma: no cover - health must never raise
-            self._logger.warning("Menu cache health probe failed: %s", exc)
-            return False
+        super().connect(f" (TTL {self._ttl}s)")
 
     def get(self, restaurant_id: UUID) -> str | None:
         """Return the cached menu JSON, or None on a miss — including a Redis outage."""
