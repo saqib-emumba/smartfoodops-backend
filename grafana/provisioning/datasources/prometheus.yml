@@ -1,0 +1,11 @@
+# Provisioned, not clicked together in the UI, so `docker compose down -v` does not lose it
+# (D42). Grafana reads every file under /etc/grafana/provisioning on startup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

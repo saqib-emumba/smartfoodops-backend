@@ -18,6 +18,7 @@ same way `order.router` does.
 from fastapi import FastAPI
 
 from common.responses import install_error_handlers
+from common.telemetry import instrument_app
 from orchestrator import deps
 from orchestrator.apis import health, order
 
@@ -25,6 +26,7 @@ from orchestrator.apis import health, order
 # that earns its keep (order, menu and user each hold two).
 app = FastAPI(title="SmartFoodOps Orchestrator Service", lifespan=deps.temporal.lifespan)
 install_error_handlers(app)
+instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
 app.include_router(order.router)

@@ -7,7 +7,7 @@ echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
 echo "📂 Creating services, gateway and per-service database directories..."
-mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu,rider},services/{common,user,restaurant,menu,order,payment,rider}}
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu,rider,analytics},services/{common,user,restaurant,menu,order,payment,rider,analytics,notification}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
@@ -23,6 +23,7 @@ ORDER_POSTGRES_PASSWORD=sfo_order_password_123
 PAYMENT_POSTGRES_PASSWORD=sfo_payment_password_123
 MENU_POSTGRES_PASSWORD=sfo_menu_password_123
 RIDER_POSTGRES_PASSWORD=sfo_rider_password_123
+ANALYTICS_POSTGRES_PASSWORD=sfo_analytics_password_123
 
 # Redis. docker-compose.yml sets the per-service URL literally (database 0 for the Menu
 # Service's cache, database 1 for the User Service's sessions), so this is only read by
@@ -62,6 +63,24 @@ JWT_PUBLIC_KEY_B64=$(printf '%s' "$jwt_public_pem" | openssl base64 -A)
 # Shared secret for the service-to-service endpoints no end user may call directly, such as
 # the Order Service's audit log write.
 INTERNAL_API_KEY=$(openssl rand -hex 32)
+EOF
+
+# 2c. Observability admin credential (Week 3, D42). Same reasoning as INTERNAL_API_KEY above:
+# a random value only openssl generates, appended because the quoted heredoc above cannot.
+cat << EOF >> .env
+
+# --- Observability (Week 3) ---
+GRAFANA_ADMIN_PASSWORD=$(openssl rand -hex 16)
+EOF
+
+# 2d. RabbitMQ credentials (Week 3, D45). Same reasoning again — Celery's broker password
+# is never a hardcoded default (common/config.py's own rule, D19); the only default this
+# platform ever uses for a real secret is "generate a fresh one here."
+cat << EOF >> .env
+
+# --- Notifications (Week 3) ---
+RABBITMQ_USER=sfo_rabbitmq_admin
+RABBITMQ_PASSWORD=$(openssl rand -hex 16)
 EOF
 
 # 3. Write out one initialization migration script per physical database.
@@ -197,6 +216,13 @@ CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up
 -- compare-and-set in OrderRepository.transition depends on (D31).
 CREATE TYPE kitchen_decision AS ENUM ('accepted', 'rejected');
 
+-- What the rider has reported so far, as a durable column rather than only a signal
+-- (Week 3, D46) — the same fix D32 already gave the kitchen's answer, applied to the
+-- other place a lost signal used to read as silence. Declared in lifecycle order for the
+-- same reason order_status is: OrderRepository.record_rider_report's guard compares with
+-- `>`, so 'delivered' > 'picked_up' has to be true by declaration, not by convention.
+CREATE TYPE rider_report_stage AS ENUM ('picked_up', 'delivered');
+
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -211,6 +237,12 @@ CREATE TABLE IF NOT EXISTS orders (
     -- capacity check counts.
     kitchen_decision kitchen_decision,
     kitchen_decided_at TIMESTAMP WITH TIME ZONE,
+    -- What the rider has told the Order Service so far, independent of `status`: a report
+    -- can arrive and this column can be set even if the *signal* carrying it to the saga
+    -- is lost. The saga reads this back on a pickup/delivery timeout, exactly like it
+    -- already does for `kitchen_decision` (D46).
+    rider_reported_stage rider_report_stage,
+    rider_reported_at TIMESTAMP WITH TIME ZONE,
     idempotency_key VARCHAR(255) UNIQUE, -- Protects order creation writes against API duplicate submissions
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -255,6 +287,52 @@ CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(or
 CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
     ON orders (restaurant_id, created_at)
     WHERE status = 'confirmed' AND kitchen_decision IS NULL;
+
+-- ============================================================================
+-- Transactional outbox (Week 3, D39) — the relay's queue, not a second audit trail.
+--
+-- order_tracking_logs already records every transition for a human reading the timeline;
+-- this table exists only so a background relay (services/common/outbox.py) can publish
+-- the same facts to Kafka without a second write after the commit. Written inside the
+-- exact same `cursor(commit=True)` blocks that already write orders and
+-- order_tracking_logs — see OrderRepository.create/transition/decide_kitchen — so an event
+-- can never exist for a write that didn't happen, and vice versa (the D09/D24 argument,
+-- applied again).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS order_outbox (
+    -- Doubles as the event's dedup key on the consumer side (Kafka delivery here is
+    -- at-least-once: a relay crash between the broker ack and marking a row published
+    -- republishes it).
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- Claim order for the relay. NOT a resumable "last seq processed" cursor: BIGSERIAL
+    -- hands out values before commit, so a lower seq can commit after a higher one and be
+    -- skipped forever if the relay tracked a high-water mark instead of querying
+    -- published_at IS NULL directly.
+    seq BIGSERIAL NOT NULL,
+    aggregate_type VARCHAR(32) NOT NULL DEFAULT 'order',
+    aggregate_id UUID NOT NULL, -- == the Kafka partition key, so per-order ordering holds
+    event_type VARCHAR(64) NOT NULL,
+    event_version SMALLINT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    -- W3C trace context, captured from the request's own span at the moment this row is
+    -- inserted — not by the relay, which runs minutes later and would otherwise start an
+    -- orphan trace disconnected from the request that caused the write.
+    traceparent TEXT,
+    tracestate TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ, -- NULL == unpublished; the relay's only WHERE clause
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- The relay's only query. Stays the size of the backlog rather than the size of history,
+-- because nearly every row ends up published.
+CREATE INDEX IF NOT EXISTS idx_order_outbox_unpublished
+    ON order_outbox (seq) WHERE published_at IS NULL;
+
+-- Lets a future admin/debug read ask "what has this order emitted so far?" without a scan.
+CREATE INDEX IF NOT EXISTS idx_order_outbox_aggregate
+    ON order_outbox (aggregate_id, seq);
 EOF
 
 cat << 'EOF' > db/payment/init.sql
@@ -297,6 +375,35 @@ CREATE TABLE IF NOT EXISTS payments (
 -- either column would be dead weight, so the only one declared here is for the reads that
 -- have no constraint behind them: sweeping for payments left mid-flight.
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+-- ============================================================================
+-- Transactional outbox (Week 3, D39) — same shape and purpose as order_outbox in
+-- sfo_order_core; see that table's comment for the full reasoning. `aggregate_id` here is
+-- deliberately `order_id`, not `payment_id`: every consumer of this stream joins on the
+-- order, and the Kafka partition key has to match what order_outbox uses so a payment
+-- event and an order event for the same order land in the same partition.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS payment_outbox (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    seq BIGSERIAL NOT NULL,
+    aggregate_type VARCHAR(32) NOT NULL DEFAULT 'payment',
+    aggregate_id UUID NOT NULL, -- orders.id (Order Service database) — the partition key
+    event_type VARCHAR(64) NOT NULL,
+    event_version SMALLINT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    traceparent TEXT,
+    tracestate TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ,
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_outbox_unpublished
+    ON payment_outbox (seq) WHERE published_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_payment_outbox_aggregate
+    ON payment_outbox (aggregate_id, seq);
 EOF
 
 cat << 'EOF' > db/menu/init.sql
@@ -417,11 +524,69 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_riders_current_order
     WHERE current_order_id IS NOT NULL;
 EOF
 
+cat << 'EOF' > db/analytics/init.sql
+-- ============================================================================
+-- Analytics Service database — sfo_analytics_core (container sfo-analytics-db, host port 5438)
+--
+-- Owns nothing about orders, payments, restaurants or riders — only the two tables a
+-- Kafka consumer needs to be correct: which events it has already applied, and the
+-- business-facing projection it derived from them. Everything here is *derived* state,
+-- rebuildable from the topic (Week 3, D38-D43): if this database were dropped, resetting
+-- the consumer group's offset to the earliest available and replaying would reconstruct
+-- both tables exactly, because Kafka — not this database — is the source of truth for
+-- what happened.
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Consumer-side dedup (Week 3, D40). Kafka delivery here is at-least-once — the relay
+-- republishes on a crash between broker-ack and marking a row published (D39), and a
+-- consumer restart can also redeliver an uncommitted batch — so "have I already applied
+-- this fact" has to be a real check, not an assumption. `event_id` is the outbox row's own
+-- id (see order_outbox/payment_outbox), stable across every republish of the same event,
+-- so it is what a projection update conditions on.
+--
+-- Keyed by (consumer_group, event_id) rather than event_id alone: this service runs one
+-- logical consumer today, but a table shaped for exactly one group would need a schema
+-- change the day a second one (a future GenAI read-model, say) starts reading the same
+-- topic independently.
+CREATE TABLE IF NOT EXISTS processed_events (
+    consumer_group VARCHAR(64) NOT NULL,
+    event_id UUID NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (consumer_group, event_id)
+);
+
+-- Business projection: one row per order, updated incrementally as its events arrive.
+-- This is what the Prometheus Counters/Gauges in analytics/consumer.py are seeded from on
+-- startup — a Counter's in-process value does not survive a restart on its own, so the
+-- durable total this table can be queried for is what makes the metric accurate again
+-- after one (see consumer.py's own comment on `Counter._value.set(...)`).
+--
+-- `delivery_seconds` is computed from the envelope's own `occurred_at` timestamps
+-- (order.created's vs order.delivered's), never from Kafka's transport timestamp, which
+-- is when the relay happened to publish, not when the kitchen actually finished — the
+-- blueprint drafted for this service made exactly that mistake.
+CREATE TABLE IF NOT EXISTS order_projections (
+    order_id UUID PRIMARY KEY,
+    restaurant_id UUID,
+    customer_id UUID,
+    total_amount DECIMAL(10, 2),
+    status VARCHAR(32) NOT NULL,
+    placed_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    delivery_seconds DOUBLE PRECISION,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_projections_status ON order_projections(status);
+EOF
+
 # 4. Write out the Docker Compose orchestration configuration
 echo "🐳 Generating docker-compose.yml..."
 cat << 'EOF' > docker-compose.yml
-version: '3.8'
-
 networks:
   smartfoodops-network:
     driver: bridge
@@ -435,6 +600,11 @@ volumes:
   rider_postgres_data:
   redis_data:
   temporal_data:
+  prometheus_data:
+  grafana_data:
+  kafka_data:
+  analytics_postgres_data:
+  rabbitmq_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
 # its own credentials, so no service can reach another's tables even by accident.
@@ -467,6 +637,12 @@ x-menu-db-env: &menu-db-env
 # location on every assignment, and a service may not write another service's tables.
 x-rider-db-env: &rider-db-env
   DATABASE_URL: postgresql://sfo_rider_admin:${RIDER_POSTGRES_PASSWORD:?set RIDER_POSTGRES_PASSWORD in the root .env}@db-rider-postgres:5432/sfo_rider_core
+
+# Owns only what a Kafka consumer needs to be correct: dedup and a derived projection
+# (Week 3, D40). No other service ever reads or writes this database — database-per-service
+# holds even for a service whose "facts" are all rebuildable from a topic.
+x-analytics-db-env: &analytics-db-env
+  DATABASE_URL: postgresql://sfo_analytics_admin:${ANALYTICS_POSTGRES_PASSWORD:?set ANALYTICS_POSTGRES_PASSWORD in the root .env}@db-analytics-postgres:5432/sfo_analytics_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -576,6 +752,21 @@ services:
       - rider_postgres_data:/var/lib/postgresql/data
       - ./db/rider/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
+  # Week 3 (D40): the Analytics Service's own database — a dedup table and a projection
+  # derived entirely from Kafka, never a fact any other service's request path depends on.
+  db-analytics-postgres:
+    <<: *postgres-base
+    container_name: sfo-analytics-db
+    environment:
+      POSTGRES_DB: sfo_analytics_core
+      POSTGRES_USER: sfo_analytics_admin
+      POSTGRES_PASSWORD: ${ANALYTICS_POSTGRES_PASSWORD}
+    ports:
+      - "5438:5432" # Maps host 5438 to container 5432
+    volumes:
+      - analytics_postgres_data:/var/lib/postgresql/data
+      - ./db/analytics/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
   cache-redis:
     image: redis:7.0-alpine
     container_name: sfo-redis
@@ -640,6 +831,176 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # --- 1c. OBSERVABILITY (Week 3) ---
+  # Distributed tracing, metrics and dashboards over the stack above. Every container here
+  # is reached only by other containers on smartfoodops-network or by a developer's browser
+  # — none of it sits behind the gateway, the same posture nginx.conf already documents for
+  # the Temporal Web UI: "no auth, so it stays off the gateway".
+
+  # OTLP receiver + trace storage + UI in one container. jaeger:2.x is itself an
+  # OpenTelemetry Collector distribution, so the OTLP ports below are native, not a
+  # compatibility shim — no separate Collector container is needed for this platform's
+  # size (D38-D43 discussion in key-decisions.md).
+  jaeger:
+    image: jaegertracing/jaeger:2.1.0
+    container_name: sfo-jaeger
+    restart: always
+    ports:
+      - "16686:16686" # Web UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - smartfoodops-network
+
+  # Scrapes every service's /metrics over the network directly — no service publishes its
+  # app port to the host, and none needs to: Compose's embedded DNS resolves e.g.
+  # order-service:8004 for any container on smartfoodops-network, Prometheus included.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: sfo-prometheus
+    restart: always
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - smartfoodops-network
+
+  # Dashboards and the Prometheus data source are provisioned from files under
+  # ./grafana/provisioning, not clicked together, so `docker compose down -v` does not
+  # discard them (D42).
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: sfo-grafana
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in the root .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - smartfoodops-network
+
+  # --- 1d. EVENTING (Week 3) ---
+  # Kafka carries facts; Temporal still owns every decision (key-decisions.md D38). No
+  # service here is on the order's critical path — checkout and the saga both work with
+  # this whole section stopped, because every producer writes to its own outbox table
+  # first (D39) and a background relay is what reaches Kafka, never the request itself.
+
+  # Single-node KRaft broker — no Zookeeper. `KAFKA_LOG_DIRS` matches the mounted volume
+  # exactly, unlike an early draft of this file that pointed it at the container's writable
+  # layer instead: with that mismatch, `docker compose down`/`up` re-formats a fresh empty
+  # log dir against the same hardcoded CLUSTER_ID and silently drops every topic, offset and
+  # consumer-group position. `KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'` is deliberate too —
+  # topics are created explicitly by kafka-init below, with the partition count the platform
+  # actually needs; auto-create would silently hand out 1 partition instead.
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: sfo-kafka
+    restart: always
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # Registers the JSON Schema common/events/*.py generates for each event type, and is
+  # consulted on the hot path (producer before send, consumer before deserialize) — not
+  # just at startup — via a version-keyed cache in common/kafka.py. The wire format stays
+  # plain JSON: registering a JSON Schema here does not require the Confluent Avro
+  # serializers, only this REST API.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    container_name: sfo-schema-registry
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: 'http://0.0.0.0:8081'
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # One-shot: creates the platform's one topic (and its DLQ) explicitly, at the partition
+  # count per-order ordering depends on (3 — see common/events/topics.py), then exits.
+  # `restart: "no"` — this is a migration step, not a long-running service.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: sfo-kafka-init
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+    volumes:
+      - ./kafka/init-topics.sh:/init-topics.sh:ro
+    entrypoint: ["bash", "/init-topics.sh"]
+
+  # Celery's broker for the Notification Service (Week 3, D45) — the curriculum's mandated
+  # transport, used here purely as a concurrency pool for slow simulated SMS/email I/O.
+  # Kafka is the durable ledger (see notification/__init__.py); RabbitMQ does not need to
+  # be, so no `depends_on` from order/payment-service — nothing on the checkout path ever
+  # touches this broker.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: sfo-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+      - "15692:15692" # Prometheus metrics (rabbitmq_prometheus, enabled via enabled_plugins)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
 
   # --- 2. API GATEWAY (NGINX REVERSE PROXY) ---
   api-gateway:
@@ -733,6 +1094,11 @@ services:
       # This service starts the saga and relays signals into it, both as HTTP calls into
       # the Orchestrator Service (D36) — it holds no Temporal client of its own any more.
       ORCHESTRATOR_SERVICE_URL: http://orchestrator-service:8007
+      # The outbox relay's target (Week 3, D39). Deliberately no `depends_on: kafka` below:
+      # the relay's own reconnect loop is what handles Kafka not being ready yet, and a
+      # hard startup dependency here would wrongly imply checkout needs Kafka to work.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-order-postgres:
         condition: service_healthy
@@ -752,6 +1118,9 @@ services:
     environment:
       <<: [*payment-db-env, *jwt-env]
       ORDER_SERVICE_URL: http://order-service:8004
+      # See order-service's own comment: no depends_on for kafka on purpose (Week 3, D39).
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-payment-postgres:
         condition: service_healthy
@@ -774,6 +1143,66 @@ services:
     depends_on:
       db-rider-postgres:
         condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3b. ANALYTICS (Week 3, D40) ---
+  # A Kafka read-model, not a request-path service — no sibling calls, no JWT keys (the
+  # first service in the platform that needs none: it never verifies a token, because
+  # nothing it serves is user-facing). No `depends_on: kafka`, matching order-service's
+  # and payment-service's own comment: the consumer's reconnect loop is what handles Kafka
+  # not being ready yet.
+  analytics-service:
+    build:
+      context: ./services
+      dockerfile: analytics/Dockerfile
+    container_name: sfo-analytics-service
+    restart: always
+    environment:
+      <<: *analytics-db-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    depends_on:
+      db-analytics-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3c. NOTIFICATIONS (Week 3, D45) ---
+  # Two containers, one image — see services/notification/__init__.py for why the split is
+  # what makes the Celery hop real rather than decorative. Neither depends on kafka or
+  # rabbitmq at the compose level: each has its own reconnect loop (the consumer) or is a
+  # pure client of a broker it does not need to be up before packages import (the worker).
+  notification-consumer:
+    build:
+      context: ./services
+      dockerfile: notification/Dockerfile
+    container_name: sfo-notification-consumer
+    restart: always
+    command: ["python", "-m", "notification.consumer"]
+    environment:
+      <<: *jwt-env
+      USER_SERVICE_URL: http://user-service:8001
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      RABBITMQ_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
+    networks:
+      - smartfoodops-network
+
+  # The concurrency pool for the slow simulated dispatch in notification/tasks.py. No
+  # sibling calls, no JWT keys — it never imports common.auth, only notification.tasks —
+  # which is what makes its environment strictly smaller than the consumer's.
+  notification-worker:
+    build:
+      context: ./services
+      dockerfile: notification/Dockerfile
+    container_name: sfo-notification-worker
+    restart: always
+    command: ["celery", "-A", "notification.worker", "worker", "--loglevel=info"]
+    environment:
+      RABBITMQ_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
     networks:
       - smartfoodops-network
 
@@ -827,6 +1256,162 @@ services:
         condition: service_healthy
     networks:
       - smartfoodops-network
+EOF
+
+# 4b. Write out the observability configuration (Week 3, D42).
+echo "📈 Generating prometheus/prometheus.yml and grafana/provisioning..."
+mkdir -p prometheus grafana/provisioning/datasources grafana/provisioning/dashboards
+cat << 'EOF' > prometheus/prometheus.yml
+# Scrape config for SmartFoodOps. Every target is a container on smartfoodops-network,
+# reached by its Compose service name — no app service publishes its port to the host, and
+# none needs to for Prometheus to see it.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Metrics port pinned since Week 2 specifically for this (docker-compose.yml).
+  - job_name: "temporal-server"
+    static_configs:
+      - targets: ["temporal-server:9233"]
+
+  # The seven FastAPI services, each exposing /metrics via common/telemetry.py.
+  - job_name: "user-service"
+    static_configs:
+      - targets: ["user-service:8001"]
+
+  - job_name: "restaurant-service"
+    static_configs:
+      - targets: ["restaurant-service:8002"]
+
+  - job_name: "menu-service"
+    static_configs:
+      - targets: ["menu-service:8003"]
+
+  - job_name: "order-service"
+    static_configs:
+      - targets: ["order-service:8004"]
+
+  - job_name: "payment-service"
+    static_configs:
+      - targets: ["payment-service:8005"]
+
+  - job_name: "rider-service"
+    static_configs:
+      - targets: ["rider-service:8006"]
+
+  - job_name: "orchestrator-service"
+    static_configs:
+      - targets: ["orchestrator-service:8007"]
+
+  # Not a FastAPI process — no /metrics route, so it runs its own bare prometheus_client
+  # HTTP server (services/orchestrator/worker.py) instead.
+  - job_name: "orchestrator-worker"
+    static_configs:
+      - targets: ["orchestrator-worker:9108"]
+
+  # Kafka read-model (Week 3, D40) — same /metrics wiring as every other FastAPI service.
+  - job_name: "analytics-service"
+    static_configs:
+      - targets: ["analytics-service:8008"]
+
+  # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
+  # HTTP server started in notification/consumer.py::main (Week 3, D45).
+  - job_name: "notification-consumer"
+    static_configs:
+      - targets: ["notification-consumer:9110"]
+
+  # The broker itself, via the rabbitmq_prometheus plugin (rabbitmq/enabled_plugins) — the
+  # observability week should not add a component that is itself unobservable.
+  - job_name: "rabbitmq"
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+EOF
+
+cat << 'EOF' > grafana/provisioning/datasources/prometheus.yml
+# Provisioned, not clicked together in the UI, so `docker compose down -v` does not lose it
+# (D42). Grafana reads every file under /etc/grafana/provisioning on startup.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+EOF
+
+cat << 'EOF' > grafana/provisioning/dashboards/dashboards.yml
+# Points Grafana at the JSON dashboard files in this same directory. Dashboards are loaded
+# from disk on startup and re-read on the interval below, so editing a JSON file here and
+# restarting the container is the update path — no export/import through the UI.
+apiVersion: 1
+
+providers:
+  - name: SmartFoodOps
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false
+EOF
+
+# 4c. Write out the Kafka topic-init script (Week 3, D42) — mounted into the
+# `kafka-init` one-shot container defined in the docker-compose.yml heredoc above.
+echo "📨 Generating kafka/init-topics.sh..."
+mkdir -p kafka
+cat << 'EOF' > kafka/init-topics.sh
+#!/usr/bin/env bash
+# Creates the platform's Kafka topics explicitly, at the partition count per-order
+# ordering depends on, then exits — this is a migration step, not a long-running service
+# (see kafka-init's `restart: "no"` in docker-compose.yml).
+#
+# `--if-not-exists` makes every run idempotent, so `docker compose up` can run this
+# against an already-initialised broker with no effect. Partition count and topic names
+# must match services/common/events/topics.py — that Python module is the source of truth
+# for what a producer/consumer expects to exist; this script is what makes it exist.
+#
+# Auto-create is deliberately disabled on the broker (KAFKA_AUTO_CREATE_TOPICS_ENABLE:
+# 'false'): without an explicit init step, Kafka would silently create a 1-partition topic
+# on the first publish, and a typo'd topic name would create a new topic instead of failing.
+
+set -euo pipefail
+
+BOOTSTRAP_SERVER="kafka:29092"
+PARTITIONS=3
+REPLICATION_FACTOR=1
+
+create_topic() {
+  local topic="$1"
+  kafka-topics --bootstrap-server "$BOOTSTRAP_SERVER" --create --if-not-exists \
+    --topic "$topic" --partitions "$PARTITIONS" --replication-factor "$REPLICATION_FACTOR"
+}
+
+create_topic "sfo.order.events.v1"
+create_topic "sfo.order.events.v1.dlq"
+
+echo "topics ready"
+EOF
+chmod +x kafka/init-topics.sh
+
+# 4d. Write out the RabbitMQ plugin config (Week 3, D45).
+echo "🐇 Generating rabbitmq/enabled_plugins..."
+mkdir -p rabbitmq
+cat << 'EOF' > rabbitmq/enabled_plugins
+% Bind-mounted into the container at /etc/rabbitmq/enabled_plugins (Week 3, D42-style
+% declarative config, matching prometheus/prometheus.yml and kafka/init-topics.sh rather
+% than a custom ENTRYPOINT/command override). `rabbitmq_management` ships the UI on 15672;
+% `rabbitmq_prometheus` is what makes the broker itself observable on 15692 — the
+% observability week should not add a component that is itself a blind spot.
+[rabbitmq_management,rabbitmq_prometheus].
 EOF
 
 # 5. Write out the Nginx routing gateway configuration

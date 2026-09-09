@@ -3,4 +3,5 @@
 # httpx for the saga's outbound calls (payment, rider, and now order itself — D36);
 # temporalio because this image runs both the API side and orchestrator-worker.
 httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
 temporalio==1.31.0

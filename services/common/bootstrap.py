@@ -11,6 +11,7 @@ from logging import Logger
 from common.config import required
 from common.logging_config import configure_logging
 from common.postgres import DEFAULT_EXHAUSTED_DETAIL, PostgresPool
+from common.telemetry import configure_telemetry
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,10 @@ def bootstrap(
     checks for a DSN it was never given one to satisfy.
     """
     logger = configure_logging(service_name)
+    # Right after logging, same place every process does it, so the trace Resource's
+    # service name, the logger's name, and health_payload's "service" field can never
+    # disagree — all three come from this one caller.
+    configure_telemetry(service_name)
     pool = (
         PostgresPool(required("DATABASE_URL"), logger=logger, exhausted_detail=exhausted_detail)
         if db

@@ -4,3 +4,10 @@
 # No temporalio (D36): this image no longer runs a worker, and holds no Temporal client of
 # its own — orchestrator/requirements.txt is the only one that needs it now.
 httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
+
+# common.kafka + common.outbox (Week 3, D39): the outbox relay's Kafka producer
+# and the schema-registry hot-path validator. Only order, payment, analytics and
+# notification install these — common/requirements.txt's own rule.
+aiokafka==0.14.0
+fastjsonschema==2.22.2

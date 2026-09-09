@@ -1,0 +1,185 @@
+{
+  "id": null,
+  "uid": "sfo-temporal-saga",
+  "title": "SmartFoodOps \u2014 Temporal Saga",
+  "description": "temporal-server's own :9233 metrics (pinned in docker-compose.yml since before Week 3 specifically so this dashboard would have a stable target) -- workflow and activity outcomes, task-queue poll health, and latency, all scoped to the order_tasks queue and the OrderWorkflow this platform actually runs (D25-D32, D36).",
+  "tags": [
+    "smartfoodops",
+    "week3"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Workflow completions by type",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (workflowType) (rate(workflow_success[5m]))",
+          "refId": "A",
+          "legendFormat": "{{workflowType}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "Activity outcomes by type",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (activityType) (rate(activity_success[5m]))",
+          "refId": "A",
+          "legendFormat": "{{activityType}} success"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (activityType) (rate(activity_fail[5m]))",
+          "refId": "B",
+          "legendFormat": "{{activityType}} fail"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "description": "Every activity retry that eventually succeeds still counts once here -- this is outcomes, not attempts. A sustained fail rate on a specific activityType is where to look first."
+    },
+    {
+      "id": 3,
+      "title": "Task poll success by task type",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum by (task_type) (rate(poll_success[5m]))",
+          "refId": "A",
+          "legendFormat": "{{task_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "description": "Workflow vs Activity task polls on the order_tasks queue -- both flat-lining together with no traffic to explain it is what a stuck worker looks like."
+    },
+    {
+      "id": 4,
+      "title": "Task schedule-to-start P95 latency",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.95, sum by (task_type, le) (rate(task_schedule_to_start_latency_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "{{task_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "description": "Time a task waited in the queue before a worker picked it up -- the leading indicator of an undersized worker pool, well before activities themselves slow down."
+    },
+    {
+      "id": 5,
+      "title": "Workflow schedule-to-close P95 latency",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(workflow_schedule_to_close_latency_bucket[5m])))",
+          "refId": "A",
+          "legendFormat": "OrderWorkflow"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "description": "Full order lifecycle duration as Temporal itself measures it -- created through terminal state, independent of the HTTP-layer latency the RED dashboard shows."
+    }
+  ]
+}

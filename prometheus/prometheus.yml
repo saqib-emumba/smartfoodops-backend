@@ -1,0 +1,68 @@
+# Scrape config for SmartFoodOps. Every target is a container on smartfoodops-network,
+# reached by its Compose service name — no app service publishes its port to the host, and
+# none needs to for Prometheus to see it.
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Metrics port pinned since Week 2 specifically for this (docker-compose.yml).
+  - job_name: "temporal-server"
+    static_configs:
+      - targets: ["temporal-server:9233"]
+
+  # The seven FastAPI services, each exposing /metrics via common/telemetry.py.
+  - job_name: "user-service"
+    static_configs:
+      - targets: ["user-service:8001"]
+
+  - job_name: "restaurant-service"
+    static_configs:
+      - targets: ["restaurant-service:8002"]
+
+  - job_name: "menu-service"
+    static_configs:
+      - targets: ["menu-service:8003"]
+
+  - job_name: "order-service"
+    static_configs:
+      - targets: ["order-service:8004"]
+
+  - job_name: "payment-service"
+    static_configs:
+      - targets: ["payment-service:8005"]
+
+  - job_name: "rider-service"
+    static_configs:
+      - targets: ["rider-service:8006"]
+
+  - job_name: "orchestrator-service"
+    static_configs:
+      - targets: ["orchestrator-service:8007"]
+
+  # Not a FastAPI process — no /metrics route, so it runs its own bare prometheus_client
+  # HTTP server (services/orchestrator/worker.py) instead.
+  - job_name: "orchestrator-worker"
+    static_configs:
+      - targets: ["orchestrator-worker:9108"]
+
+  # Kafka read-model (Week 3, D40) — same /metrics wiring as every other FastAPI service.
+  - job_name: "analytics-service"
+    static_configs:
+      - targets: ["analytics-service:8008"]
+
+  # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
+  # HTTP server started in notification/consumer.py::main (Week 3, D45).
+  - job_name: "notification-consumer"
+    static_configs:
+      - targets: ["notification-consumer:9110"]
+
+  # The broker itself, via the rabbitmq_prometheus plugin (rabbitmq/enabled_plugins) — the
+  # observability week should not add a component that is itself unobservable.
+  - job_name: "rabbitmq"
+    static_configs:
+      - targets: ["rabbitmq:15692"]

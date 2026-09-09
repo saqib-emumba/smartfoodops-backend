@@ -2,3 +2,6 @@
 
 # httpx for the ownership lookup against the User Service.
 httpx==0.28.1
+# common.service_client's fresh-per-call httpx.Client/AsyncClient is covered by
+# instrumenting the class itself, which is what this patches (Week 3).
+opentelemetry-instrumentation-httpx==0.65b0

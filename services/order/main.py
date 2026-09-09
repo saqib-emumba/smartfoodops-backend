@@ -13,19 +13,29 @@ This module is the composition root: it builds the app and mounts the six router
 Singletons live in deps.py, the saga hand-off in clients/orchestrator.py, and the routes
 are grouped by domain area in apis/.
 
-One lifespan now, not two (D36): the Temporal client this service used to hold directly —
-alongside `db.lifespan` — moved with the worker to the Orchestrator Service, so there is
-only `PostgresPool`'s left to compose.
+D36 took this down to one lifespan; Week 3 brings it back to two, for a different
+reason. `db.lifespan` still holds the connection pool; `deps.outbox_relay.lifespan` (D39)
+runs the background relay that publishes `order_outbox` rows to Kafka — genuinely a second,
+independent concern this time, not the Temporal client D36 removed.
 """
 
 from fastapi import FastAPI
 
+from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
+from common.telemetry import instrument_app
 from order import deps
 from order.apis import checkout, health, kitchen, signals, tracking, transitions
 
-app = FastAPI(title="SmartFoodOps Order Service", lifespan=deps.db.lifespan)
+# Two lifespans again as of Week 3, having been one since D36: the outbox relay
+# (deps.outbox_relay, D39) runs alongside the connection pool for this process' whole
+# life, publishing order_outbox rows to Kafka in the background.
+app = FastAPI(
+    title="SmartFoodOps Order Service",
+    lifespan=compose_lifespan(deps.db.lifespan, deps.outbox_relay.lifespan),
+)
 install_error_handlers(app)
+instrument_app(app, deps.SERVICE_NAME)
 
 # health first: it and checkout.router's GET /{order_id} are both single-segment GET paths
 # under this prefix, and Starlette matches by registration order — a parameterised route

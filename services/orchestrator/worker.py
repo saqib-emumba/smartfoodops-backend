@@ -23,6 +23,17 @@ its own `OrderWorkflow`-shaped class in `workflows/<entity>.py` and `Activities`
 below, exactly like `OrderWorkflow` and `OrderActivities` are today. A second task queue,
 and therefore a second `Worker(...)`, is only needed if a future entity's workflows should
 scale or deploy independently of this one.
+
+Connects through `TemporalGateway` rather than a bare `Client.connect()` (Week 3): that is
+the one place `TracingInterceptor` is wired in, so this process and the Orchestrator
+Service's API side connect exactly the same way. Per Temporal's own guidance, the
+interceptor is registered on the client only — `Worker(...)` inherits it from the client
+it is built with, and registering it a second time on the Worker itself would duplicate
+every span.
+
+Also starts a bare `prometheus_client` HTTP server on `:9108`: this process is not a FastAPI
+app, so it has no `/metrics` route of its own to reuse the app-scoped wiring in
+`common/telemetry.py` — this is its only scrape target.
 """
 
 import asyncio
@@ -31,27 +42,38 @@ import signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
-from temporalio.client import Client
+from prometheus_client import start_http_server
 from temporalio.worker import Worker
 
 from common.bootstrap import bootstrap
 from common.config import DEFAULT_TEMPORAL_ADDRESS, ORDER_TASK_QUEUE
+from common.temporal import TemporalGateway
 from orchestrator.activities.order import OrderActivities
 from orchestrator.clients.order.order_service import OrderServiceClient
 from orchestrator.workflows.order import OrderWorkflow
 
 SERVICE_NAME = "orchestrator-worker"
 
+# This process has no FastAPI app and therefore no /metrics route of its own — a fixed
+# port, scraped directly, is its only telemetry surface for Prometheus.
+METRICS_PORT = 9108
+
 
 async def main() -> None:
     address = os.getenv("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
 
     # No database: this process holds no state of its own, so bootstrap builds a logger
-    # and nothing else. `required("DATABASE_URL")` is never even checked.
+    # and nothing else. `required("DATABASE_URL")` is never even checked. bootstrap() also
+    # calls configure_telemetry(), so the TracerProvider TracingInterceptor attaches to
+    # below is already installed by the time TemporalGateway.connect() runs.
     runtime = bootstrap(SERVICE_NAME, db=False)
     logger = runtime.logger
 
-    client = await Client.connect(address)
+    start_http_server(METRICS_PORT)
+    logger.info("Prometheus metrics server listening on :%d", METRICS_PORT)
+
+    temporal = TemporalGateway(address, logger=logger)
+    client = await temporal.connect()
     activities = OrderActivities(orders=OrderServiceClient(logger), logger=logger)
 
     # No connection pool to bound against any more; a modest fixed size instead of the
@@ -69,6 +91,11 @@ async def main() -> None:
                 activities.read_kitchen_decision_activity,
                 activities.dispatch_rider_activity,
                 activities.release_rider_activity,
+                # Week 3, D46 — a seventh activity added to a live registration list. Safe
+                # for workflows *started* after this deploys; see workflows/order.py's own
+                # comment on why a workflow already mid-flight needs draining first, not
+                # this addition alone, to replay safely against the new code.
+                activities.read_rider_report_activity,
             ],
             activity_executor=executor,
             # Time allowed for in-flight activities to finish after shutdown starts.

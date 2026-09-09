@@ -1,0 +1,11 @@
+-r ../common/requirements.txt
+
+# httpx: common.kafka.SchemaRegistryValidator registers/validates schemas over HTTP.
+httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
+
+# common.kafka + common.outbox (for SchemaRegistryValidator and build_producer, the DLQ
+# producer) — this service has no outbox of its own, but reuses the same schema-registry
+# hot-path validator the relay uses, and the same producer builder for DLQ writes.
+aiokafka==0.14.0
+fastjsonschema==2.22.2

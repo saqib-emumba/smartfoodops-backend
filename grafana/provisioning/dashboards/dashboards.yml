@@ -1,0 +1,15 @@
+# Points Grafana at the JSON dashboard files in this same directory. Dashboards are loaded
+# from disk on startup and re-read on the interval below, so editing a JSON file here and
+# restarting the container is the update path — no export/import through the UI.
+apiVersion: 1
+
+providers:
+  - name: SmartFoodOps
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

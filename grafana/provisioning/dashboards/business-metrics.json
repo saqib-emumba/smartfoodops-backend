@@ -1,0 +1,237 @@
+{
+  "id": null,
+  "uid": "sfo-business-metrics",
+  "title": "SmartFoodOps \u2014 Business Metrics",
+  "description": "The Analytics Service's read-model (D44) -- a pure Kafka consumer projecting sfo.order.events.v1 into its own database, with no sibling calls and no JWT keys.",
+  "tags": [
+    "smartfoodops",
+    "week3"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Orders placed (total)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sfo_business_orders_placed_total",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Orders delivered (total)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sfo_business_orders_delivered_total",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Orders cancelled (total)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sfo_business_orders_cancelled_total",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Average delivery time",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sfo_business_average_delivery_seconds",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "description": "Computed from the stored projection, not an in-process dict -- survives an analytics-service restart.",
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Orders placed / delivered / cancelled \u2014 rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 6,
+        "w": 24,
+        "h": 9
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(sfo_business_orders_placed_total[5m]))",
+          "refId": "A",
+          "legendFormat": "placed"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(sfo_business_orders_delivered_total[5m]))",
+          "refId": "B",
+          "legendFormat": "delivered"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(sfo_business_orders_cancelled_total[5m]))",
+          "refId": "C",
+          "legendFormat": "cancelled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "title": "Cancellation rate",
+      "type": "timeseries",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 15,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "100 * sfo_business_orders_cancelled_total / sfo_business_orders_placed_total",
+          "refId": "A",
+          "legendFormat": "cancelled / placed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 2
+          }
+        },
+        "overrides": []
+      },
+      "description": "The analytics read-model's view of the same lifecycle scripts/smoke-test.sh reads straight out of order_tracking_logs -- both should agree on shape, never on identical values (analytics is order.created / order.delivered / order.cancelled events; the tracking log is the full transition history)."
+    }
+  ]
+}

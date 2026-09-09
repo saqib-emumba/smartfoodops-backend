@@ -1,0 +1,4873 @@
+{
+  "info": {
+    "_postman_id": "15eb2594-8df7-4a41-8247-69b17551c6b6",
+    "name": "SmartFoodOps API",
+    "description": "Every route the Nginx gateway exposes across all 7 services (user, restaurant, menu, order, payment, rider, orchestrator), organised and asserted the same way scripts/smoke-test.sh drives them: happy path, authorisation boundaries, edge cases, and the Temporal-driven order saga end to end.\n\n**Run order matters.** Folders 1-9 are numbered because later ones depend on variables (tokens, ids) captured by earlier ones. Run the whole collection with the Collection Runner, top to bottom, in one sitting -- individual folders can be re-run later, but only after folder 2 has populated tokens in this session.\n\n**Folders 7 and 8 contain self-looping poll requests** (they re-send themselves via `postman.setNextRequest` until the order reaches the status they're waiting on, up to a bounded number of tries) -- since Week 2 the order lifecycle is driven by a Temporal saga, so a status is reached *eventually*, not by the time the request that triggered it returns. These only work in the Collection Runner, not on a single Send click; set a ~2000ms delay between requests there.\n\n**Two things smoke-test.sh checks that this collection can't**: it reads three tables directly (payments, order_tracking_logs, riders) via `docker exec` to assert refunds, trail rows and fleet-leak invariants no HTTP response exposes, and it drives two compensation paths (no rider available, kitchen at capacity) that need direct database manipulation to set up. Both are read-only observations layered on top of the same HTTP contract this collection already exercises.\n\nSee readme/observability-and-eventing-guide.md and readme/order-saga-orchestration-guide.md for how the pieces underneath these routes actually work.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Runs before every request in this collection. Stamps a run-unique identity",
+          "// exactly once per session, the same reason scripts/smoke-test.sh tags every",
+          "// identity with `smoke$(date +%s)$$` -- so this collection can be re-run from the",
+          "// top any number of times without tripping the email/phone UNIQUE constraints.",
+          "if (!pm.collectionVariables.get(\"tag\")) {",
+          "  const stamp = Date.now();",
+          "  pm.collectionVariables.set(\"tag\", \"pm\" + stamp + Math.floor(Math.random() * 100000));",
+          "  pm.collectionVariables.set(\"password\", \"Passw0rd!\");",
+          "  const phone = (offset) => \"+1\" + String(stamp + offset).slice(-9);",
+          "  pm.collectionVariables.set(\"owner_email\", \"owner_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"owner_phone\", phone(1));",
+          "  pm.collectionVariables.set(\"cust_email\", \"cust_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"cust_phone\", phone(2));",
+          "  pm.collectionVariables.set(\"other_email\", \"other_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"other_phone\", phone(3));",
+          "  pm.collectionVariables.set(\"rider_email\", \"rider_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"rider_phone\", phone(4));",
+          "  pm.collectionVariables.set(\"rider2_email\", \"rider2_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"rider2_phone\", phone(5));",
+          "  pm.collectionVariables.set(\"admin_email\", \"admin_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"admin_phone\", phone(6));",
+          "  pm.collectionVariables.set(\"owner2_email\", \"owner2_pm\" + stamp + \"@example.com\");",
+          "  pm.collectionVariables.set(\"owner2_phone\", phone(7));",
+          "  pm.collectionVariables.set(\"rest_lat\", \"33.68\");",
+          "  pm.collectionVariables.set(\"rest_lon\", \"73.04\");",
+          "}"
+        ]
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost",
+      "type": "string"
+    },
+    {
+      "key": "internal_api_key",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "tag",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "password",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "owner_email",
+      "value": ""
+    },
+    {
+      "key": "owner_phone",
+      "value": ""
+    },
+    {
+      "key": "owner_id",
+      "value": ""
+    },
+    {
+      "key": "owner_token",
+      "value": ""
+    },
+    {
+      "key": "cust_email",
+      "value": ""
+    },
+    {
+      "key": "cust_phone",
+      "value": ""
+    },
+    {
+      "key": "cust_id",
+      "value": ""
+    },
+    {
+      "key": "cust_token",
+      "value": ""
+    },
+    {
+      "key": "cust_refresh",
+      "value": ""
+    },
+    {
+      "key": "other_email",
+      "value": ""
+    },
+    {
+      "key": "other_phone",
+      "value": ""
+    },
+    {
+      "key": "other_id",
+      "value": ""
+    },
+    {
+      "key": "other_token",
+      "value": ""
+    },
+    {
+      "key": "rider_email",
+      "value": ""
+    },
+    {
+      "key": "rider_phone",
+      "value": ""
+    },
+    {
+      "key": "rider_user_id",
+      "value": ""
+    },
+    {
+      "key": "rider_token",
+      "value": ""
+    },
+    {
+      "key": "rider_id",
+      "value": ""
+    },
+    {
+      "key": "rider2_email",
+      "value": ""
+    },
+    {
+      "key": "rider2_phone",
+      "value": ""
+    },
+    {
+      "key": "rider2_user_id",
+      "value": ""
+    },
+    {
+      "key": "rider2_token",
+      "value": ""
+    },
+    {
+      "key": "rider2_id",
+      "value": ""
+    },
+    {
+      "key": "admin_email",
+      "value": ""
+    },
+    {
+      "key": "admin_phone",
+      "value": ""
+    },
+    {
+      "key": "admin_id",
+      "value": ""
+    },
+    {
+      "key": "admin_token",
+      "value": ""
+    },
+    {
+      "key": "owner2_email",
+      "value": ""
+    },
+    {
+      "key": "owner2_phone",
+      "value": ""
+    },
+    {
+      "key": "owner2_id",
+      "value": ""
+    },
+    {
+      "key": "owner2_token",
+      "value": ""
+    },
+    {
+      "key": "rotated_access",
+      "value": ""
+    },
+    {
+      "key": "rotated_refresh",
+      "value": ""
+    },
+    {
+      "key": "wrong_pass_msg",
+      "value": ""
+    },
+    {
+      "key": "rest_lat",
+      "value": "33.68"
+    },
+    {
+      "key": "rest_lon",
+      "value": "73.04"
+    },
+    {
+      "key": "rest_id",
+      "value": ""
+    },
+    {
+      "key": "tight_id",
+      "value": ""
+    },
+    {
+      "key": "order_id",
+      "value": ""
+    },
+    {
+      "key": "second_order_id",
+      "value": ""
+    },
+    {
+      "key": "rej_order_id",
+      "value": ""
+    },
+    {
+      "key": "last_order_status",
+      "value": ""
+    },
+    {
+      "key": "assigned_rider",
+      "value": ""
+    },
+    {
+      "key": "carrier_token",
+      "value": ""
+    },
+    {
+      "key": "other_carrier_token",
+      "value": ""
+    },
+    {
+      "key": "payment_id",
+      "value": "",
+      "description": "Fill manually -- see the last Payment Service request."
+    }
+  ],
+  "item": [
+    {
+      "id": "743bb3db-1ef7-4340-8121-fc07d10314d3",
+      "name": "1. Health",
+      "item": [
+        {
+          "id": "a7966f0e-443c-40b3-81e4-74999327741b",
+          "name": "Users health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/users/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "967bfcef-15bd-4f99-b01f-4a0c9b50b3f6",
+          "name": "Restaurants health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/restaurants/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2cb8eef7-6a35-469f-9631-15e834d0e86d",
+          "name": "Menus health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/menus/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b2fd1e36-ee56-4282-a27c-7cf2e03c3b6b",
+          "name": "Orders health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orders/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "7a7df72f-e349-4199-b5a6-327d5d4978c3",
+          "name": "Payments health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/payments/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4b5c9204-1381-44d8-a82e-f6699fd35dfb",
+          "name": "Riders health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/riders/health"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a4c6c9c8-0689-4119-bf8f-57b3f21717a8",
+          "name": "Orchestrator health (Temporal reachable)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orchestrator/health",
+            "description": "The gateway routes only this one Orchestrator path on purpose (D36) -- everything else on the Orchestrator Service is internal-only."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"temporal_reachable is True\", () => pm.expect(String(pm.response.json().body.temporal_reachable)).to.eql(String(\"True\")));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Public, uncredentialed probes. A dependency check must not require a token."
+    },
+    {
+      "id": "581a28e3-4b8a-4a50-b3b1-fada3c6b6224",
+      "name": "2. Authentication & Identity",
+      "item": [
+        {
+          "id": "96ee5a22-44c1-4a8a-8ceb-7a711597c0b6",
+          "name": "0. Set run identity (pre-request only)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/users/health",
+            "description": "Run this first. The collection-level Pre-request Script stamps a unique `tag` collection variable the first time any request fires, so register/login below never collide with a previous run's emails/phones -- same reason smoke-test.sh tags every identity with `smoke$(date +%s)$$`."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "42bf94f2-32b7-4979-8000-2e7333ebed5f",
+          "name": "Register Restaurant Owner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Restaurant Owner\",\"phone\":\"{{owner_phone}}\",\"role\":\"restaurant_admin\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"owner_id\", pm.response.json().body.id);",
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"restaurant_admin\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0f14f88d-b114-45ac-ba8a-fb3bfc4ea1c9",
+          "name": "Register Customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{cust_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Customer\",\"phone\":\"{{cust_phone}}\",\"role\":\"customer\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"cust_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a70d02e3-3a4c-4287-a896-b0c225dea057",
+          "name": "Register Second Customer (Other)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{other_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Second Customer (Other)\",\"phone\":\"{{other_phone}}\",\"role\":\"customer\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"other_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "30b610ee-7f12-46e5-a0ed-bd11b8b2e35f",
+          "name": "Register Rider",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{rider_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Rider\",\"phone\":\"{{rider_phone}}\",\"role\":\"rider\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider_user_id\", pm.response.json().body.id);",
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"rider\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "1ff4d482-fc03-4ab2-b6dc-4dbe7bcd8547",
+          "name": "Register Second Rider",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{rider2_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Second Rider\",\"phone\":\"{{rider2_phone}}\",\"role\":\"rider\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider2_user_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a60f71c8-972e-4a2b-bbde-3d4b680d100e",
+          "name": "Register System Admin",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{admin_email}}\",\"password\":\"{{password}}\",\"full_name\":\"System Admin\",\"phone\":\"{{admin_phone}}\",\"role\":\"system_admin\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"admin_id\", pm.response.json().body.id);",
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"system_admin\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3e393ada-2232-45e6-9cde-45bc91faca13",
+          "name": "Register Second Restaurant Owner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner2_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Second Restaurant Owner\",\"phone\":\"{{owner2_phone}}\",\"role\":\"restaurant_admin\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"owner2_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "f68d411b-789f-4264-8532-45aaf9338af3",
+          "name": "Register: unknown role -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"badrole_{{tag}}@example.com\",\"password\":\"{{password}}\",\"full_name\":\"Bad Role\",\"phone\":\"+1777{{$randomInt}}{{$timestamp}}\",\"role\":\"wizard\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "e80b4300-4ee9-4a82-b6de-230f50152b52",
+          "name": "Register: duplicate email -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner_email}}\",\"password\":\"{{password}}\",\"full_name\":\"Dup Email\",\"phone\":\"+1888{{$randomInt}}{{$timestamp}}\",\"role\":\"customer\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ea0bfccb-a339-428a-9614-82232e41318a",
+          "name": "Register: duplicate phone -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "description": "Depends on 'Register Restaurant Owner' having run earlier in this session so {{owner_phone}} is populated.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"dupphone_{{tag}}@example.com\",\"password\":\"{{password}}\",\"full_name\":\"Dup Phone\",\"phone\":\"{{owner_phone}}\",\"role\":\"customer\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0a3bb1c7-5b73-4b88-9fd4-c47c1689eba8",
+          "name": "Register: short password -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/register",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"shortpw_{{tag}}@example.com\",\"password\":\"abc\",\"full_name\":\"Short Pass\",\"phone\":\"+1999{{$randomInt}}{{$timestamp}}\",\"role\":\"customer\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0758e32d-f43e-44be-82a1-511e04ff4bd0",
+          "name": "Login Owner",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"owner_token\", pm.response.json().body.access_token);",
+                  "pm.test(\"token type is bearer\", () => pm.expect(String(pm.response.json().body.token_type)).to.eql(String(\"bearer\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "17f5cbcb-5bf4-4e05-8855-141cc408eaee",
+          "name": "Login Customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{cust_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"cust_token\", pm.response.json().body.access_token);",
+                  "pm.collectionVariables.set(\"cust_refresh\", pm.response.json().body.refresh_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "bed897e7-1bbd-4640-94fc-0a57bd43826a",
+          "name": "Login Other Customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{other_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"other_token\", pm.response.json().body.access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "7e2258a9-84d1-44e0-8d1b-84cafaed256f",
+          "name": "Login Rider",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{rider_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider_token\", pm.response.json().body.access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8cf78090-9734-4144-8af9-b945e22bf02d",
+          "name": "Login Second Rider",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{rider2_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider2_token\", pm.response.json().body.access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "09f0e027-dbc5-4e8f-a1fd-943e57a234bd",
+          "name": "Login Admin",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{admin_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"admin_token\", pm.response.json().body.access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5aa0b0b9-f1e6-457f-9edf-b45f36d1ce02",
+          "name": "Login Owner2",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner2_email}}\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"owner2_token\", pm.response.json().body.access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "08483702-d4bf-4028-ad28-cdcad42a9bae",
+          "name": "Login: wrong password -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"{{owner_email}}\",\"password\":\"WrongPassword!\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"wrong_pass_msg\", pm.response.json().message || \"\");"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "604919d6-90b1-449b-bdbe-9cc7f2c5919d",
+          "name": "Login: unknown email -> 401 (no user enumeration)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/login",
+            "description": "Run after 'Login: wrong password -> 401' -- both must return the identical message.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"email\":\"nobody_{{tag}}@example.com\",\"password\":\"{{password}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"same error message as a wrong password (no user enumeration)\", () => { pm.expect(pm.response.json().message || \"\").to.eql(pm.collectionVariables.get(\"wrong_pass_msg\")); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d8fd7923-14da-4f66-a153-3d6cb53fd7e0",
+          "name": "Token: no token -> 401",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/users/{{owner_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "036c6d0d-602a-4b16-b0fa-b3f1e902a475",
+          "name": "Token: malformed token -> 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer not-a-real-token"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/{{owner_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4648e1f3-c4f9-4b3a-98d0-fb5391b5b5cd",
+          "name": "Token: tampered signature -> 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}tampered"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/{{owner_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a1953d99-15c2-41cc-a77f-d521de358b4f",
+          "name": "Fetch own profile",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/{{owner_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"returned the same user\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{owner_id}}\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "fd2223c5-5478-42f1-8772-2755d02b6feb",
+          "name": "Reading another user's profile -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/{{cust_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "bbcecc4c-bc19-46e1-b644-9c6ba01c8ecc",
+          "name": "Someone else's user id -> 403 (not 404, on purpose)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/00000000-0000-0000-0000-000000000000",
+            "description": "Ownership check runs before the lookup, so a stranger's id and a nonexistent id are indistinguishable from outside -- deliberate."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "89e9517d-0ffc-4521-a687-82ea6b83db2d",
+          "name": "Session: refresh returns a rotated pair",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/refresh",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"refresh_token\":\"{{cust_refresh}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rotated_refresh\", pm.response.json().body.refresh_token);",
+                  "pm.collectionVariables.set(\"rotated_access\", pm.response.json().body.access_token);",
+                  "pm.test(\"refresh token was rotated\", () => pm.expect(pm.response.json().body.refresh_token).to.not.eql(pm.collectionVariables.get(\"cust_refresh\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "6ce9b0d4-9e5f-4bc5-8fbc-52da3de7a248",
+          "name": "Session: the consumed refresh token is dead -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/refresh",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"refresh_token\":\"{{cust_refresh}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "51f21266-6578-4bf0-b194-b7d03645963a",
+          "name": "Session: the rotated access token works",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rotated_access}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/{{cust_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5affb7e9-badb-42f9-b80b-b3d356ee6779",
+          "name": "Session: logout",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rotated_access}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/logout",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"refresh_token\":\"{{rotated_refresh}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "be72a424-0211-4daf-87b5-1877dfffedaf",
+          "name": "Session: refreshing after logout -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/refresh",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"refresh_token\":\"{{rotated_refresh}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "38bbb1cf-44f3-483f-ab16-1ef4bc51aef5",
+          "name": "Session: logout without a bearer token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/users/logout",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"refresh_token\":\"{{rotated_refresh}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Run top to bottom once per collection run -- later folders depend on the tokens and ids captured here. Re-running from the top is always safe: every identity is tagged with a fresh {{tag}} so unique constraints never collide."
+    },
+    {
+      "id": "07a93944-3b60-478c-b044-eb2ccc28e94e",
+      "name": "3. Restaurant Service",
+      "item": [
+        {
+          "id": "6a042419-ddea-4007-bcac-82a3badad46f",
+          "name": "Onboard restaurant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Smoke Diner\",\"address\":\"12 Test Street\",\"latitude\":{{rest_lat}},\"longitude\":{{rest_lon}},\"capacity\":40}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rest_id\", pm.response.json().body.id);",
+                  "pm.test(\"defaults to active\", () => pm.expect(String(pm.response.json().body.is_active)).to.eql(String(\"True\")));",
+                  "pm.test(\"owner taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.owner_id)).to.eql(String(\"{{owner_id}}\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8af4b4a6-6eeb-4ba8-9ea8-b060c972e49a",
+          "name": "Onboard a one-slot restaurant (for the capacity folder)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"One Slot Diner\",\"address\":\"1 Tight Street\",\"latitude\":{{rest_lat}},\"longitude\":{{rest_lon}},\"capacity\":1}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"tight_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c4d69bfa-9d67-463d-a362-21b3b5302722",
+          "name": "Fetch restaurant by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/{{rest_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a00e3361-1180-4ce8-ad01-25033915a950",
+          "name": "Customer cannot onboard a restaurant -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Customer Diner\",\"address\":\"2 Nowhere Road\",\"latitude\":10,\"longitude\":10,\"capacity\":5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "43983845-e87b-422c-b877-f9387b6bdac2",
+          "name": "Latitude out of range -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Bad Coords\",\"address\":\"3 Nowhere Road\",\"latitude\":999,\"longitude\":10,\"capacity\":5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "add4950b-1898-45fc-8f30-591632e357e2",
+          "name": "Capacity must be positive -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"Zero Cap\",\"address\":\"4 Nowhere Road\",\"latitude\":10,\"longitude\":10,\"capacity\":0}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "f32d0e76-e029-45b8-a0e7-d0c9db29fdb1",
+          "name": "Unknown restaurant id -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/00000000-0000-0000-0000-000000000000"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "55c49ee7-205f-4b52-8a22-59c17c71ce8e",
+      "name": "4. Menu Service",
+      "item": [
+        {
+          "id": "f9c7b68f-f4da-4150-bad5-f0145a3e63e4",
+          "name": "Publish menu",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a13296ab-2424-4da0-b163-07d611325708",
+          "name": "Publish menu for the one-slot restaurant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{tight_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "41408076-54e2-42ec-b4e8-e7fd3c0eadea",
+          "name": "Fetch published menu",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus/{{rest_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3b2848a3-cdf1-4608-b2f0-c3ae04989f6f",
+          "name": "Customer cannot publish a menu -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2d019f84-5b1b-43e6-a3f2-29407afa6a03",
+          "name": "Menu for unknown restaurant -> 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"00000000-0000-0000-0000-000000000000\",\"categories\":[]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "306bd968-3121-472f-993f-ce4292315e02",
+          "name": "min_selection > max_selection -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c\",\"category_name\":\"C\",\"items\":[{\"item_id\":\"i\",\"name\":\"I\",\"description\":\"d\",\"base_price\":1.0,\"customization_groups\":[{\"group_id\":\"g\",\"group_name\":\"G\",\"min_selection\":3,\"max_selection\":1,\"options\":[{\"name\":\"a\"}]}]}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "9807ce95-3143-45fa-93e7-cad19bc844cc",
+          "name": "No menu published -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus/11111111-1111-1111-1111-111111111111"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "8a003d54-758a-4eec-b8e5-9c6b0f04ffc5",
+      "name": "5. Order Service -- Core",
+      "item": [
+        {
+          "id": "71a443ae-b055-41a3-b9b6-c99821a503e9",
+          "name": "Create order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"order_id\", pm.response.json().body.id);",
+                  "pm.test(\"customer taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.customer_id)).to.eql(String(\"{{cust_id}}\")));",
+                  "pm.test(\"server-recalculated unit price\", () => pm.expect(String(pm.response.json().body.items[0].unit_price)).to.eql(String(13.5)));",
+                  "pm.test(\"server-recalculated total\", () => pm.expect(String(pm.response.json().body.total_amount)).to.eql(String(27.0)));",
+                  "pm.test(\"initial status is 'created' (INSERT ... RETURNING; the saga advances it after)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(String(\"created\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b185b851-55fa-45b5-86e7-9379db6ba2ce",
+          "name": "Replay same idempotency key -> 200, same order (no duplicate)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"replay returned the SAME order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5b0d95e4-f9fa-4b04-a5e0-d17655624026",
+          "name": "Fetch order by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"returned the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a2191db0-ae7d-4373-8fa6-874bb0853264",
+          "name": "Restaurant owner cannot place an order -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-ownerorder"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "19302e3c-9cb7-4415-880c-a2fcd11cb320",
+          "name": "Reading another customer's order -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a10a3200-2da5-4522-ba56-6d4da02e9e38",
+          "name": "Edge: missing idempotency key -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2b94e6dc-72f4-4ff6-b602-30bbff54950e",
+          "name": "Edge: total_amount mismatch -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-mismatch"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"cheddar\"}}],\"total_amount\":1.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "19eefdde-c426-4596-bf6b-716e5e38b896",
+          "name": "Edge: unavailable item -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-soldout"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}],\"total_amount\":5.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0bee8d9e-c6a2-4b54-943e-f250521e6cd6",
+          "name": "Edge: item not on menu -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-unknown"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"nope\",\"quantity\":1}],\"total_amount\":5.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "286ad761-3b7f-45c9-8662-6f59ce9e654d",
+          "name": "Edge: unknown customization group -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-badgroup"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"ghost\":\"x\"}}],\"total_amount\":10.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "00cfd64e-f186-4b03-8bad-575a4e8ccf54",
+          "name": "Edge: option not offered -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-badoption"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}],\"total_amount\":10.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "393d56a0-35bd-412e-8bfb-16d3a12d84b2",
+          "name": "Edge: required group omitted -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-missinggrp"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}],\"total_amount\":10.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "1ec89b1d-ff44-4fb8-9a25-41edcfb10d36",
+          "name": "Edge: too many selections -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-toomany"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}],\"total_amount\":11.50}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0a93a6e6-4a73-4fd9-ba54-fda24fbcc29e",
+          "name": "Edge: restaurant has no menu -> 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-nomenu"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ed9ee12c-e808-4896-8fe2-f4b70a92b8d6",
+          "name": "Edge: empty item list -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-empty"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[],\"total_amount\":10.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "71edfcd4-9439-4199-9fe0-284d289a24c6",
+          "name": "Edge: option object form is accepted -> 201",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-dictform"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}],\"total_amount\":11.50}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"second_order_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "427f0c9e-dd0b-4709-bd35-699627cf6744",
+          "name": "Edge: unknown order id -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/00000000-0000-0000-0000-000000000000"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a98de4c8-d5c6-45cb-b7c1-d6c109f6a950",
+          "name": "Internal: order read serves the saga (needs X-Internal-Key)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/internal",
+            "description": "Set {{internal_api_key}} in the environment from your own .env's INTERNAL_API_KEY (see README's Environment file section) -- this route has no bearer-token path at all."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"same authoritative total as the bearer path\", () => pm.expect(String(pm.response.json().body.total_amount)).to.eql(String(27.0)));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "32246029-c1e8-4050-bab0-a08a2a8aff63",
+          "name": "Internal: order read without the key -> 401",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/internal"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4a0e8226-5c35-4e8f-b095-eda028bf8b3c",
+          "name": "Audit log rejects an end-user token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/logs",
+            "description": "A customer holding a bearer token must not be able to write their own order's audit trail.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"status\":\"confirmed\",\"service\":\"postman\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "da89abd1-e700-4114-b037-743aa8f082e3",
+          "name": "Audit log appends a transition -> 201 (internal)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/logs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"status\":\"confirmed\",\"service\":\"postman\",\"raw_log\":\"{}\",\"updated_by\":\"tester\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "dfd9e5e1-6025-4c3e-8d03-5fb310491814",
+          "name": "Audit log: unknown order -> 422 (internal)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/logs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"00000000-0000-0000-0000-000000000000\",\"status\":\"confirmed\",\"service\":\"postman\",\"raw_log\":\"{}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "72c21004-64b2-4607-8c97-9e0e2ba59c2d",
+          "name": "Audit log: status the enum does not define -> 422 (internal)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/logs",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"status\":\"teleported\",\"service\":\"postman\",\"raw_log\":\"{}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "51bc4fd0-3bb7-40d3-b368-7e0a7a5ae965",
+          "name": "Read the order's tracking timeline",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/logs"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"trail opens with the checkout transition\", () => pm.expect(pm.response.json().body[0].status).to.eql(\"created\"));",
+                  "pm.test(\"the first entry has no predecessor\", () => pm.expect(pm.response.json().body[0].previous_status).to.be.null);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c8043c50-c0d7-4f1e-a255-d96cb497840d",
+          "name": "Another customer cannot read the timeline -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/logs"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d577bec7-2d5f-45fb-8472-44bbcec5f4dd",
+          "name": "Timeline for an unknown order -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/00000000-0000-0000-0000-000000000000/logs"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "'Create order' must run before every other request in this folder; several rows populate {{order_id}} / {{second_order_id}} that later folders (Payment, Saga) depend on."
+    },
+    {
+      "id": "2871b8a1-7225-4a0e-9d14-86f44f63ba41",
+      "name": "6. Order Saga -- Fleet Setup & Internal Boundaries",
+      "item": [
+        {
+          "id": "f6a8bec4-fe40-4dcb-91e7-99852cb013c8",
+          "name": "Rider registers a profile",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"vehicle_type\":\"motorbike\",\"vehicle_number\":\"PM-{{$randomInt}}{{$timestamp}}\",\"current_latitude\":{{rest_lat}},\"current_longitude\":{{rest_lon}}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider_id\", pm.response.json().body.id);",
+                  "pm.test(\"rider taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.user_id)).to.eql(String(\"{{rider_user_id}}\")));",
+                  "pm.test(\"rider starts available\", () => pm.expect(String(pm.response.json().body.is_available)).to.eql(String(\"True\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c52ac9d8-e82e-4ca6-af7f-0fcfc5d76cd3",
+          "name": "Second rider registers",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider2_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"vehicle_type\":\"bicycle\",\"vehicle_number\":\"PM2-{{$randomInt}}{{$timestamp}}\",\"current_latitude\":{{rest_lat}},\"current_longitude\":{{rest_lon}}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rider2_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8a5507f5-5d2b-4733-bd6d-8bed7a6706a2",
+          "name": "A customer cannot join the fleet -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"vehicle_type\":\"car\",\"vehicle_number\":\"NOPE-{{$randomInt}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "6ff7762a-c2b5-4cc2-bbcb-df09f4b9b38d",
+          "name": "The same account cannot register twice -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"vehicle_type\":\"van\",\"vehicle_number\":\"DUPE-{{$randomInt}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0e46b1ee-d277-43d3-be68-cf050da6e916",
+          "name": "Rider reports a location",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me/location",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"current_latitude\":{{rest_lat}},\"current_longitude\":{{rest_lon}}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5d38cf71-9ae7-4675-9ec1-86eaee293c15",
+          "name": "Rider reads own profile",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2bf1b054-dfd5-4405-b9d7-7cdb6a043da2",
+          "name": "Dispatch without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/dispatch",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"restaurant_latitude\":{{rest_lat}},\"restaurant_longitude\":{{rest_lon}}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "aea10125-f7f4-46c5-adac-29c82a5f3e07",
+          "name": "Dispatch with a customer token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/dispatch",
+            "description": "The saga's dispatch endpoint is not reachable with ANY user token, however privileged.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"restaurant_latitude\":{{rest_lat}},\"restaurant_longitude\":{{rest_lon}}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2c445b85-5018-400e-96e6-5284d21d5061",
+          "name": "Release without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/release",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b87c36b5-e730-4daf-9420-5ad6428b9587",
+          "name": "Refund without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments/refund",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "46911d4e-2f14-4d2e-8250-230c53362ebd",
+          "name": "Authorize without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments/authorize",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"amount\":\"27.00\",\"idempotency_key\":\"nope\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4a433b39-5989-4818-8795-30f572f061f9",
+          "name": "Signal relay without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/signals",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"signal\":\"rider_pickup\",\"payload\":{}}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c667f8a0-8219-49e9-9e5d-ff21ee3d3904",
+          "name": "Deciding an order with no token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4852440f-98e4-4e97-914d-08dc1a39f47c",
+          "name": "A customer cannot accept an order -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5d0f56f6-949e-451d-83f9-2ea2d6375ea0",
+          "name": "A rider cannot accept an order -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d7f670fb-5269-42cc-be17-ff4c44d59f01",
+          "name": "The kitchen queue needs the admin role -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/kitchen/{{rest_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "dca062c0-3998-4a14-a448-fbb435384116",
+          "name": "Deciding an order that does not exist -> 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/00000000-0000-0000-0000-000000000000/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Registers the two-rider fleet dispatch will pick from, and proves every saga-internal endpoint (dispatch/release/authorize/refund/signals) refuses every user token, however privileged -- 'the workflow may do this' must never become 'anyone may do this'."
+    },
+    {
+      "id": "4f809548-af9c-449c-9c91-59f567d25098",
+      "name": "7. Order Saga -- Happy Path to 'delivered'",
+      "item": [
+        {
+          "id": "40ce61c6-2344-4c85-b517-076c27990378",
+          "name": "Poll: order reaches 'confirmed'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 30 times until the order reaches 'confirmed', mirroring smoke-test.sh's poll_status(). Runs after checkout; the saga authorises payment and confirms before the kitchen can act on it."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_order_reaches_'confirmed'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"confirmed\") {",
+                  "  pm.test(\"order reached 'confirmed'\", () => pm.expect(status).to.eql(\"confirmed\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Kitchen queue shows the order\");",
+                  "} else if (tries >= 30) {",
+                  "  pm.test(\"order reached 'confirmed' within 30 polls\", () => pm.expect(status).to.eql(\"confirmed\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Kitchen queue shows the order\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: order reaches 'confirmed'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "7f9aab4e-dbc5-4e3c-806d-1176a6cf6f7a",
+          "name": "Kitchen queue shows the order",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/kitchen/{{rest_id}}",
+            "description": "The kitchen projection is deliberately narrower than the full order -- moving the queue onto `orders` must not widen what a restaurant can see about a customer's order."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"the order awaiting a decision is this one\", () => pm.expect(String(pm.response.json().body[0].id)).to.eql(String(\"{{order_id}}\")));",
+                  "pm.test(\"the kitchen is not shown what was paid\", () => pm.expect(pm.response.json().body[0]).to.not.have.property(\"total_amount\"));",
+                  "pm.test(\"nor who ordered it\", () => pm.expect(pm.response.json().body[0]).to.not.have.property(\"customer_id\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8316a873-1795-49ae-9c9c-8839c13f7b44",
+          "name": "A system_admin reads a kitchen queue for a restaurant they do not own -> 200",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/kitchen/{{rest_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b462fc82-713b-4dfb-961a-dc59f35a4f5f",
+          "name": "A restaurant_admin who does not own this restaurant is refused -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner2_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/kitchen/{{rest_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c30ce256-ad3a-4d9b-964e-51ee417aefa9",
+          "name": "A system_admin may republish a menu for a restaurant they do not own -> 200",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c2613983-cfd7-4d34-a3e4-cca12024da3c",
+          "name": "A restaurant_admin who does not own this restaurant cannot publish its menu -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner2_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "07d21522-5101-4734-9aa8-54617f7bc6f7",
+          "name": "Kitchen accepts the order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"decision recorded as accepted\", () => pm.expect(String(pm.response.json().body.decision)).to.eql(String(\"accepted\")));",
+                  "pm.test(\"and it actually changed something\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(String(\"True\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4107abb6-b42d-4a46-98e9-8b6718b5a948",
+          "name": "Accepting twice does not signal the saga again",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/accept"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"second accept is a no-op\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(String(\"False\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "66f013ea-a006-4ea9-b16f-01c3e9e25e5d",
+          "name": "Poll: order reaches 'assigned'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 40 times until the order reaches 'assigned', mirroring smoke-test.sh's poll_status(). Acceptance releases the saga to find a rider; dispatch picks by proximity, and both seeded riders are equidistant, so which one wins is not fixed -- the on-success script resolves {{carrier_token}} to whichever one actually got it."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_order_reaches_'assigned'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"assigned\") {",
+                  "  pm.test(\"order reached 'assigned'\", () => pm.expect(status).to.eql(\"assigned\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  const assigned = rbody.rider_id || \"\";",
+                  "  pm.collectionVariables.set(\"assigned_rider\", assigned);",
+                  "  if (assigned && assigned === pm.collectionVariables.get(\"rider_id\")) {",
+                  "    pm.collectionVariables.set(\"carrier_token\", pm.collectionVariables.get(\"rider_token\"));",
+                  "    pm.collectionVariables.set(\"other_carrier_token\", pm.collectionVariables.get(\"rider2_token\"));",
+                  "  } else {",
+                  "    pm.collectionVariables.set(\"carrier_token\", pm.collectionVariables.get(\"rider2_token\"));",
+                  "    pm.collectionVariables.set(\"other_carrier_token\", pm.collectionVariables.get(\"rider_token\"));",
+                  "  }",
+                  "  postman.setNextRequest(\"The other rider cannot report this delivery -> 403\");",
+                  "} else if (tries >= 40) {",
+                  "  pm.test(\"order reached 'assigned' within 40 polls\", () => pm.expect(status).to.eql(\"assigned\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"The other rider cannot report this delivery -> 403\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: order reaches 'assigned'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "207e54e2-06aa-4007-b0c8-4aacf7345023",
+          "name": "The other rider cannot report this delivery -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_carrier_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me/orders/{{order_id}}/picked-up"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "737a2cba-ef9a-4940-982c-8c3283034367",
+          "name": "A rider cannot go off shift mid-order -> 409",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{carrier_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me/availability",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"is_available\":true}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "245bb5d0-4a32-4530-a07e-6d681ec20cce",
+          "name": "Rider reports the pickup",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{carrier_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me/orders/{{order_id}}/picked-up"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a5ffe94c-76e8-4a0f-bb1c-6962a8376bfb",
+          "name": "Poll: order reaches 'picked_up'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 30 times until the order reaches 'picked_up', mirroring smoke-test.sh's poll_status(). "
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_order_reaches_'picked_up'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"picked_up\") {",
+                  "  pm.test(\"order reached 'picked_up'\", () => pm.expect(status).to.eql(\"picked_up\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"The pickup report is durable\");",
+                  "} else if (tries >= 30) {",
+                  "  pm.test(\"order reached 'picked_up' within 30 polls\", () => pm.expect(status).to.eql(\"picked_up\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"The pickup report is durable\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: order reaches 'picked_up'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "f8073f86-76e1-42a7-a348-8eeedfd362d2",
+          "name": "The pickup report is durable",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/internal",
+            "description": "D43: the rider's report is a durable column on `orders`, not only a Temporal signal -- this is what the saga's own recovery activity reads if the signal itself is lost."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"rider_reported_stage reads 'picked_up'\", () => pm.expect(String(pm.response.json().body.rider_reported_stage)).to.eql(String(\"picked_up\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3e01a2d1-226c-4886-b9e1-96484108b646",
+          "name": "Rider reports the delivery",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{carrier_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/me/orders/{{order_id}}/delivered"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5ef1a635-ab0a-4ce1-8ebe-e76d961cef6e",
+          "name": "Poll: order reaches 'delivered'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 40 times until the order reaches 'delivered', mirroring smoke-test.sh's poll_status(). "
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_order_reaches_'delivered'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"delivered\") {",
+                  "  pm.test(\"order reached 'delivered'\", () => pm.expect(status).to.eql(\"delivered\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"The delivery report is durable\");",
+                  "} else if (tries >= 40) {",
+                  "  pm.test(\"order reached 'delivered' within 40 polls\", () => pm.expect(status).to.eql(\"delivered\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"The delivery report is durable\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: order reaches 'delivered'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b481e464-84bf-4f64-b490-4630b5c2a4a4",
+          "name": "The delivery report is durable",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Internal-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/internal"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"rider_reported_stage reads 'delivered'\", () => pm.expect(String(pm.response.json().body.rider_reported_stage)).to.eql(String(\"delivered\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3abfa94b-d7af-4842-af3e-4c9ad99dc11c",
+          "name": "The trail records the full lifecycle",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/logs",
+            "description": "Collapses consecutive duplicate entries the same way smoke-test.sh does, so the extra 'confirmed' the manual audit-log entry above wrote doesn't break the comparison."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"created -> confirmed -> assigned -> picked_up -> delivered\", () => { const entries = pm.response.json().body; const seq = []; let last = null; entries.forEach(e => { if (e.status !== last) { seq.push(e.status); last = e.status; } }); pm.expect(seq).to.eql([\"created\", \"confirmed\", \"assigned\", \"picked_up\", \"delivered\"]);});"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Contains self-looping poll requests -- run this folder with the Collection Runner (not one-by-one Send), with a ~2000ms delay between requests. Depends on folders 2, 3, 5 and 6 having already run in this session."
+    },
+    {
+      "id": "3313311a-7516-43bd-8f68-20ac1cc38386",
+      "name": "8. Order Saga -- Compensation on Rejection",
+      "item": [
+        {
+          "id": "7150eca8-811a-48d7-af5c-668a06485713",
+          "name": "Place an order to be rejected",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-idem-rej"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"rej_order_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "9610e98a-3e7e-4531-853d-af0f05fd833a",
+          "name": "Poll: rejected-order reaches 'confirmed'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{rej_order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 30 times until the order reaches 'confirmed', mirroring smoke-test.sh's poll_status(). "
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_rejected-order_reaches_'confirmed'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"confirmed\") {",
+                  "  pm.test(\"order reached 'confirmed'\", () => pm.expect(status).to.eql(\"confirmed\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Kitchen rejects the order\");",
+                  "} else if (tries >= 30) {",
+                  "  pm.test(\"order reached 'confirmed' within 30 polls\", () => pm.expect(status).to.eql(\"confirmed\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Kitchen rejects the order\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: rejected-order reaches 'confirmed'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "edb51438-f3ea-4aa6-a90b-7867816b6672",
+          "name": "Kitchen rejects the order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{rej_order_id}}/reject"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"decision recorded as rejected\", () => pm.expect(String(pm.response.json().body.decision)).to.eql(String(\"rejected\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "098f54b1-f73e-4a18-9282-7611ad7dc438",
+          "name": "Poll: rejected-order reaches 'cancelled'",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{rej_order_id}}",
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 40 times until the order reaches 'cancelled', mirroring smoke-test.sh's poll_status(). The refund and the capacity slot's release both happen as side effects of this compensation; verifying the refund itself needs the payment database, which is out of reach from Postman alone -- see scripts/smoke-test.sh's docker_payment_row()."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = \"poll_tries_Poll:_rejected-order_reaches_'cancelled'\";",
+                  "const n = parseInt(pm.collectionVariables.get(key) || \"0\", 10);",
+                  "pm.collectionVariables.set(key, String(n + 1));",
+                  "pm.variables.set(\"__poll_key\", key);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const key = pm.variables.get(\"__poll_key\");",
+                  "const tries = parseInt(pm.collectionVariables.get(key) || \"1\", 10);",
+                  "let status = \"\", rbody = {};",
+                  "try { rbody = pm.response.json().body; status = rbody.status; } catch (e) {}",
+                  "pm.collectionVariables.set(\"last_order_status\", status);",
+                  "if (status === \"cancelled\") {",
+                  "  pm.test(\"order reached 'cancelled'\", () => pm.expect(status).to.eql(\"cancelled\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Re-rejecting an already-decided order is a no-op\");",
+                  "} else if (tries >= 40) {",
+                  "  pm.test(\"order reached 'cancelled' within 40 polls\", () => pm.expect(status).to.eql(\"cancelled\"));",
+                  "  pm.collectionVariables.set(key, \"0\");",
+                  "  postman.setNextRequest(\"Re-rejecting an already-decided order is a no-op\");",
+                  "} else {",
+                  "  postman.setNextRequest(\"Poll: rejected-order reaches 'cancelled'\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "1e6c0d1c-f4e1-4774-aff6-9f300401e8db",
+          "name": "Re-rejecting an already-decided order is a no-op",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{rej_order_id}}/reject"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"decision unchanged\", () => pm.expect(String(pm.response.json().body.decision)).to.eql(String(\"rejected\")));"
+                ]
+              }
+            }
+          ]
+        }
+      ],
+      "description": "Also a Collection Runner folder (self-looping polls). The no-rider-available and at-capacity compensation paths in scripts/smoke-test.sh aren't reproduced here -- both need direct database manipulation (grounding the whole fleet, racing two orders) that isn't reachable through the HTTP API at all."
+    },
+    {
+      "id": "4a832965-e59e-4811-ad7a-de5b4e0aef60",
+      "name": "9. Payment Service",
+      "item": [
+        {
+          "id": "5f34328b-545a-490b-a4bb-49e42a3f30e6",
+          "name": "Client payment for a saga-owned order -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "description": "Since D30 the saga owns authorisation -- a client POST here would race the workflow and lose on UNIQUE(order_id).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"amount\":27.00,\"idempotency_key\":\"{{tag}}-pay\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "11e21539-46bd-4cd5-84f2-6b75ba115629",
+          "name": "Missing idempotency header -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"amount\":27.00,\"idempotency_key\":\"{{tag}}-pay2\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "914618a9-5243-4521-9e9f-b33e7098865c",
+          "name": "Header disagrees with body -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay-other"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"amount\":27.00,\"idempotency_key\":\"{{tag}}-pay2\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "cfeaa717-9d7d-44ab-845c-82655ce57143",
+          "name": "Unknown order -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay-badorder"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"44444444-4444-4444-4444-444444444444\",\"amount\":27.00,\"idempotency_key\":\"{{tag}}-pay-badorder\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "58463618-87c5-44c9-b73d-d5bc51d1da40",
+          "name": "Amount does not settle the order -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay-short"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{second_order_id}}\",\"amount\":1.00,\"idempotency_key\":\"{{tag}}-pay-short\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "6d62bf84-6fd2-4d06-9fb7-c72548999ab3",
+          "name": "Non-positive amount -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay-zero"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{second_order_id}}\",\"amount\":0,\"idempotency_key\":\"{{tag}}-pay-zero\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d82bc57e-8fc1-498c-9d13-8f1f6daca06f",
+          "name": "Second payment for a paid order -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-pay-again"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"amount\":27.00,\"idempotency_key\":\"{{tag}}-pay-again\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "565b0dbb-11d4-439d-a24f-7592fc99ba68",
+          "name": "Unknown payment id -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments/00000000-0000-0000-0000-000000000000"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d9635951-a3c4-49ec-b8d2-646a28d04d4c",
+          "name": "Get payment by id (fill {{payment_id}} manually)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/payments/{{payment_id}}",
+            "description": "The customer never learns the payment id from any API response -- the saga creates the payment, not the client. scripts/smoke-test.sh reads it straight out of sfo_payment_core; from Postman, either read it from the DB the same way, or copy it out of a Jaeger trace / the order.payment.authorized Kafka event, then set the {{payment_id}} environment variable before running this one."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -16,6 +16,11 @@ from order.schemas.signals import SignalAcceptedResponse, WorkflowSignalRequest
 
 router = APIRouter(prefix="/api/v1/orders", dependencies=[Depends(require_internal)])
 
+# The workflow's signal names, mapped to the durable stage this service records before
+# relaying (Week 3, D46) — `restaurant_decision` is absent here for the same reason the
+# schema's own docstring gives it none: this relay carries rider events only.
+_REPORTED_STAGE = {"rider_pickup": "picked_up", "rider_delivery": "delivered"}
+
 
 @router.post(
     "/{order_id}/signals",
@@ -38,7 +43,17 @@ async def signal_workflow(
 
     `202`, not `200`: a signal is delivered to the workflow, not executed by it. By the time
     this returns the saga has been told, not necessarily acted.
+
+    The stage is recorded here, in this service's own database, *before* the relay —
+    mirroring D27's rule for kitchen tickets exactly: commit the fact first, relay it
+    second, and never roll the fact back if the relay fails. That ordering is what makes
+    the saga's own timeout recovery possible (`read_rider_report_activity`): if this signal
+    never reaches the workflow, the column it wrote is still there to read back.
     """
+    stage = _REPORTED_STAGE.get(payload.signal)
+    if stage is not None:
+        deps.orders.record_rider_report(order_id, stage)
+
     await deps.orchestrator_service.signal(order_id, payload.signal, payload.payload)
     deps.logger.info("Signalled '%s' to the saga for order %s", payload.signal, order_id)
     return ok(

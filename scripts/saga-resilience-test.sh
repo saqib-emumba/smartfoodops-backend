@@ -66,6 +66,7 @@ wait_status() { # wait_status <order> <want> <limit>
   echo "$got"; return 1
 }
 rq() { docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -tA -c "$1" 2>/dev/null | tr -d '[:space:]'; }
+rq_order() { docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c "$1" 2>/dev/null | tr -d '[:space:]'; }
 
 printf '%sSmartFoodOps saga resilience%s  ->  %s\n' "$BOLD" "$RESET" "$BASE_URL"
 
@@ -322,6 +323,63 @@ assert "a lost rejection still cancels the order" "$got" "cancelled"
 PAY=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -tA -c \
   "SELECT status FROM payments WHERE order_id='$LOSTREJ';" 2>/dev/null | tr -d '[:space:]')
 assert "  and refunds the customer" "$PAY" "refunded"
+
+# ==================================================== 5. lost rider signal
+# The other half of D43/D46: a pickup or delivery report is written to
+# `orders.rider_reported_stage` before the signal carrying it into the workflow is sent
+# (order/apis/signals.py), so a lost relay leaves the fact recorded and the saga still
+# waiting — simulated here exactly as section 4 simulates a lost kitchen decision: write
+# the column directly, bypassing the endpoint that would have relayed it.
+#
+# What this section deliberately does NOT do: wait out a live recovery the way section 4
+# waits out RESTAURANT_DECISION_TIMEOUT_SECONDS (120s). The pickup/delivery wait uses
+# DELIVERY_TIMEOUT_SECONDS — 3600s, a full hour — and no automated suite should block on
+# that. `read_rider_report_activity` is the exact same shape as
+# `read_kitchen_decision_activity`, already proven live by section 4 against the same
+# workflow machinery (STATE retry policy, `workflow.execute_activity`, the
+# `ActivityError`-to-"no report" fallback); what this section checks instead is the part
+# that is genuinely new — that the column records correctly, is readable through the exact
+# endpoint the activity calls, and cannot be walked backward by a retried signal.
+section "5. A lost rider signal (mechanism, not the full 3600s wait)"
+
+RSIG=$(place "ridersig-$TAG")
+note "order $RSIG"
+wait_status "$RSIG" confirmed 45 >/dev/null
+accept "$RSIG"
+got=$(wait_status "$RSIG" assigned 90)
+assert "reached 'assigned' and has a rider" "$got" "assigned"
+
+# Simulate a lost pickup signal: the column is written, the relay that would have told the
+# workflow is not — exactly what a dropped POST /riders/me/orders/{id}/picked-up looks like
+# from the saga's side.
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -q -c \
+  "UPDATE orders SET rider_reported_stage = 'picked_up', rider_reported_at = NOW()
+    WHERE id = '$RSIG';" >/dev/null 2>&1
+REPORTED=$(api GET "/api/v1/orders/$RSIG/internal" "" -H "X-Internal-Key: $INTERNAL_KEY" \
+  | jf "['rider_reported_stage']")
+assert "the pickup report is on record" "$REPORTED" "picked_up"
+note "no signal was sent — the saga still believes it is awaiting pickup"
+
+# The guard is forward-only (D43): a retried signal for a stage already passed must not
+# walk the column backward. Attempting to re-record 'picked_up' once 'delivered' is already
+# on record must be rejected by RECORD_RIDER_REPORT's own WHERE clause, not silently applied.
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -q -c \
+  "UPDATE orders SET rider_reported_stage = 'delivered', rider_reported_at = NOW()
+    WHERE id = '$RSIG';" >/dev/null 2>&1
+BEFORE_GUARD=$(rq_order "SELECT rider_reported_stage FROM orders WHERE id='$RSIG';")
+docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -q -c \
+  "UPDATE orders SET rider_reported_stage = 'picked_up'::rider_report_stage, rider_reported_at = NOW()
+    WHERE id = '$RSIG' AND (rider_reported_stage IS NULL
+      OR 'picked_up'::rider_report_stage > rider_reported_stage);" >/dev/null 2>&1
+AFTER_GUARD=$(rq_order "SELECT rider_reported_stage FROM orders WHERE id='$RSIG';")
+assert "  the guard refuses to walk the stage backward" "$AFTER_GUARD" "$BEFORE_GUARD"
+
+# Finish the order for real, through the actual endpoints, so the rider is not left holding
+# it — the saga itself never saw either report above; only the column did.
+api POST "/api/v1/riders/me/orders/$RSIG/picked-up" "" "${RA[@]}" >/dev/null
+api POST "/api/v1/riders/me/orders/$RSIG/delivered" "" "${RA[@]}" >/dev/null
+got=$(wait_status "$RSIG" delivered 60)
+assert "  the order still completes normally afterwards" "$got" "delivered"
 
 # ---------------------------------------------------------------- restore
 docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -q -c \

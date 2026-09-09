@@ -1,0 +1,6 @@
+% Bind-mounted into the container at /etc/rabbitmq/enabled_plugins (Week 3, D42-style
+% declarative config, matching prometheus/prometheus.yml and kafka/init-topics.sh rather
+% than a custom ENTRYPOINT/command override). `rabbitmq_management` ships the UI on 15672;
+% `rabbitmq_prometheus` is what makes the broker itself observable on 15692 — the
+% observability week should not add a component that is itself a blind spot.
+[rabbitmq_management,rabbitmq_prometheus].

@@ -21,8 +21,9 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 115 of the 185
-# checks and leaves fourteen routes COMPLETELY untouched -- every one the saga drives:
+# It is a real reduction in coverage, not just in runtime. --fast asserts 209 of the 328
+# checks (counts as of Week 3's observability and eventing additions) and leaves fourteen
+# routes COMPLETELY untouched -- every one the saga drives:
 #
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
 #   POST   /api/v1/orders/{id}/reject          POST   /api/v1/payments/refund
@@ -771,9 +772,17 @@ expect "rider reports the pickup" 200 POST "/api/v1/riders/me/orders/$ORDER_ID/p
   "" "${CARRIER[@]}"
 poll_status "$ORDER_ID" picked_up 40 "${CUST_AUTH[@]}"
 
+# Week 3 (D43): the report is a durable column, not only a signal — checked directly
+# against the internal endpoint the saga's own recovery activity reads on a timeout.
+expect "the pickup report is durable" 200 GET "/api/v1/orders/$ORDER_ID/internal" "" "${INTERNAL[@]}"
+assert "  rider_reported_stage reads 'picked_up'" "$(jfield "['rider_reported_stage']")" "picked_up"
+
 expect "rider reports the delivery" 200 POST "/api/v1/riders/me/orders/$ORDER_ID/delivered" \
   "" "${CARRIER[@]}"
 poll_status "$ORDER_ID" delivered 40 "${CUST_AUTH[@]}"
+
+expect "the delivery report is durable" 200 GET "/api/v1/orders/$ORDER_ID/internal" "" "${INTERNAL[@]}"
+assert "  rider_reported_stage reads 'delivered'" "$(jfield "['rider_reported_stage']")" "delivered"
 
 # The whole lifecycle, in order, derived rather than asserted by the caller.
 expect "the trail records the full lifecycle" 200 GET "/api/v1/orders/$ORDER_ID/logs" "" "${CUST_AUTH[@]}"
@@ -1035,6 +1044,103 @@ if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/n
   assert "  private key is absent from the Order Service" "${LEAKED:-absent}" "absent"
 else
   printf '  %sSKIP%s  signing-key isolation check (sfo-order-service not reachable)\n' "$DIM" "$RESET"
+fi
+
+# --------------------------------------------------------- observability
+# Prometheus's own JSON, not this platform's D35 envelope — a separate pair of helpers
+# rather than reusing jfield/efield, which assume the envelope shape.
+prom_query() { curl -s -m 5 --data-urlencode "query=$1" http://localhost:9090/api/v1/query 2>/dev/null; }
+prom_value() {
+  prom_query "$1" | python3 -c "
+import json,sys
+try:
+    print(json.load(sys.stdin)['data']['result'][0]['value'][1])
+except Exception:
+    print('')
+" 2>/dev/null
+}
+
+section "Observability (Week 3)"
+
+# /metrics carries Prometheus's own exposition format, not the D35 envelope (D41), and must
+# not be reachable through the gateway — the same posture the platform already takes with
+# the Temporal Web UI: an operator surface, not a public API route.
+expect "metrics is not routed by the gateway" 404 GET /metrics
+
+if curl -sf -m 3 http://localhost:9090/-/healthy >/dev/null 2>&1; then
+  TARGETS_JSON=$(curl -s -m 5 http://localhost:9090/api/v1/targets 2>/dev/null)
+  read -r UP_COUNT TOTAL_COUNT <<<"$(python3 -c "
+import json,sys
+d = json.loads(sys.stdin.read())
+t = d.get('data', {}).get('activeTargets', [])
+print(sum(1 for x in t if x.get('health') == 'up'), len(t))
+" <<<"$TARGETS_JSON" 2>/dev/null)"
+  assert "  every Prometheus scrape target is healthy ($UP_COUNT/$TOTAL_COUNT)" \
+    "$UP_COUNT" "$TOTAL_COUNT"
+
+  # The cardinality guard: the entire reason common/telemetry.py's metrics middleware
+  # labels by the matched ROUTE TEMPLATE rather than request.url.path (the bug the Week 3
+  # blueprint draft made) is to keep this bounded regardless of how many orders the
+  # platform has ever served. A regression back to the raw path would make this number
+  # climb with every order id the suite has ever minted.
+  ROUTE_CARD=$(prom_value 'count(count by (route) (sfo_http_requests_total))')
+  ROUTE_CARD_INT=${ROUTE_CARD%%.*}
+  if [[ -n "$ROUTE_CARD_INT" ]] && (( ROUTE_CARD_INT < 60 )); then
+    ok "  route-template cardinality stays bounded ($ROUTE_CARD_INT distinct routes)"
+  else
+    bad "  route-template cardinality stays bounded" \
+      "got '$ROUTE_CARD' distinct routes, expected < 60 — request.url.path may have leaked into a label"
+  fi
+else
+  printf '  %sSKIP%s  Prometheus checks (localhost:9090 not reachable)\n' "$DIM" "$RESET"
+fi
+
+# ---------------------------------------------------------------- eventing
+section "Eventing (Week 3)"
+
+if have_container sfo-order-db; then
+  # The relay drains on a ~1s cadence; poll briefly rather than assume it has already run
+  # in the instant since the happy-path section above committed its last outbox row.
+  UNPUB=""
+  for _ in $(seq 1 10); do
+    UNPUB=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT count(*) FROM order_outbox WHERE published_at IS NULL;" 2>/dev/null | tr -d '[:space:]')
+    [[ "$UNPUB" == "0" ]] && break
+    sleep 1
+  done
+  assert "the order outbox drains" "$UNPUB" "0"
+else
+  printf '  %sSKIP%s  outbox drain check (docker/sfo-order-db not reachable)\n' "$DIM" "$RESET"
+fi
+
+if have_container sfo-kafka; then
+  PARTITIONS=$(docker exec sfo-kafka kafka-topics --bootstrap-server localhost:9092 \
+    --describe --topic sfo.order.events.v1 2>/dev/null \
+    | grep -o "PartitionCount: [0-9]*" | grep -o "[0-9]*$")
+  assert "the order-events topic has 3 partitions" "$PARTITIONS" "3"
+else
+  printf '  %sSKIP%s  Kafka topic check (docker/sfo-kafka not reachable)\n' "$DIM" "$RESET"
+fi
+
+if curl -sf -m 3 http://localhost:8081/subjects >/dev/null 2>&1; then
+  SUBJECT_COUNT=$(curl -s -m 5 http://localhost:8081/subjects 2>/dev/null \
+    | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null)
+  if [[ -n "$SUBJECT_COUNT" ]] && (( SUBJECT_COUNT > 0 )); then
+    ok "  schema registry has registered subjects ($SUBJECT_COUNT)"
+  else
+    bad "  schema registry has registered subjects" "got '$SUBJECT_COUNT'"
+  fi
+else
+  printf '  %sSKIP%s  Schema Registry check (localhost:8081 not reachable)\n' "$DIM" "$RESET"
+fi
+
+if curl -sf -m 3 http://localhost:9090/-/healthy >/dev/null 2>&1; then
+  PLACED=$(prom_value 'sfo_business_orders_placed_total')
+  if [[ -n "$PLACED" ]]; then
+    ok "  the analytics read-model has processed at least one order.created event (placed=$PLACED)"
+  else
+    printf '  %sSKIP%s  analytics counter check (metric not scraped yet)\n' "$DIM" "$RESET"
+  fi
 fi
 
 # ------------------------------------------------------------- summary

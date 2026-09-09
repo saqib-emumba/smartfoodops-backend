@@ -24,11 +24,13 @@ import os
 from fastapi import FastAPI
 
 from common.responses import install_error_handlers
+from common.telemetry import instrument_app
 from rider import deps
 from rider.apis import delivery, dispatch, health, profile
 
 app = FastAPI(title="SmartFoodOps Rider Service", lifespan=deps.db.lifespan)
 install_error_handlers(app)
+instrument_app(app, deps.SERVICE_NAME)
 
 # `health` first: a literal segment must be registered before any parameterised sibling
 # that could shadow it, and Starlette matches in registration order.

@@ -1,0 +1,13 @@
+-r ../common/requirements.txt
+
+# httpx: resolving contact details against the User Service's internal endpoint.
+httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
+
+# common.kafka's SchemaRegistryValidator (validation) and build_producer (DLQ writes).
+aiokafka==0.14.0
+fastjsonschema==2.22.2
+
+# Celery + its AMQP transport (RabbitMQ) — the base `celery` package includes `kombu`'s
+# amqp transport unconditionally, no extra needed for this broker specifically.
+celery==5.6.3

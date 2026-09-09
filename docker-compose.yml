@@ -1,5 +1,3 @@
-version: '3.8'
-
 networks:
   smartfoodops-network:
     driver: bridge
@@ -13,6 +11,11 @@ volumes:
   rider_postgres_data:
   redis_data:
   temporal_data:
+  prometheus_data:
+  grafana_data:
+  kafka_data:
+  analytics_postgres_data:
+  rabbitmq_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
 # its own credentials, so no service can reach another's tables even by accident.
@@ -45,6 +48,12 @@ x-menu-db-env: &menu-db-env
 # location on every assignment, and a service may not write another service's tables.
 x-rider-db-env: &rider-db-env
   DATABASE_URL: postgresql://sfo_rider_admin:${RIDER_POSTGRES_PASSWORD:?set RIDER_POSTGRES_PASSWORD in the root .env}@db-rider-postgres:5432/sfo_rider_core
+
+# Owns only what a Kafka consumer needs to be correct: dedup and a derived projection
+# (Week 3, D40). No other service ever reads or writes this database — database-per-service
+# holds even for a service whose "facts" are all rebuildable from a topic.
+x-analytics-db-env: &analytics-db-env
+  DATABASE_URL: postgresql://sfo_analytics_admin:${ANALYTICS_POSTGRES_PASSWORD:?set ANALYTICS_POSTGRES_PASSWORD in the root .env}@db-analytics-postgres:5432/sfo_analytics_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -154,6 +163,21 @@ services:
       - rider_postgres_data:/var/lib/postgresql/data
       - ./db/rider/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
+  # Week 3 (D40): the Analytics Service's own database — a dedup table and a projection
+  # derived entirely from Kafka, never a fact any other service's request path depends on.
+  db-analytics-postgres:
+    <<: *postgres-base
+    container_name: sfo-analytics-db
+    environment:
+      POSTGRES_DB: sfo_analytics_core
+      POSTGRES_USER: sfo_analytics_admin
+      POSTGRES_PASSWORD: ${ANALYTICS_POSTGRES_PASSWORD}
+    ports:
+      - "5438:5432" # Maps host 5438 to container 5432
+    volumes:
+      - analytics_postgres_data:/var/lib/postgresql/data
+      - ./db/analytics/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
   cache-redis:
     image: redis:7.0-alpine
     container_name: sfo-redis
@@ -218,6 +242,176 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # --- 1c. OBSERVABILITY (Week 3) ---
+  # Distributed tracing, metrics and dashboards over the stack above. Every container here
+  # is reached only by other containers on smartfoodops-network or by a developer's browser
+  # — none of it sits behind the gateway, the same posture nginx.conf already documents for
+  # the Temporal Web UI: "no auth, so it stays off the gateway".
+
+  # OTLP receiver + trace storage + UI in one container. jaeger:2.x is itself an
+  # OpenTelemetry Collector distribution, so the OTLP ports below are native, not a
+  # compatibility shim — no separate Collector container is needed for this platform's
+  # size (D38-D43 discussion in key-decisions.md).
+  jaeger:
+    image: jaegertracing/jaeger:2.1.0
+    container_name: sfo-jaeger
+    restart: always
+    ports:
+      - "16686:16686" # Web UI
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+    networks:
+      - smartfoodops-network
+
+  # Scrapes every service's /metrics over the network directly — no service publishes its
+  # app port to the host, and none needs to: Compose's embedded DNS resolves e.g.
+  # order-service:8004 for any container on smartfoodops-network, Prometheus included.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: sfo-prometheus
+    restart: always
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - smartfoodops-network
+
+  # Dashboards and the Prometheus data source are provisioned from files under
+  # ./grafana/provisioning, not clicked together, so `docker compose down -v` does not
+  # discard them (D42).
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: sfo-grafana
+    restart: always
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in the root .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - smartfoodops-network
+
+  # --- 1d. EVENTING (Week 3) ---
+  # Kafka carries facts; Temporal still owns every decision (key-decisions.md D38). No
+  # service here is on the order's critical path — checkout and the saga both work with
+  # this whole section stopped, because every producer writes to its own outbox table
+  # first (D39) and a background relay is what reaches Kafka, never the request itself.
+
+  # Single-node KRaft broker — no Zookeeper. `KAFKA_LOG_DIRS` matches the mounted volume
+  # exactly, unlike an early draft of this file that pointed it at the container's writable
+  # layer instead: with that mismatch, `docker compose down`/`up` re-formats a fresh empty
+  # log dir against the same hardcoded CLUSTER_ID and silently drops every topic, offset and
+  # consumer-group position. `KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'` is deliberate too —
+  # topics are created explicitly by kafka-init below, with the partition count the platform
+  # actually needs; auto-create would silently hand out 1 partition instead.
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: sfo-kafka
+    restart: always
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:29093'
+      KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      KAFKA_LOG_DIRS: '/var/lib/kafka/data'
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # Registers the JSON Schema common/events/*.py generates for each event type, and is
+  # consulted on the hot path (producer before send, consumer before deserialize) — not
+  # just at startup — via a version-keyed cache in common/kafka.py. The wire format stays
+  # plain JSON: registering a JSON Schema here does not require the Confluent Avro
+  # serializers, only this REST API.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    container_name: sfo-schema-registry
+    restart: always
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:29092'
+      SCHEMA_REGISTRY_LISTENERS: 'http://0.0.0.0:8081'
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  # One-shot: creates the platform's one topic (and its DLQ) explicitly, at the partition
+  # count per-order ordering depends on (3 — see common/events/topics.py), then exits.
+  # `restart: "no"` — this is a migration step, not a long-running service.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: sfo-kafka-init
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+    volumes:
+      - ./kafka/init-topics.sh:/init-topics.sh:ro
+    entrypoint: ["bash", "/init-topics.sh"]
+
+  # Celery's broker for the Notification Service (Week 3, D45) — the curriculum's mandated
+  # transport, used here purely as a concurrency pool for slow simulated SMS/email I/O.
+  # Kafka is the durable ledger (see notification/__init__.py); RabbitMQ does not need to
+  # be, so no `depends_on` from order/payment-service — nothing on the checkout path ever
+  # touches this broker.
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: sfo-rabbitmq
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+      - "15692:15692" # Prometheus metrics (rabbitmq_prometheus, enabled via enabled_plugins)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - smartfoodops-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
 
   # --- 2. API GATEWAY (NGINX REVERSE PROXY) ---
   api-gateway:
@@ -311,6 +505,11 @@ services:
       # This service starts the saga and relays signals into it, both as HTTP calls into
       # the Orchestrator Service (D36) — it holds no Temporal client of its own any more.
       ORCHESTRATOR_SERVICE_URL: http://orchestrator-service:8007
+      # The outbox relay's target (Week 3, D39). Deliberately no `depends_on: kafka` below:
+      # the relay's own reconnect loop is what handles Kafka not being ready yet, and a
+      # hard startup dependency here would wrongly imply checkout needs Kafka to work.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-order-postgres:
         condition: service_healthy
@@ -330,6 +529,9 @@ services:
     environment:
       <<: [*payment-db-env, *jwt-env]
       ORDER_SERVICE_URL: http://order-service:8004
+      # See order-service's own comment: no depends_on for kafka on purpose (Week 3, D39).
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-payment-postgres:
         condition: service_healthy
@@ -352,6 +554,66 @@ services:
     depends_on:
       db-rider-postgres:
         condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3b. ANALYTICS (Week 3, D40) ---
+  # A Kafka read-model, not a request-path service — no sibling calls, no JWT keys (the
+  # first service in the platform that needs none: it never verifies a token, because
+  # nothing it serves is user-facing). No `depends_on: kafka`, matching order-service's
+  # and payment-service's own comment: the consumer's reconnect loop is what handles Kafka
+  # not being ready yet.
+  analytics-service:
+    build:
+      context: ./services
+      dockerfile: analytics/Dockerfile
+    container_name: sfo-analytics-service
+    restart: always
+    environment:
+      <<: *analytics-db-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    depends_on:
+      db-analytics-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3c. NOTIFICATIONS (Week 3, D45) ---
+  # Two containers, one image — see services/notification/__init__.py for why the split is
+  # what makes the Celery hop real rather than decorative. Neither depends on kafka or
+  # rabbitmq at the compose level: each has its own reconnect loop (the consumer) or is a
+  # pure client of a broker it does not need to be up before packages import (the worker).
+  notification-consumer:
+    build:
+      context: ./services
+      dockerfile: notification/Dockerfile
+    container_name: sfo-notification-consumer
+    restart: always
+    command: ["python", "-m", "notification.consumer"]
+    environment:
+      <<: *jwt-env
+      USER_SERVICE_URL: http://user-service:8001
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      RABBITMQ_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
+    networks:
+      - smartfoodops-network
+
+  # The concurrency pool for the slow simulated dispatch in notification/tasks.py. No
+  # sibling calls, no JWT keys — it never imports common.auth, only notification.tasks —
+  # which is what makes its environment strictly smaller than the consumer's.
+  notification-worker:
+    build:
+      context: ./services
+      dockerfile: notification/Dockerfile
+    container_name: sfo-notification-worker
+    restart: always
+    command: ["celery", "-A", "notification.worker", "worker", "--loglevel=info"]
+    environment:
+      RABBITMQ_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in the root .env}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in the root .env}
     networks:
       - smartfoodops-network
 

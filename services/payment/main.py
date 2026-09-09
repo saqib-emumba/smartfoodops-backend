@@ -12,16 +12,26 @@ service already recalculated from the live menu.
 This module is the composition root: it builds the app and mounts the router. Singletons
 live in deps.py, routes in apis/, and the one authorisation algorithm both charging routes
 run in authorise.py.
+
+Two lifespans as of Week 3: `db.lifespan` for the connection pool, and
+`deps.outbox_relay.lifespan` (D39) for the background relay that publishes
+`payment_outbox` rows to Kafka.
 """
 
 from fastapi import FastAPI
 
+from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
+from common.telemetry import instrument_app
 from payment.apis import health, payments, saga
 from payment import deps
 
-app = FastAPI(title="SmartFoodOps Payment Service", lifespan=deps.db.lifespan)
+app = FastAPI(
+    title="SmartFoodOps Payment Service",
+    lifespan=compose_lifespan(deps.db.lifespan, deps.outbox_relay.lifespan),
+)
 install_error_handlers(app)
+instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
 app.include_router(payments.router)
