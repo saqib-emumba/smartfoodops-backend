@@ -100,6 +100,242 @@ If you only want to *watch* a run rather than drive it — e.g. you already have
 just want to see the lifecycle happen — [scripts/smoke-test.sh](../scripts/smoke-test.sh) does the
 identical sequence from the terminal in one command and prints each step as it passes.
 
+## Manual walkthrough — exact requests and sample data
+
+The table above tells you *which* pre-built request to send. This section is the same
+happy path spelled out with **literal request bodies** — useful if you're building the
+requests by hand instead of using the collection, or just want to see real values instead of
+`{{tag}}`-templated ones. Every number here is the same one used throughout this repo's docs
+(`readme/api-testing-guide.md`, `scripts/smoke-test.sh`), so the totals below aren't arbitrary
+— they're worth cross-checking if something looks off.
+
+All requests go through the gateway at `http://localhost` (`{{base_url}}`). `Content-Type:
+application/json` is required on every POST/PATCH below; it's omitted from each entry for
+brevity.
+
+**These exact values only work once** — `email` and `phone` are `UNIQUE` columns, so a second
+run with the same body gets a `409 Conflict` on registration. Change the email/phone (e.g.
+`customer2@example.com`) to run it again, or skip straight to step 2 and reuse the token you
+already have.
+
+### 1. Register a customer
+
+```
+POST /api/v1/users/register
+
+{
+  "email": "customer@example.com",
+  "password": "Passw0rd!",
+  "full_name": "Jane Customer",
+  "phone": "+15550100001",
+  "role": "customer"
+}
+```
+Response `201` — copy `body.id` as `customer_id`.
+
+### 2. Log in as the customer
+
+```
+POST /api/v1/users/login
+
+{
+  "email": "customer@example.com",
+  "password": "Passw0rd!"
+}
+```
+Response `200` — copy `body.access_token` as `customer_token`. Every request from here on
+that's marked **(customer)** needs header `Authorization: Bearer <customer_token>`.
+
+### 3. Register a restaurant owner and log in
+
+Same shape as step 1/2, with `"role": "restaurant_admin"`:
+
+```
+POST /api/v1/users/register
+
+{
+  "email": "owner@example.com",
+  "password": "Passw0rd!",
+  "full_name": "Owen Owner",
+  "phone": "+15550100002",
+  "role": "restaurant_admin"
+}
+```
+then `POST /api/v1/users/login` with the same `email`/`password` → `owner_token`.
+
+### 4. Register a rider and log in
+
+Same shape again, `"role": "rider"`:
+
+```
+POST /api/v1/users/register
+
+{
+  "email": "rider@example.com",
+  "password": "Passw0rd!",
+  "full_name": "Ryan Rider",
+  "phone": "+15550100003",
+  "role": "rider"
+}
+```
+then `POST /api/v1/users/login` → `rider_token`.
+
+### 5. Onboard a restaurant (owner)
+
+```
+POST /api/v1/restaurants/onboard
+Authorization: Bearer <owner_token>
+
+{
+  "name": "Downtown Diner",
+  "address": "221B Baker Street",
+  "latitude": 33.68,
+  "longitude": 73.04,
+  "capacity": 10
+}
+```
+Response `201` — copy `body.id` as `restaurant_id`.
+
+### 6. Publish its menu (owner)
+
+```
+POST /api/v1/menus
+Authorization: Bearer <owner_token>
+
+{
+  "restaurant_id": "<restaurant_id>",
+  "categories": [
+    {
+      "category_id": "c1",
+      "category_name": "Mains",
+      "display_order": 1,
+      "items": [
+        {
+          "item_id": "burger",
+          "name": "Burger",
+          "description": "Beef burger",
+          "base_price": 10.00,
+          "is_available": true,
+          "customization_groups": [
+            {
+              "group_id": "cheese",
+              "group_name": "Cheese",
+              "min_selection": 1,
+              "max_selection": 1,
+              "options": [
+                { "name": "cheddar", "extra_price": 1.50 },
+                { "name": "none", "extra_price": 0.0 }
+              ]
+            },
+            {
+              "group_id": "extras",
+              "group_name": "Extras",
+              "min_selection": 0,
+              "max_selection": 2,
+              "options": [
+                { "name": "bacon", "extra_price": 2.00 },
+                { "name": "egg", "extra_price": 1.00 }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+Response `200`.
+
+### 7. Register the rider's fleet profile (rider)
+
+```
+POST /api/v1/riders
+Authorization: Bearer <rider_token>
+
+{
+  "vehicle_type": "motorbike",
+  "vehicle_number": "RIDER-001",
+  "current_latitude": 33.68,
+  "current_longitude": 73.04
+}
+```
+Response `201`. `current_latitude`/`current_longitude` need to be near the restaurant's
+coordinates — dispatch searches within a 10km radius.
+
+### 8. Place the order (customer)
+
+```
+POST /api/v1/orders
+Authorization: Bearer <customer_token>
+X-Idempotency-Key: order-happy-path-001
+
+{
+  "restaurant_id": "<restaurant_id>",
+  "items": [
+    {
+      "item_id": "burger",
+      "quantity": 2,
+      "customizations": { "cheese": "cheddar", "extras": ["bacon"] }
+    }
+  ],
+  "total_amount": 27.00
+}
+```
+Response `201`, `body.status` is `"created"` — copy `body.id` as `order_id`. The total is
+recalculated server-side: base `10.00` + cheddar `1.50` + bacon `2.00` = `13.50` per burger,
+`× 2` = `27.00`. Send a `total_amount` that doesn't match and you'll get a `422` instead — the
+server never trusts the client's arithmetic.
+
+**Everything past this point happens because the saga is running, not because you send another
+request that "does" it.** Re-send `GET /api/v1/orders/<order_id>` (customer) every couple of
+seconds to watch `status` change on its own.
+
+### 9. Wait for `status: "confirmed"`
+
+```
+GET /api/v1/orders/<order_id>
+Authorization: Bearer <customer_token>
+```
+Poll until `body.status` is `"confirmed"` (payment authorised — a few seconds).
+
+### 10. Kitchen accepts the order (owner)
+
+```
+POST /api/v1/orders/<order_id>/accept
+Authorization: Bearer <owner_token>
+```
+Response `200`, `body.decision` is `"accepted"`. No body needed.
+
+### 11. Wait for `status: "assigned"`
+
+Same poll as step 9. Once `body.status` is `"assigned"`, `body.rider_id` is populated — that's
+who dispatch picked.
+
+### 12. Rider reports pickup
+
+```
+POST /api/v1/riders/me/orders/<order_id>/picked-up
+Authorization: Bearer <rider_token>
+```
+No body. Response `200`. Poll again for `status: "picked_up"`.
+
+### 13. Rider reports delivery
+
+```
+POST /api/v1/riders/me/orders/<order_id>/delivered
+Authorization: Bearer <rider_token>
+```
+No body. Response `200`. Poll once more for `status: "delivered"` — that's the terminal state.
+
+### 14. Confirm the full trail (optional)
+
+```
+GET /api/v1/orders/<order_id>/logs
+Authorization: Bearer <customer_token>
+```
+Response `200`, a list of entries whose `status` values read, in order:
+`created, confirmed, assigned, picked_up, delivered`.
+
 ## What this can't check that `smoke-test.sh` can
 
 Named here rather than silently missing:
