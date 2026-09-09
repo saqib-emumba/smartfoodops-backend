@@ -31,6 +31,13 @@ CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up
 -- compare-and-set in OrderRepository.transition depends on (D31).
 CREATE TYPE kitchen_decision AS ENUM ('accepted', 'rejected');
 
+-- What the rider has reported so far, as a durable column rather than only a signal
+-- (Week 3, D46) — the same fix D32 already gave the kitchen's answer, applied to the
+-- other place a lost signal used to read as silence. Declared in lifecycle order for the
+-- same reason order_status is: OrderRepository.record_rider_report's guard compares with
+-- `>`, so 'delivered' > 'picked_up' has to be true by declaration, not by convention.
+CREATE TYPE rider_report_stage AS ENUM ('picked_up', 'delivered');
+
 -- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -45,6 +52,12 @@ CREATE TABLE IF NOT EXISTS orders (
     -- capacity check counts.
     kitchen_decision kitchen_decision,
     kitchen_decided_at TIMESTAMP WITH TIME ZONE,
+    -- What the rider has told the Order Service so far, independent of `status`: a report
+    -- can arrive and this column can be set even if the *signal* carrying it to the saga
+    -- is lost. The saga reads this back on a pickup/delivery timeout, exactly like it
+    -- already does for `kitchen_decision` (D46).
+    rider_reported_stage rider_report_stage,
+    rider_reported_at TIMESTAMP WITH TIME ZONE,
     idempotency_key VARCHAR(255) UNIQUE, -- Protects order creation writes against API duplicate submissions
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -89,3 +102,49 @@ CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(or
 CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
     ON orders (restaurant_id, created_at)
     WHERE status = 'confirmed' AND kitchen_decision IS NULL;
+
+-- ============================================================================
+-- Transactional outbox (Week 3, D39) — the relay's queue, not a second audit trail.
+--
+-- order_tracking_logs already records every transition for a human reading the timeline;
+-- this table exists only so a background relay (services/common/outbox.py) can publish
+-- the same facts to Kafka without a second write after the commit. Written inside the
+-- exact same `cursor(commit=True)` blocks that already write orders and
+-- order_tracking_logs — see OrderRepository.create/transition/decide_kitchen — so an event
+-- can never exist for a write that didn't happen, and vice versa (the D09/D24 argument,
+-- applied again).
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS order_outbox (
+    -- Doubles as the event's dedup key on the consumer side (Kafka delivery here is
+    -- at-least-once: a relay crash between the broker ack and marking a row published
+    -- republishes it).
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    -- Claim order for the relay. NOT a resumable "last seq processed" cursor: BIGSERIAL
+    -- hands out values before commit, so a lower seq can commit after a higher one and be
+    -- skipped forever if the relay tracked a high-water mark instead of querying
+    -- published_at IS NULL directly.
+    seq BIGSERIAL NOT NULL,
+    aggregate_type VARCHAR(32) NOT NULL DEFAULT 'order',
+    aggregate_id UUID NOT NULL, -- == the Kafka partition key, so per-order ordering holds
+    event_type VARCHAR(64) NOT NULL,
+    event_version SMALLINT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    -- W3C trace context, captured from the request's own span at the moment this row is
+    -- inserted — not by the relay, which runs minutes later and would otherwise start an
+    -- orphan trace disconnected from the request that caused the write.
+    traceparent TEXT,
+    tracestate TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ, -- NULL == unpublished; the relay's only WHERE clause
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+-- The relay's only query. Stays the size of the backlog rather than the size of history,
+-- because nearly every row ends up published.
+CREATE INDEX IF NOT EXISTS idx_order_outbox_unpublished
+    ON order_outbox (seq) WHERE published_at IS NULL;
+
+-- Lets a future admin/debug read ask "what has this order emitted so far?" without a scan.
+CREATE INDEX IF NOT EXISTS idx_order_outbox_aggregate
+    ON order_outbox (aggregate_id, seq);

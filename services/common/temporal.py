@@ -19,6 +19,7 @@ from logging import Logger
 from uuid import UUID
 
 from temporalio.client import Client
+from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.service import RPCError
 
 WORKFLOW_ID_PREFIX = "order-"
@@ -61,7 +62,14 @@ class TemporalGateway:
         return self._client is not None
 
     async def connect(self) -> Client:
-        self._client = await Client.connect(self.address)
+        # TracingInterceptor picks up whatever TracerProvider configure_telemetry already
+        # installed globally — it does not need its own Resource or exporter. Without it, a
+        # trace started by an HTTP handler ends at the client.start_workflow() call: nothing
+        # here would carry the trace context into the workflow, and durable-history spans
+        # (activities, signals, timers) would appear as an orphaned, service-less trace.
+        self._client = await Client.connect(
+            self.address, interceptors=[TracingInterceptor()]
+        )
         self._logger.info("Connected to Temporal at %s", self.address)
         return self._client
 

@@ -8,7 +8,7 @@ sibling's report — three call sites, one INSERT, one place that can drift.
 
 _COLUMNS = (
     "id, customer_id, restaurant_id, rider_id, items, total_amount, status, "
-    "kitchen_decision, idempotency_key"
+    "kitchen_decision, rider_reported_stage, idempotency_key"
 )
 
 # What the kitchen is shown, and deliberately less than _COLUMNS. An admin deciding on an
@@ -86,6 +86,21 @@ DECIDE_KITCHEN = f"""
            updated_at = CURRENT_TIMESTAMP
      WHERE id = %(order_id)s::uuid
        AND {ON_RAIL}
+    RETURNING {_COLUMNS}
+"""
+
+# Guarded forward-only, the same argument D31 makes for TRANSITION_ORDER below: a rider
+# retrying a pickup call after delivery has already been reported must not walk the column
+# back to 'picked_up'. `rider_report_stage` was declared in lifecycle order for exactly
+# this comparison (Week 3, D46).
+RECORD_RIDER_REPORT = f"""
+    UPDATE orders
+       SET rider_reported_stage = %(stage)s::rider_report_stage,
+           rider_reported_at = CURRENT_TIMESTAMP,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE id = %(order_id)s::uuid
+       AND (rider_reported_stage IS NULL
+            OR %(stage)s::rider_report_stage > rider_reported_stage)
     RETURNING {_COLUMNS}
 """
 

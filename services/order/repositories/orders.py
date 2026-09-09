@@ -15,12 +15,14 @@ import psycopg2
 from psycopg2.extras import Json
 
 from common.errors import conflict
+from common.outbox import append_outbox
 from common.postgres import PostgresPool
 from common.repository import Repository
 from order.repositories.sql import (
     COUNT_ON_RAIL_FOR_ORDER,
     DECIDE_KITCHEN,
     INSERT_ORDER,
+    RECORD_RIDER_REPORT,
     SELECT_BY_ID,
     SELECT_BY_KEY,
     SELECT_KITCHEN_QUEUE,
@@ -118,6 +120,28 @@ class OrderRepository(Repository):
                     "metadata": Json({"idempotency_key": idempotency_key}),
                 },
             )
+
+            # Same transaction as the insert and the trail row above (D39) — an order
+            # without an `order.created` outbox row cannot exist, the same guarantee D24
+            # already gives order_tracking_logs. Items are left out of the payload
+            # deliberately: they can be large, and a consumer that needs them can read
+            # GET /api/v1/orders/{id} — the outbox carries the facts a consumer reacts to,
+            # not a full copy of the row.
+            append_outbox(
+                cur,
+                table="order_outbox",
+                aggregate_type="order",
+                aggregate_id=order["id"],
+                event_type="order.created",
+                payload={
+                    "order_id": str(order["id"]),
+                    "customer_id": str(order["customer_id"]),
+                    "restaurant_id": str(order["restaurant_id"]),
+                    "total_amount": order["total_amount"],
+                    "status": order["status"],
+                    "items_count": len(order["items"]),
+                },
+            )
             return order
 
     def transition(
@@ -201,6 +225,32 @@ class OrderRepository(Repository):
                     "metadata": Json(metadata or {}),
                 },
             )
+
+            # Gated on the exact same branch as the trail row above — the CAS above this
+            # block already guarantees `changed` (this branch) fires once per logical
+            # transition regardless of how many times Temporal retries the activity, so
+            # this inherits that guarantee for free rather than re-deriving it (D39).
+            # `new_status` names the event type directly: order.confirmed, order.assigned,
+            # order.picked_up, order.delivered, order.cancelled (D40) — the last of those
+            # carries the saga's compensation reason via `metadata`, which is how a reason
+            # code recorded nowhere the orchestrator can write (it holds no outbox of its
+            # own, D38) still reaches Kafka.
+            append_outbox(
+                cur,
+                table="order_outbox",
+                aggregate_type="order",
+                aggregate_id=order_id,
+                event_type=f"order.{new_status}",
+                payload={
+                    "order_id": str(order_id),
+                    "new_status": new_status,
+                    "customer_id": str(updated["customer_id"]),
+                    "restaurant_id": str(updated["restaurant_id"]),
+                    "rider_id": str(updated["rider_id"]) if updated["rider_id"] else None,
+                    "total_amount": updated["total_amount"],
+                    "metadata": metadata or {},
+                },
+            )
             return updated, True
 
     def kitchen_queue(self, restaurant_id: UUID) -> list[dict]:
@@ -221,6 +271,40 @@ class OrderRepository(Repository):
             )
             decided = cur.fetchone()
             if decided is not None:
+                # No order_tracking_logs row exists for this write (DECIDE_KITCHEN never
+                # called append_log — see this method's own docstring), so the outbox is
+                # the only record of a kitchen decision anywhere outside `orders` itself.
+                # Guarded on `decided is not None` exactly like the trail row would be if
+                # one existed, for the same reason: a second accept on an already-decided
+                # order must not emit twice.
+                append_outbox(
+                    cur,
+                    table="order_outbox",
+                    aggregate_type="order",
+                    aggregate_id=order_id,
+                    event_type="order.kitchen.decided",
+                    payload={
+                        "order_id": str(order_id),
+                        "decision": decision,
+                        "restaurant_id": str(decided["restaurant_id"]),
+                    },
+                )
                 return decided, True
             cur.execute(SELECT_BY_ID, (str(order_id),))
             return cur.fetchone(), False
+
+    def record_rider_report(self, order_id: UUID, stage: str) -> dict | None:
+        """Record what the rider has told this service so far — a durable column, not an
+        event (Week 3, D46). No outbox row and no trail entry: this is bookkeeping for the
+        saga's own timeout recovery, the same category `kitchen_decision` already occupies,
+        not a new fact anything downstream of Kafka needs to react to.
+
+        Returns the updated row, or `None` if the guard rejected the write (already at this
+        stage or past it) — the caller does not currently act on that, but the shape
+        matches `decide_kitchen`'s for the same reason: a second report for a stage already
+        recorded is a no-op, not an error, and the guard is what makes a retried signal
+        relay safe to call twice.
+        """
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(RECORD_RIDER_REPORT, {"order_id": str(order_id), "stage": stage})
+            return cur.fetchone()

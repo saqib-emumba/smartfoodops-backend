@@ -21,6 +21,7 @@ from fastapi import FastAPI
 
 from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
+from common.telemetry import instrument_app
 from menu.apis import health, menus
 from menu import deps
 
@@ -40,6 +41,7 @@ app = FastAPI(
     lifespan=compose_lifespan(deps.db.lifespan, _cache_lifespan),
 )
 install_error_handlers(app)
+instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
 app.include_router(menus.router)

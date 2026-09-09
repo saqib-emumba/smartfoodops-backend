@@ -46,6 +46,10 @@ class OrderResponse(BaseModel):
     # The kitchen's answer. NULL until they respond; `status` stays `confirmed` either way,
     # because acceptance does not move the order along its lifecycle — finding a rider does.
     kitchen_decision: Optional[str] = None
+    # What the rider has reported so far, independent of `status` — read back by the saga
+    # on a pickup/delivery timeout so a lost signal self-corrects the same way a lost
+    # kitchen decision already does (Week 3, D46).
+    rider_reported_stage: Optional[str] = None
     idempotency_key: Optional[str]
 
     model_config = ConfigDict(from_attributes=True)

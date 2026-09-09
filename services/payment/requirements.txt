@@ -2,3 +2,8 @@
 
 # httpx for order verification against the Order Service.
 httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
+
+# common.kafka + common.outbox (Week 3, D39) — same reasoning as order/requirements.txt.
+aiokafka==0.14.0
+fastjsonschema==2.22.2

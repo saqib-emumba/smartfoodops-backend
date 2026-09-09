@@ -5,11 +5,18 @@
 # files are reachable from every service's Dockerfile.
 #
 # Deliberately NOT here:
-#   httpx       — only services that call a sibling import common.service_client, and the
-#                 User Service calls nobody. Listed by the five that do.
-#   temporalio  — only common.temporal needs it, and only the Order Service imports that.
+#   httpx                          — only services that call a sibling import
+#                                     common.service_client, and the User Service calls
+#                                     nobody. Listed by the five that do.
+#   opentelemetry-instrumentation-httpx
+#                                   — same reasoning: only needed alongside httpx itself.
+#   temporalio                     — only common.temporal needs it, and only the
+#                                     Orchestrator Service imports that.
+#   aiokafka, fastjsonschema        — only common.kafka needs them, and only order,
+#                                     payment, analytics and notification import that
+#                                     (Week 3, D39/D40).
 #
-# Anything added here is added to all six images, so a dependency belongs here only when
+# Anything added here is added to all seven images, so a dependency belongs here only when
 # a module in common/ imports it unconditionally.
 
 fastapi==0.115.6
@@ -17,3 +24,13 @@ uvicorn==0.34.0
 pydantic==2.10.4
 psycopg2-binary==2.9.10
 PyJWT[crypto]==2.10.1
+
+# common/telemetry.py imports the tracing SDK, the psycopg2 and FastAPI instrumentors, and
+# prometheus_client unconditionally — every service gets these regardless of which of its
+# own outbound clients it uses (Week 3, D38-D43).
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-psycopg2==0.65b0
+prometheus-client==0.26.0

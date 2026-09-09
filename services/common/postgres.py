@@ -55,8 +55,20 @@ class PostgresPool:
 
         Pass directly as ``FastAPI(lifespan=db.lifespan)``.
         """
+        # `cursor_factory` is passed here, at connect time, rather than per-call in
+        # `cursor()` below — deliberately (Week 3). `opentelemetry-instrumentation-psycopg2`
+        # injects its tracing wrapper as the CONNECTION's default cursor factory, built
+        # from whichever `cursor_factory` it sees passed to `psycopg2.connect(...)`; a
+        # `cursor_factory` supplied instead at `conn.cursor(cursor_factory=...)` time
+        # overrides that default and bypasses the tracing wrapper entirely — silently, no
+        # error, just no span. Passing it here means `conn.cursor()` below can be called
+        # with no arguments and still get both the traced cursor and RealDictCursor rows,
+        # whether or not OpenTelemetry is instrumented in this process.
         self._pool = pool.ThreadedConnectionPool(
-            minconn=self._minconn, maxconn=self._maxconn, dsn=self._dsn
+            minconn=self._minconn,
+            maxconn=self._maxconn,
+            dsn=self._dsn,
+            cursor_factory=RealDictCursor,
         )
         self._logger.info("PostgreSQL connection pool initialised")
         try:
@@ -80,7 +92,11 @@ class PostgresPool:
             self._logger.error("Could not lease a PostgreSQL connection: %s", exc)
             raise internal_error(self._exhausted_detail) from exc
         try:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # No `cursor_factory=` here — the connection's own default, set once at
+            # connect time above, already produces RealDictCursor rows (traced ones, when
+            # instrumented). See the comment in `lifespan()` for why call-time and
+            # connect-time are not interchangeable here.
+            with conn.cursor() as cur:
                 yield cur
             conn.commit() if commit else conn.rollback()
         except Exception:

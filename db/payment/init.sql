@@ -37,3 +37,32 @@ CREATE TABLE IF NOT EXISTS payments (
 -- either column would be dead weight, so the only one declared here is for the reads that
 -- have no constraint behind them: sweeping for payments left mid-flight.
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+-- ============================================================================
+-- Transactional outbox (Week 3, D39) — same shape and purpose as order_outbox in
+-- sfo_order_core; see that table's comment for the full reasoning. `aggregate_id` here is
+-- deliberately `order_id`, not `payment_id`: every consumer of this stream joins on the
+-- order, and the Kafka partition key has to match what order_outbox uses so a payment
+-- event and an order event for the same order land in the same partition.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS payment_outbox (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    seq BIGSERIAL NOT NULL,
+    aggregate_type VARCHAR(32) NOT NULL DEFAULT 'payment',
+    aggregate_id UUID NOT NULL, -- orders.id (Order Service database) — the partition key
+    event_type VARCHAR(64) NOT NULL,
+    event_version SMALLINT NOT NULL DEFAULT 1,
+    payload JSONB NOT NULL,
+    traceparent TEXT,
+    tracestate TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TIMESTAMPTZ,
+    attempts INT NOT NULL DEFAULT 0,
+    last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_outbox_unpublished
+    ON payment_outbox (seq) WHERE published_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_payment_outbox_aggregate
+    ON payment_outbox (aggregate_id, seq);

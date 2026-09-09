@@ -174,6 +174,27 @@ class OrderActivities:
         )
         return {"decision": decision, "status": order["status"]}
 
+    @activity.defn
+    def read_rider_report_activity(self, details: dict) -> dict:
+        """Read what the rider has reported straight off the order (Week 3, D46).
+
+        The same recovery `read_kitchen_decision_activity` already gives the kitchen's
+        answer, for the other signal a lost relay can strand: a pickup or delivery report
+        committed to `orders.rider_reported_stage` before the signal that carries it into
+        the workflow, so a timeout can tell "the rider genuinely never reported" apart from
+        "they reported and the signal never landed."
+        """
+        order_id = details["order_id"]
+        try:
+            order = self._orders.read(order_id)
+        except OrderGone as exc:
+            raise ApplicationError(str(exc), non_retryable=True) from exc
+        stage = order.get("rider_reported_stage")
+        self._logger.info(
+            "Rider report for order %s reads '%s'", order_id, stage
+        )
+        return {"stage": stage}
+
     # --- fleet --------------------------------------------------------------------------
 
     @activity.defn

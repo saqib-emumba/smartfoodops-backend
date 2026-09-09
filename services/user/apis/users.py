@@ -12,7 +12,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 
-from common.auth import CurrentUser, get_current_user, require_self_or_admin
+from common.auth import CurrentUser, get_current_user, require_internal, require_self_or_admin
 from common.errors import not_found
 from common.responses import Envelope, ok
 from user import deps
@@ -45,6 +45,27 @@ def get_user(
     """
     require_self_or_admin(current_user, user_id)
 
+    row = deps.users.find(user_id)
+    if row is None:
+        raise not_found(f"User {user_id} not found")
+    return ok(UserResponse(**row), message="User found")
+
+
+@router.get(
+    "/{user_id}/internal",
+    response_model=Envelope[UserResponse],
+    dependencies=[Depends(require_internal)],
+)
+def get_user_internally(user_id: UUID) -> Envelope[UserResponse]:
+    """The same profile as the bearer-token route above, for a caller with no user token
+    to forward (Week 3, D45) — the Analytics/Notification path's equivalent of
+    `order/apis/checkout.py::get_order_internally`, added for D26's same reason: a Kafka
+    consumer has no request, and therefore no bearer token, behind it at all.
+
+    Internal-key only, because without the token there is no ownership check left here —
+    this must not be reachable by anyone who could guess a user id, the same caveat
+    `get_order_internally`'s own docstring already states.
+    """
     row = deps.users.find(user_id)
     if row is None:
         raise not_found(f"User {user_id} not found")

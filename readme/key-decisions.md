@@ -54,6 +54,14 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D35](#d35--every-response-is-an-envelope-status-body-message-errors) | Every response is an envelope: `{status, body, message, errors}` | 2026-08-27 | Accepted |
 | [D36](#d36--the-order-sagas-workflow-and-worker-split-into-their-own-deployable) | The order saga's workflow and worker split into their own deployable | 2026-08-27 | Accepted |
 | [D37](#d37--the-orchestrator-services-subdirectories-are-entity-scoped) | The Orchestrator Service's subdirectories are entity-scoped | 2026-08-27 | Accepted |
+| [D38](#d38--kafka-carries-facts-temporal-still-owns-decisions) | Kafka carries facts, Temporal still owns decisions | 2026-09-08 | Accepted |
+| [D39](#d39--a-transactional-outbox-not-a-post-commit-publish) | A transactional outbox, not a post-commit publish | 2026-09-08 | Accepted |
+| [D40](#d40--one-topic-keyed-by-order_id-versioned-in-the-envelope) | One topic, keyed by `order_id`, versioned in the envelope | 2026-09-08 | Accepted |
+| [D41](#d41--metrics-is-the-documented-exception-to-d35) | `/metrics` is the documented exception to D35 | 2026-09-08 | Accepted |
+| [D42](#d42--observability-and-eventing-config-joins-d20s-byte-for-byte-set) | Observability and eventing config joins D20's byte-for-byte set | 2026-09-08 | Accepted |
+| [D43](#d43--the-riders-report-becomes-a-durable-column-on-orders) | The rider's report becomes a durable column on `orders` | 2026-09-08 | Accepted |
+| [D44](#d44--the-analytics-service-gets-its-own-database-and-dedups-by-consumer_group-event_id) | The Analytics Service gets its own database, dedups by `(consumer_group, event_id)` | 2026-09-08 | Accepted |
+| [D45](#d45--kafka-is-the-ledger-rabbitmqcelery-is-the-concurrency-pool) | Kafka is the ledger, RabbitMQ/Celery is the concurrency pool | 2026-09-09 | Accepted |
 
 ---
 
@@ -1101,6 +1109,283 @@ is a decision for when a second entity's requirements are known, not a guess mad
 
 ---
 
+## Week 3 — events and observability
+
+Added 2026-09-08, implementing a corrected version of
+[week3-event-driven-observability-blueprint.md](week3-event-driven-observability-blueprint.md).
+The draft blueprint described a repository that does not exist (a nested `services/common/common/`,
+an `orchestration/` package, six of seven services omitted) and several of its code samples would
+have broken the platform outright if pasted verbatim — replacing `common/logging_config.py`
+wholesale breaks all eight processes on import, and its example `create_order` handler drops the
+connection pool and every existing route. None of it was implemented as written; this section
+records what was built instead and why.
+
+### D38 — Kafka carries facts, Temporal still owns decisions
+
+**Decided:** every Kafka record describes a state change already committed in some service's
+database, in the past tense, with no reply expected. Nothing on the order's critical path blocks
+on Kafka, and no consumer writes back into `orders`. The Orchestrator Service holds no Kafka
+client at all — it produces nothing.
+
+**Instead of:** the blueprint's framing, which proposed moving to "an asynchronous event-driven
+**choreographic** pipeline."
+
+**Why:** this platform deliberately chose orchestration in Week 2 (D25), and
+[saga-resilience-test.sh](../scripts/saga-resilience-test.sh) exists specifically to prove the
+saga survives a mid-saga worker kill. A choreographic pipeline over Kafka would scatter
+compensation logic across consumers with no durable execution, no timers, and no query surface —
+it is a proposal to undo Week 2, not extend it. Keeping the orchestrator producer-free also removes
+a real hazard by construction rather than by discipline: a `@workflow.defn` may not do I/O (it
+replays deterministically and the sandbox blocks the imports), so an `aiokafka` call inside
+`OrderWorkflow.run` would fail the workflow task, and Temporal retries workflow tasks forever —
+every in-flight order would wedge permanently.
+
+**Costs:** saga-level facts (compensation reason codes, timeout causes) only reach Kafka
+indirectly, riding out through `orders.transition()`'s `metadata` argument on the next lifecycle
+event rather than being emitted directly by the workflow. That is judged the right trade: the saga
+stays observable through traces and Temporal's own metrics (port 9233), not through a second
+channel that could disagree with what Temporal itself records.
+
+### D39 — A transactional outbox, not a post-commit publish
+
+**Decided:** `order_outbox` and `payment_outbox` tables, written inside the same
+`cursor(commit=True)` block as the business write and the trail row. A background relay, composed
+into each service's own lifespan, publishes unpublished rows to Kafka and marks them published.
+
+**Instead of:** the blueprint's `await kafka_producer.send_event(...)` called after the database
+commit, with the exception re-raised on failure.
+
+**Why:** this is D09's argument again, verbatim. D09 said audit logging had to be best-effort
+because the order was already committed when the log call fired — returning `500` would tell a
+client their order failed when it existed. D24 closed that only by moving the write **into the
+transaction**. The blueprint's post-commit publish reopens exactly the hole D24 closed: a Kafka
+outage under the blueprint's code returns a spurious `500` for an order that was, in fact, created,
+and the client's idempotent retry then returns a confusing `200`. The outbox makes Kafka's
+availability irrelevant to whether checkout succeeds — proven by running the full smoke suite
+twice, once with Kafka up and once with the broker stopped, both required to pass 185/185.
+
+The outbox emission at `OrderRepository.transition()` is gated on the same `changed` flag the
+trail-row write already uses, for the same reason: an activity retried five times by Temporal's
+at-least-once guarantee must produce one event, not five.
+
+**Costs:** two extra tables to maintain, a relay process inside two services, and an
+at-least-once delivery contract — a crash between the broker ack and marking a row published
+republishes it, so every consumer must dedup on `event_id` rather than assume single delivery.
+
+### D40 — One topic, keyed by `order_id`, versioned in the envelope
+
+**Decided:** a single topic, `sfo.order.events.v1`, three partitions, carrying both order and
+payment events, keyed by `order_id`. The envelope is `{event_id, event_type, event_version,
+aggregate_type, aggregate_id, seq, occurred_at, producer, data}`; `traceparent`/`tracestate` travel
+as Kafka message headers, not envelope fields.
+
+**Instead of:** the blueprint's one-topic-per-event-type layout (`order_placed`,
+`order_cancelled`, `order_delivered`, …).
+
+**Why:** Kafka orders records only within a single partition of a single topic. The blueprint's
+analytics consumer depends on seeing `order_placed` before `order_delivered` for the same order,
+and across two topics that ordering is not guaranteed — it is a design flaw, not a detail. A single
+topic keyed by `order_id` is the only way per-order ordering holds for every consumer, present and
+future.
+
+**Costs:** every consumer filters event types it does not care about — a few lines, not a real
+cost. A schema change that is not backward-compatible needs a new topic suffix (`v2`), produced
+alongside `v1` during migration, rather than a per-event-type version bump.
+
+### D41 — `/metrics` is the documented exception to D35
+
+**Decided:** every service's `/metrics` route returns Prometheus's own text exposition format,
+`include_in_schema=False`, bypassing both `install_error_handlers` and the `Envelope` wrapper. It
+is not reachable through the gateway — nginx has no `/metrics` location, matching how the Temporal
+Web UI is already handled.
+
+**Why:** D35 made every response in the platform the same envelope, and that rule is right for
+every API a client parses. Prometheus's exposition format is a machine-defined content type that
+no envelope can wrap without breaking every scraper that exists. Rather than let that exception
+happen silently the first time someone reaches for `Response(generate_latest())`, it is recorded
+here: `/metrics` is an operator surface, in the same category as the Temporal UI, not an API route.
+
+**Costs:** one documented inconsistency in a platform that otherwise has exactly one response
+shape. Guarded by a smoke-test assertion that `/metrics` is not routable through the gateway, so
+the exception cannot silently expand into a second public shape.
+
+### D42 — Observability and eventing config joins D20's byte-for-byte set
+
+**Decided:** `prometheus.yml`, `grafana/provisioning/**`, and the Kafka topic-init script are
+generated by `scripts/init_bootstrap.sh` alongside the four artifacts D20 already covered, and
+verified with the same scratch-directory diff.
+
+**Why:** D20 already named `.env`, the four (now more) `init.sql` files, `docker-compose.yml` and
+`nginx.conf` as "the easiest thing in the repo to forget." Week 3 adds three more generated
+artifacts of the same kind; leaving them out of the mirroring discipline would make the bootstrap
+script quietly stop being the reproducible path from empty directory to running stack that D20
+exists to guarantee.
+
+**Costs:** none beyond keeping the heredocs current, which the scratch-diff gate already forces
+for every phase of this work.
+
+### D43 — The rider's report becomes a durable column on `orders`
+
+**Decided:** `orders.rider_reported_stage` (nullable `rider_report_stage` enum,
+`'picked_up' | 'delivered'`, declared in that order for the same reason `order_status` is —
+D31's guard compares with `>`) and `orders.rider_reported_at`.
+`POST /api/v1/orders/{id}/signals` records the stage, guarded forward-only, **before**
+relaying to the orchestrator — mirroring D27's rule for kitchen tickets exactly: commit the
+fact, then relay it, and never roll the fact back if the relay fails. A new
+`read_rider_report_activity`, shaped identically to `read_kitchen_decision_activity`, lets
+the saga read it back when a pickup or delivery wait times out, and resume instead of
+compensating if the rider genuinely reported.
+
+**Instead of:** leaving the gap the Open Questions section already named — a lost kitchen
+decision self-corrects (D27), a lost rider pickup or delivery signal did not, because
+`riders.current_order_id` says who is carrying an order, not how far along they are, and
+there was no equivalent record anywhere to read back.
+
+**Why:** this is D32's fix, applied to the other place it was needed, using a table that
+already existed rather than a new one. D32 collapsed the kitchen queue onto
+`orders.kitchen_decision` specifically so a timed-out wait could read back what actually
+happened instead of assuming silence means refusal.
+[services/rider/apis/delivery.py](../services/rider/apis/delivery.py) writes nothing
+locally — both reporting routes are pure HTTP relays through the Order Service — so before
+this decision a lost signal after `DELIVERY_TIMEOUT_SECONDS` (3600s) read as silence, and
+the saga refunded a delivered order.
+
+Two alternatives were rejected in favour of a column. Writing to `order_tracking_logs`
+needs no new DDL, but `new_status` is `NOT NULL order_status` and `old_status` is derived
+from the preceding row (D24) — a "reported" entry with no real status change is
+indistinguishable from a genuine transition and corrupts the chain the very next real one
+reads. Having the Order Service perform the `picked_up`/`delivered` transition directly,
+rather than only recording that a report arrived, would make it a second orchestrator and
+break D25/D31's single-writer rule — recording a fact and acting on it are kept separate on
+purpose, exactly as `kitchen_decision` already keeps them separate from `status`.
+
+**Costs:** adding an activity call to a live workflow is safe for workflows started after the
+deploy, but a running workflow replayed against the new code hits a non-determinism error — the
+same class of risk D37's cost section already names, and closed the same way, by draining
+in-flight workflows before deploying. `saga-resilience-test.sh` gained a fifth section
+(lost-rider-signal) mirroring its existing lost-kitchen-decision case exactly, writing the
+report straight into `sfo_order_core` to simulate the lost relay.
+
+### D44 — The Analytics Service gets its own database, and dedups by `(consumer_group, event_id)`
+
+**Decided:** a fifth Postgres database, `sfo_analytics_core` (port 5438), holding exactly
+two tables: `processed_events` (consumer-side dedup, keyed by `(consumer_group, event_id)`)
+and `order_projections` (one row per order, updated incrementally as its events arrive). The
+consumer commits the projection write and the dedup row in one transaction, then commits
+the Kafka offset — never the other way around — and seeds its Prometheus Counters from
+`order_projections` at startup via `Counter._value.set(...)`, so a restart does not silently
+reset business totals to zero.
+
+**Instead of:** two alternatives considered and rejected —
+
+* **A stateless log-fold.** Assign partitions from offset 0 at startup, never commit
+  offsets, hold counters and a seen-`event_id` set entirely in memory. Simplest possible,
+  and it would have saved a container, a credential, and the D20 mirroring this decision
+  now owes. Rejected because it bounds correctness to topic retention: once messages age
+  out, a restart can no longer rebuild an accurate picture, and this platform sets no
+  retention policy today that would make that bound meaningful.
+* **Prometheus as the only store.** No database at all, counters living purely in
+  `prometheus_client`. Rejected for the same reason D39 chose a durable outbox over a
+  fire-and-forget publish: a Counter's value is process-local and resets to zero on every
+  restart, and Prometheus cannot detect that reset the way it can a legitimate counter
+  rollover — every restart would show as a cliff in `rate()`/`increase()`, not a gap.
+
+**Why:** this service earns the same argument D01 already made for every other table in the
+platform — a physical database boundary is enforced, a convention is not — applied here to
+data that happens to be *derived* rather than authoritative. Nothing else ever reads or
+writes `sfo_analytics_core`, and nothing in it is a fact any other service's request path
+depends on: the whole database could be dropped and rebuilt by resetting the consumer
+group's offset and replaying, which is the property that makes owning a database here cheap
+rather than a second source of truth competing with the outbox tables in `sfo_order_core`
+and `sfo_payment_core`.
+
+The dedup key is `(consumer_group, event_id)`, not `event_id` alone, for the reason
+`services/analytics/repositories/projections.py` states directly: this service runs one
+logical consumer today, but a table shaped for exactly one group would need a schema change
+the day a second one — a future GenAI read-model over the same topic, say — starts reading
+independently.
+
+**Costs:** a container, a credential, a port, and a `db/analytics/init.sql` that D20 now
+requires stay mirrored into `init_bootstrap.sh` alongside everything else. And a genuinely
+separate cost worth naming: Prometheus does not hot-reload `prometheus.yml` — adding this
+service's scrape target required a manual `SIGHUP` to the running container, confirmed
+necessary the first time this service was deployed. That is an operational step, not a
+config one, and it is easy to forget the next time a target is added.
+
+**Verified, not assumed:** deployed against a topic already carrying several thousand
+duplicate deliveries — an artifact of the `uuid = text` cast bug D39's relay shipped with
+and fixed (see below) — and the dedup collapsed them to the correct count of distinct
+events on the first run, with the derived `order_projections` rows (status counts, average
+delivery time) cross-checked against `order_tracking_logs` for the same orders and matching
+exactly.
+
+### A bug found and fixed while deploying D39's relay: array parameters need an explicit cast
+
+**Found:** `OutboxRelay._mark_published`'s `UPDATE {table} SET published_at = ... WHERE id
+= ANY(%(ids)s)` failed on every batch with `operator does not exist: uuid = text` —
+psycopg2 adapts a Python list of strings to a `text[]` literal, and Postgres will not
+implicitly cast a whole array parameter to compare against a `uuid` column, unlike a scalar
+`%s::uuid`, which does cast implicitly. The relay's own retry loop meant this was not a
+one-time failure: each iteration successfully published its claimed batch to Kafka via
+`send_and_wait`, then failed at the very next step, so the same rows were reclaimed and
+republished on every poll interval until the fix shipped.
+
+**Fixed:** both `_MARK_PUBLISHED` and `_MARK_FAILED` now read `WHERE id = ANY(%(ids)s::uuid[])`.
+
+**Why this is worth a paragraph rather than a silent fix:** nothing was lost. Every
+duplicate publish carried the same `event_id`, so the at-least-once contract D39 designed
+for — "a relay crash between broker-ack and marking a row published republishes it;
+downstream dedups on `event_id`" — held exactly as intended under a real failure, not just
+the one it was written to anticipate. The Analytics Service's dedup collapsing several
+thousand redelivered messages back down to the correct count, on its very first run against
+real data, is the closest this platform has come to a live test of that guarantee.
+
+### D45 — Kafka is the ledger, RabbitMQ/Celery is the concurrency pool
+
+**Decided:** `notification-consumer` and `notification-worker` — two containers built from
+one `services/notification/` image. The consumer reads `sfo.order.events.v1` under its own
+group (`"notification"`, independent of analytics' `"analytics"`), resolves the customer's
+contact details over a new internal-key endpoint, and enqueues a Celery task — committing
+its Kafka offset only *after* `send_task` returns. The worker is a plain Celery consumer of
+those tasks, holding no Kafka client and no JWT keys, because it never imports
+`common.auth` or touches the topic at all.
+
+Also decided: `GET /api/v1/users/{user_id}/internal`, internal-key guarded, added because
+this consumer has no bearer token to forward — the same gap `get_order_internally` (D26)
+closed for the saga's activities, closed the same way for a Kafka consumer instead of a
+Temporal one.
+
+**Instead of:** the curriculum's literal ask read one way — Kafka **and** RabbitMQ as two
+independent, competing durability layers — would have meant a lost RabbitMQ message and a
+lost Kafka message were two different incidents needing two different recoveries. Making
+Kafka's offset the actual commit point collapses that to one: a crash between enqueueing
+and committing redelivers the same event and re-enqueues the same task, so recovery is
+always "reset the notification consumer group and replay," never "hope RabbitMQ's own
+persistence held."
+
+**Why:** a duplicate SMS costs nothing like a duplicate charge does, so this consumer
+deliberately does **not** carry the platform's usual at-least-once-with-dedup discipline
+(no `processed_events` table here, unlike analytics' — see D44). `task_acks_late=True` +
+`worker_prefetch_multiplier=1` make a worker crash mid-dispatch redeliver to another worker
+rather than silently drop the task; `task_ignore_result=True` because nothing ever calls
+`.get()` on a fire-and-forget dispatch, so no result backend is configured at all.
+
+Only three event types are notification-worthy — `order.confirmed`, `order.delivered`,
+`order.cancelled` — a smaller set than analytics tracks, and none of the other four
+(`order.created`, `order.assigned`, `order.kitchen.decided`, `payment.*`) go through schema
+validation at all: this consumer never touches the data of an event it will not act on.
+
+**Costs:** a genuinely hardcoded-secret bug caught before it shipped — an early draft of
+`notification/worker.py` defaulted the whole broker URL to
+`amqp://guest:guest@rabbitmq:5672//`, exactly the mistake this platform's own review of the
+Week 3 blueprint had already flagged in a different file. Fixed by requiring
+`RABBITMQ_USER`/`RABBITMQ_PASSWORD` separately (D19) and composing the URL from them; only
+the credential-free hostname may default. And a second stateful broker in the observability
+week, whose durability this design deliberately does not lean on — see the "instead of"
+above for why that is the point, not an oversight.
+
+---
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -1108,7 +1393,9 @@ Not yet decided, and worth settling before the code forces an answer:
 - **Key rotation.** Rotating the RSA keypair invalidates every live token simultaneously.
   There is no overlap mechanism (`kid` header, multiple accepted public keys) yet.
 - **Where the private key lives outside a laptop.** `.env` is right locally and wrong for
-  anything shared; a secrets manager or mounted key file is the Week 3 answer.
+  anything shared; a secrets manager or mounted key file was flagged as "the Week 3 answer"
+  when this question was written, but Week 3 did not touch it — the eventing and observability
+  work took the available time. Still open, explicitly deferred rather than silently dropped.
 - ~~**Whether `system_admin` should bypass ownership checks.**~~ Settled by
   [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass): it
   does, everywhere, via `require_role` and `require_self_or_admin` — the Order Service's
@@ -1117,19 +1404,23 @@ Not yet decided, and worth settling before the code forces an answer:
   endpoint resolves `pending` as well as `authorized`.
 - ~~**Whether the audit trail stays best-effort** (D09).~~ Settled by D24 for the opening
   entry and by D31 for the saga's own transitions, which now commit with the status change
-  they describe. The reported half is **partly** settled: a decision or delivery is
+  they describe. The reported half was **partly** settled: a decision or delivery is
   committed locally and *then* relayed as a signal, and a failed relay is logged rather than
-  retried — but the saga now reads the ticket back when its timeout fires, so a lost
-  *kitchen decision* self-corrects (D27). **A lost rider pickup or delivery signal does
-  not**, because there is no equivalent record to read back: the Rider Service's
-  `current_order_id` says who is carrying the order, not how far along they are. An outbox
-  table in each reporting service is the general answer; Week 3's Kafka work is the natural
-  place for it.
+  retried — but the saga read the ticket back when its timeout fired, so a lost
+  *kitchen decision* self-corrected (D27), while **a lost rider pickup or delivery signal did
+  not**, because there was no equivalent record to read back. Closed by
+  [D43](#d43--the-riders-report-becomes-a-durable-column-on-orders): the rider's report is
+  now a durable column on `orders`, read back on the same two timeout branches the kitchen
+  case already used. Note this was closed with a column, not the outbox — the outbox (D39)
+  answers a different question (getting a fact to Kafka), not this one (having a fact to read
+  back before compensating).
 - **Per-service credentials for internal calls** (D15, D26). The shared `INTERNAL_API_KEY`
-  now unlocks **seven** endpoints across three services, including refunds — down from
-  eleven after D32. D15 named this threshold in advance; it was crossed by accretion and
-  has since been partly walked back, which is an argument for deciding it deliberately
-  rather than letting the count drift with each change.
+  unlocked seven endpoints across three services after D32, including refunds, and Week 3
+  added an eighth — `GET /api/v1/users/{user_id}/internal` (D45), the Notification
+  Service's only way to resolve a customer's contact details with no bearer token to
+  forward. D15 named this threshold in advance; it keeps being crossed by accretion, which
+  is an argument for deciding it deliberately rather than letting the count drift with each
+  change.
 - **Whether the rider search window belongs in config or per-restaurant.**
   `RIDER_SEARCH_ATTEMPTS × RIDER_SEARCH_INTERVAL_SECONDS` is one platform-wide number, so a
   dense city centre and a rural outpost get the same 60 seconds before an order is refunded.

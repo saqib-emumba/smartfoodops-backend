@@ -1,10 +1,17 @@
-# SmartFoodOps — Backend (Weeks 1–2)
+# SmartFoodOps — Backend (Weeks 1–3)
 
-A containerised, seven-service food-ordering backend fronted by an Nginx API gateway, with
-the order lifecycle driven by a durable Temporal workflow that runs in its own deployable —
-the Orchestrator Service and its worker (D36), sharing neither image nor database with any
-other service. Everything runs locally through Docker Compose: six PostgreSQL databases,
-Redis, the Temporal dev server, the gateway, seven FastAPI services and one workflow worker.
+A containerised, eight-FastAPI-service food-ordering backend fronted by an Nginx API
+gateway, with the order lifecycle driven by a durable Temporal workflow that runs in its own
+deployable — the Orchestrator Service and its worker (D36), sharing neither image nor
+database with any other service. Since Week 3, every state change an order goes through is
+also published to Kafka through a transactional outbox (D39), read by an independent
+Analytics read-model and a Notification pipeline that dispatches simulated SMS/email over
+Celery — and the whole platform is traced end to end with OpenTelemetry into Jaeger, and
+scraped by Prometheus into Grafana dashboards. Everything runs locally through Docker
+Compose: seven PostgreSQL databases, Redis, the Temporal dev server, Kafka, Schema Registry,
+RabbitMQ, Jaeger, Prometheus, Grafana, the gateway, eight FastAPI services and four
+background workers (the saga worker, two notification processes and a one-shot topic-init
+job) — 27 containers in total.
 
 ---
 
@@ -62,6 +69,9 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (pickup/delivery signal relay) |
 | `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; the gateway proxies just its `/health` |
 | `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
+| `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls, no JWT keys (D44) |
+| `notification-consumer` | — | nothing — no database | — | Kafka (reads), User Service (resolves contact details, D45), RabbitMQ (enqueues) |
+| `notification-worker` | — | nothing — no database | — | RabbitMQ only — no sibling calls, no JWT keys |
 
 Rules the code enforces deliberately:
 
@@ -78,6 +88,15 @@ Rules the code enforces deliberately:
   signals) and `orchestrator-worker` (runs them). Every other service — including
   `order-service` itself, since D36 — reports what it observed over HTTP and is unaware an
   orchestrator exists.
+- **Kafka carries facts; Temporal still owns every decision (D38).** Nothing on the
+  checkout path or inside the saga waits on Kafka, the Schema Registry, RabbitMQ or Celery —
+  every one of those can be stopped and checkout still completes, because each producer
+  writes to its own outbox table first and a background relay is what reaches the broker,
+  never the request itself. The Orchestrator Service holds no Kafka client at all: it has no
+  outbox of its own, and a `@workflow.defn` may not do I/O in the first place.
+- The Analytics and Notification Services never write to `orders`, `payments`, or any table
+  another service owns. Both are pure consumers of the same Kafka topic, under their own
+  consumer group, and could be stopped for a day without another service noticing.
 
 ### The order saga
 
@@ -133,6 +152,67 @@ database, and an outage at the card gateway can no longer starve the threads tha
 read and track orders. It also gives Week 2's Temporal saga two independently compensatable
 activities instead of one transaction spanning both concerns.
 
+### Eventing and observability
+
+Week 3 added a second data path beside the synchronous one above: every write to `orders`
+that changes something (a new order, a transition, a kitchen decision) and every write to
+`payments` also inserts a row into that service's own `order_outbox` / `payment_outbox`
+table, in the **same transaction** as the write it describes. Nothing else about checkout or
+the saga changed — this is the same argument D24 already made for the audit trail, applied
+again: a write that already succeeded must not be reported as a failure just because a
+second, unrelated system is unreachable.
+
+```
+  order-service            payment-service
+  ┌────────────┐           ┌──────────────┐
+  │   orders   │           │   payments   │
+  │(+ outbox row,          │ (+ outbox row,
+  │  same txn) │           │   same txn)  │
+  └─────┬──────┘           └──────┬───────┘
+        │ background relay        │ background relay
+        │ (polls unpublished       │ (same shape)
+        │  rows, FOR UPDATE         │
+        │  SKIP LOCKED)            │
+        ▼                          ▼
+  ┌─────────────────────────────────────────┐
+  │     Kafka — sfo.order.events.v1           │   3 partitions, keyed by order_id, so one
+  │     (schema-checked against the           │   order's events always land in one
+  │      Schema Registry before send)         │   partition and are never reordered
+  └───────────────┬─────────────┬─────────────┘
+                   │             │
+      consumer group "analytics" │  consumer group "notification"
+                   ▼             ▼
+        ┌─────────────────┐   ┌───────────────────────┐
+        │ Analytics Service │  │ Notification Consumer │
+        │  :8008             │  │ (order.confirmed/     │
+        │  sfo_analytics_core │  │  delivered/cancelled  │
+        │  (dedup + KPIs)      │  │  only — resolves      │
+        └─────────────────┘   │  contact details, then │
+                                │  enqueues a task)      │
+                                └───────────┬────────────┘
+                                            ▼
+                                    RabbitMQ ──▶ Notification Worker
+                                   (Celery broker)  (simulated SMS/email,
+                                                      time.sleep for latency)
+```
+
+Every service is also instrumented with OpenTelemetry: a request's trace follows it through
+every HTTP hop, into Postgres, across the Temporal boundary (via
+`temporalio.contrib.opentelemetry.TracingInterceptor` on both Temporal clients), and — via a
+`traceparent` captured at the moment the outbox row is written and carried as a Kafka message
+header — into whichever consumer picks the event up. The whole chain is one trace in Jaeger,
+not eight disconnected ones. Every service also exposes `/metrics` in Prometheus's own
+format (not the D35 envelope — see D41), scraped by Prometheus and rendered in Grafana.
+
+The rule that makes all of this safe to add: **Kafka carries facts, Temporal still owns every
+decision (D38).** No consumer signals the workflow, writes to `orders`, or sits on the
+checkout path — proved directly by running the full smoke suite twice, once with Kafka
+running and once with the Kafka container stopped, both green. If the whole eventing stack
+(Kafka, Schema Registry, RabbitMQ, both Celery processes, Analytics) were deleted tomorrow,
+checkout and the saga would not notice; only the outbox tables would grow unread.
+
+Full reasoning: D38–D45 in [readme/key-decisions.md](readme/key-decisions.md).
+
 ### References that cross a database boundary
 
 A foreign key cannot span two physical databases, so a column pointing at another service's
@@ -169,7 +249,11 @@ problem, not solving it.
 
 - Docker Desktop (Compose v2) — `docker compose version`
 - `curl` and `python3` for the smoke tests below
-- Ports free on the host: **80, 5432, 5433, 5434, 5435, 5436, 6379**
+- Ports free on the host: **80** (gateway), **5432–5438** (seven Postgres), **6379** (Redis),
+  **7233 / 8233 / 9233** (Temporal gRPC / UI / metrics), **16686 / 4317 / 4318** (Jaeger UI /
+  OTLP gRPC / OTLP HTTP), **9090** (Prometheus), **3000** (Grafana), **9092** (Kafka),
+  **8081** (Schema Registry), **5672 / 15672 / 15692** (RabbitMQ AMQP / management UI /
+  Prometheus metrics)
 - A `.env` file at the repo root — see below, it is not committed
 
 ---
@@ -189,8 +273,16 @@ ORDER_POSTGRES_PASSWORD=<choose one>
 PAYMENT_POSTGRES_PASSWORD=<choose one>
 MENU_POSTGRES_PASSWORD=<choose one>
 RIDER_POSTGRES_PASSWORD=<choose one>
+ANALYTICS_POSTGRES_PASSWORD=<choose one>
 
 REDIS_URL=redis://cache-redis:6379/0
+
+# Week 3 — the Grafana dashboard admin account and Celery's RabbitMQ broker credentials.
+# Never defaulted in code (same rule as every password above): a missing value aborts the
+# stack rather than falling back to a checked-in password.
+GRAFANA_ADMIN_PASSWORD=<choose one>
+RABBITMQ_USER=<choose one>
+RABBITMQ_PASSWORD=<choose one>
 
 # Service endpoints (within the Docker network)
 USER_SERVICE_URL=http://user-service:8001
@@ -232,7 +324,9 @@ service talks to which database.
 
 | Key | Required | Notes |
 |---|---|---|
-| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
+| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD`, `RIDER_POSTGRES_PASSWORD`, `ANALYTICS_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
+| `GRAFANA_ADMIN_PASSWORD` | yes | Grafana's own admin login, not a database password |
+| `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | yes | Celery's broker credentials (Week 3, D45) — required even though Kafka, not RabbitMQ, is the durable ledger |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
 Nothing falls back to a baked-in password, at either layer. Compose refuses to start with an
@@ -246,12 +340,12 @@ config **including passwords**, so redirect it rather than pasting the output an
 docker compose config | grep DATABASE_URL
 ```
 
-Four DSNs must come back, each naming a different host and database.
+Seven DSNs must come back, each naming a different host and database.
 
 Host names like `db-user-postgres` are **Docker DNS names**, reachable only from inside the
-Compose network. From your host the same databases are `localhost:5432`, `:5433`, `:5434` and
-`:5435` — which is why the host-run section below builds `DATABASE_URL` by hand. The
-`*_SERVICE_URL` values have the same constraint.
+Compose network. From your host the same databases are `localhost:5432` through `:5438` —
+which is why the host-run section below builds `DATABASE_URL` by hand. The `*_SERVICE_URL`
+values have the same constraint.
 
 If you change a password, reset that volume with `docker compose down -v`. Postgres only
 applies the variable when it initialises an empty data directory; editing it afterwards has
@@ -265,7 +359,7 @@ in a secrets manager, not in this file.
 ## Quick start
 
 ```bash
-docker compose up --build -d      # build images and start all 17 containers
+docker compose up --build -d      # build images and start all 27 containers
 docker compose ps                 # all should read "Up" / "healthy"
 ```
 
@@ -273,20 +367,34 @@ First boot takes a few minutes while the Python images build. Each Postgres cont
 its own schema — [db/user/init.sql](db/user/init.sql),
 [db/restaurant/init.sql](db/restaurant/init.sql), [db/order/init.sql](db/order/init.sql),
 [db/payment/init.sql](db/payment/init.sql), [db/menu/init.sql](db/menu/init.sql),
-[db/rider/init.sql](db/rider/init.sql) — automatically on the **first** boot of its volume.
-See [Resetting the databases](#resetting-the-databases) if you change one.
+[db/rider/init.sql](db/rider/init.sql), [db/analytics/init.sql](db/analytics/init.sql) —
+automatically on the **first** boot of its volume. See
+[Resetting the databases](#resetting-the-databases) if you change one.
 
-Two things to look at once it is up: `docker compose logs orchestrator-worker` should show
-`Worker polling task queue 'order-tasks'`, and the **Temporal Web UI** is at
-<http://localhost:8233>, where every order's workflow history is browsable. The UI is
-deliberately *not* behind the gateway — it has no authentication of its own, so proxying it
-would publish every workflow's history, including the arguments each was started with.
+Several things to look at once it is up:
 
-> **Upgrading a Week 1 checkout? `-v` is mandatory.** The `riders` table moved out of
-> `sfo_user_core` into its own database (D28), and `init.sql` only runs on an empty volume —
-> so without wiping, the user database keeps a stale `riders` table and the rider database is
-> never created. Add `RIDER_POSTGRES_PASSWORD`, `RIDER_SERVICE_URL` and `TEMPORAL_ADDRESS`
-> to `.env`, then:
+- `docker compose logs orchestrator-worker` should show
+  `Worker polling task queue 'order-tasks'`.
+- The **Temporal Web UI** is at <http://localhost:8233>, where every order's workflow
+  history is browsable.
+- The **Jaeger UI** is at <http://localhost:16686> — pick `order-service` and "Find Traces"
+  after placing an order to see the whole checkout, saga and Kafka publish as one trace.
+- The **Prometheus UI** is at <http://localhost:9090/targets> — every target should read
+  `UP`.
+- **Grafana** is at <http://localhost:3000> (`admin` / your `GRAFANA_ADMIN_PASSWORD`), with
+  the Prometheus datasource and dashboards already provisioned from
+  [grafana/provisioning/](grafana/provisioning/) — nothing to click together by hand.
+- The **RabbitMQ management UI** is at <http://localhost:15672>.
+
+None of these five are behind the gateway — like the Temporal Web UI, they have no
+authentication of their own beyond what's noted above, so proxying them would publish more
+than intended.
+
+> **Upgrading an older checkout? `-v` is mandatory.** Week 3 added columns to `orders`
+> (`rider_reported_stage`, `rider_reported_at` — D43) and two new outbox tables
+> (`order_outbox`, `payment_outbox` — D39), and `init.sql` only runs on an empty volume — so
+> without wiping, the schema stays exactly as it was before. Add every new key from
+> [Environment file](#environment-file) to `.env` first, then:
 >
 > ```bash
 > docker compose down -v && docker compose up --build -d
@@ -315,6 +423,17 @@ because the cache is a copy and never the source of truth. The Order Service's
 *advancing* them, and a retry with the same idempotency key repairs that once the
 orchestrator returns.
 
+The Analytics Service has no gateway route — like Temporal's UI, it is not user-facing — so
+check it directly on the Docker network:
+
+```bash
+docker exec sfo-analytics-service curl -s http://localhost:8008/api/v1/analytics/health
+```
+
+The Notification Service's two processes have no HTTP health route at all (one is a bare
+Kafka consumer, the other a Celery worker); `docker compose ps` and
+`docker compose logs notification-consumer` are the way to check on them.
+
 ### Run the test suite
 
 [scripts/smoke-test.sh](scripts/smoke-test.sh) drives all seven services through the gateway
@@ -322,8 +441,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 315 assertions against http://localhost
+./scripts/smoke-test.sh            # 328 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
+./scripts/smoke-test.sh --fast     # 209 assertions, skips the saga sections (~20s vs ~12min)
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
@@ -348,6 +468,16 @@ What it covers beyond status codes:
   by the foreign key, which the MongoDB collection had no way to do
 - **Cache-aside** — that a read populates `menu:<restaurant_id>` in Redis, that publishing
   invalidates it, and that the menu still serves with the cache cold
+- **`/metrics` is not routed by the gateway**, and every Prometheus scrape target reports
+  healthy
+- **Route-template cardinality stays bounded** — the guard against exactly the bug the Week
+  3 blueprint draft made (labelling metrics by `request.url.path`, so every order id mints a
+  new time series forever)
+- **The outbox drains, the Kafka topic has the right partition count, the Schema Registry
+  has every subject registered, and the Analytics Service has processed at least one event**
+  — the whole eventing chain, checked end to end, not just that the containers are up
+- **A pickup or delivery report is durable** — `rider_reported_stage` reads back correctly
+  through the same internal endpoint the saga's own recovery activity calls (D43)
 
 Because the lifecycle is now driven by a workflow, every post-checkout status assertion
 **polls**. Asserting immediately would be a race that passes on an idle laptop and fails
@@ -355,8 +485,8 @@ under load.
 
 [scripts/saga-resilience-test.sh](scripts/saga-resilience-test.sh) is separate, and slower
 (a few minutes), because it is destructive and because it waits out real timeouts. It holds
-the two checks that actually justify running a workflow engine — everything in the smoke test
-could be passed by a synchronous implementation with a retry loop; neither of these could:
+the checks that actually justify running a workflow engine — everything in the smoke test
+could be passed by a synchronous implementation with a retry loop; none of these could:
 
 ```bash
 ./scripts/saga-resilience-test.sh
@@ -374,6 +504,16 @@ could be passed by a synchronous implementation with a retry loop; neither of th
   bypassing the relay that would normally carry it, which is exactly what a signal lost in
   flight looks like. A lost *acceptance* must still complete the order without refunding;
   a lost *rejection* must still cancel and refund.
+- **Lost rider signal (D43)** — the same idea applied to a pickup report: written straight
+  to `orders.rider_reported_stage`, bypassing the relay. Checks the mechanism (the column,
+  its forward-only guard) rather than waiting out the live 3600-second saga timeout, which
+  no automated suite should block on — see the script's own comment for why.
+
+The **Kafka-down proof** lives in the smoke test, not here: run
+`./scripts/smoke-test.sh` once with the stack as-is and once with
+`docker compose stop kafka schema-registry`, and both runs pass identically. That is the
+machine-checkable version of D38 — nothing on the checkout or saga path depends on the
+eventing stack being up.
 
 Each run generates unique emails, phone numbers, and idempotency keys, so both are safe to
 run repeatedly against the same database. They only ever create data — nothing is deleted —
@@ -385,6 +525,13 @@ The resilience script additionally needs `docker` access to the local stack.
 For poking at a single endpoint by hand, see
 [readme/api-testing-guide.md](readme/api-testing-guide.md) — the same scenarios as
 copy-pasteable `curl` commands, grouped by service, with the expected response for each.
+
+For exercising the same contract from Postman instead of a terminal, import
+[postman/smartfoodops.postman_collection.json](postman/smartfoodops.postman_collection.json) —
+129 requests across 9 folders, generated from the same scenarios `smoke-test.sh` drives,
+including a Collection-Runner-only happy path through the saga (self-looping status polls,
+since checkout is asynchronous). See [postman/README.md](postman/README.md) for import steps,
+run order, and what it can't check that the shell script can.
 
 ### Shut down
 
@@ -605,6 +752,24 @@ curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bear
 …or visually, with each activity, retry and timer, in the Temporal UI at
 <http://localhost:8233> under workflow id `order-<ORDER_UUID>`.
 
+**9 — Everything above also happened on Kafka, with nobody calling anything new**
+
+No endpoint changed and no extra call was needed: every transition above committed an
+outbox row in the same transaction, a background relay published it, and two independent
+consumers picked it up.
+
+```bash
+# The whole checkout, saga and Kafka publish, as one trace:
+open "http://localhost:16686/search?service=order-service&limit=1"
+
+# The business counters the Analytics Service derived from the same events:
+curl -s http://localhost:9090/api/v1/query --data-urlencode \
+  'query=sfo_business_orders_placed_total' | python3 -m json.tool
+
+# The simulated SMS/email the Notification Service dispatched on confirmation:
+docker compose logs notification-worker | grep DISPATCH
+```
+
 ### Endpoint reference
 
 | Method | Path | Who may call it | Notes |
@@ -647,6 +812,7 @@ curl -s http://localhost/api/v1/orders/<ORDER_UUID>/logs -H "Authorization: Bear
 | `POST` | `/api/v1/payments/refund` | worker | Compensation; idempotent by status, and sweeps stranded `pending` rows |
 | `POST` | `/api/v1/riders/dispatch` | worker | Claims the nearest rider; `{"assigned": false}` is a `200`, not an error |
 | `POST` | `/api/v1/riders/release` | worker | Compensation; releasing an unheld order is success |
+| `GET` | `/api/v1/users/{user_id}/internal` | Notification Consumer | Resolves `phone`/`email` for a Kafka consumer with no user token to forward (Week 3, D45) |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -708,11 +874,20 @@ services:
   orchestrator-service:
     volumes: ["./services/orchestrator:/app/orchestrator", "./services/common:/app/common"]
     command: ["uvicorn", "orchestrator.main:app", "--host", "0.0.0.0", "--port", "8007", "--reload"]
+  analytics-service:
+    volumes: ["./services/analytics:/app/analytics", "./services/common:/app/common"]
+    command: ["uvicorn", "analytics.main:app", "--host", "0.0.0.0", "--port", "8008", "--reload"]
 ```
 
-`orchestrator-worker` is a long-running process rather than a request handler, so `--reload`
-does not apply the same way; restart it by hand (`docker compose restart orchestrator-worker`)
-after editing `workflows/order.py` or `activities/order.py`.
+`orchestrator-worker`, `notification-consumer` and `notification-worker` are long-running
+processes rather than request handlers, so `--reload` does not apply the same way; restart
+them by hand after editing their code:
+
+```bash
+docker compose restart orchestrator-worker      # workflows/order.py, activities/order.py
+docker compose restart notification-consumer    # consumer.py
+docker compose restart notification-worker      # tasks.py, worker.py
+```
 
 Then `docker compose up -d` — saving a `.py` file restarts that worker in about a second.
 
@@ -802,6 +977,14 @@ docker exec -it sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core
 #   SELECT seq, old_status, new_status, service, updated_by
 #     FROM order_tracking_logs WHERE order_id = '<uuid>' ORDER BY seq;
 
+# The outbox tables (Week 3, D39) — lives beside `orders`/`payments`, same databases.
+# published_at IS NULL means the relay hasn't reached Kafka with it yet; under normal
+# operation this should drain to empty within a second or two of a write.
+#   SELECT event_type, seq, published_at FROM order_outbox
+#     WHERE aggregate_id = '<uuid>' ORDER BY seq;      -- run against sfo-order-db
+#   SELECT event_type, seq, published_at FROM payment_outbox
+#     WHERE aggregate_id = '<uuid>' ORDER BY seq;      -- run against sfo-payment-db, same order id
+
 # Menu database — menus (the JSONB tree that replaced the MongoDB collection)
 docker exec -it sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core
 #   SELECT restaurant_id, jsonb_pretty(categories) FROM menus;
@@ -821,11 +1004,18 @@ docker exec -it sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core
 docker exec -it sfo-redis redis-cli ping
 #   redis-cli KEYS 'menu:*'
 #   redis-cli TTL menu:<restaurant_id>     # counts down from 3600
+
+# Analytics database — the Kafka read-model's own dedup table and derived projection
+# (Week 3, D44). Nothing else in the platform ever reads or writes this database.
+docker exec -it sfo-analytics-db psql -U sfo_analytics_admin -d sfo_analytics_core
+#   SELECT status, count(*) FROM order_projections GROUP BY status;
+#   SELECT event_type, count(*) FROM processed_events GROUP BY event_type;
+#   -- if this database were dropped entirely, resetting the "analytics" consumer group's
+#   -- Kafka offset and replaying the topic would rebuild both tables exactly.
 ```
 
 `psql` inside the container needs no password (local trust); from a GUI client on your host,
-connect to `localhost:5432` / `:5433` / `:5434` / `:5435` / `:5436` with the matching role
-and `.env` password.
+connect to `localhost:5432` through `:5438` with the matching role and `.env` password.
 
 Joining across services is deliberately impossible now. To follow an order to its customer,
 read `customer_id` and call `GET /api/v1/users/{id}` — the same path the services take.
@@ -838,8 +1028,8 @@ A schema file runs **only** when its own Postgres volume is empty. After editing
 docker compose down -v && docker compose up --build -d
 ```
 
-This wipes all six Postgres volumes plus Redis. To reset a single database,
-target its volume — the others keep their data:
+This wipes all seven Postgres volumes plus Redis, Kafka and Grafana's own storage. To reset
+a single database, target its volume — the others keep their data:
 
 ```bash
 docker compose rm -sf db-order-postgres
@@ -866,30 +1056,47 @@ the whole image.
 ```text
 smartfoodops-backend/
 ├── api-gateway/nginx.conf     # Path-based routing + /health
+├── prometheus/prometheus.yml  # Scrape config — every FastAPI service, both Temporal ports,
+│                              #   the outbox relays' own metrics, RabbitMQ (Week 3)
+├── grafana/provisioning/      # Datasource + dashboards, file-provisioned so `down -v`
+│                              #   never loses them (Week 3, D42)
+├── kafka/init-topics.sh       # One-shot: creates sfo.order.events.v1 (+ .dlq) explicitly,
+│                              #   at the partition count per-order ordering depends on
+├── rabbitmq/enabled_plugins   # Enables the management UI and the Prometheus exporter
 ├── db/                        # One schema per physical database, mounted into its container
 │   ├── user/init.sql          # roles (+ seed data), users
 │   ├── restaurant/init.sql    # restaurants
 │   ├── menu/init.sql          # menus (category tree as JSONB)
-│   ├── order/init.sql         # order_status enum, orders, order_tracking_logs
-│   ├── payment/init.sql       # payment_status enum, payments
-│   └── rider/init.sql         # riders
+│   ├── order/init.sql         # order_status enum, orders (+ outbox + rider report columns,
+│   │                          #   Week 3), order_tracking_logs, order_outbox
+│   ├── payment/init.sql       # payment_status enum, payments, payment_outbox
+│   ├── rider/init.sql         # riders
+│   └── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
 │   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_role, require_self_or_admin
-│   │   ├── bootstrap.py       # ServiceRuntime: logging + a service's own DB pool, in one call
+│   │   ├── bootstrap.py       # ServiceRuntime: logging + telemetry + a service's own DB pool, one call
 │   │   ├── config.py          # Env defaults, timeouts, pool bounds
 │   │   ├── errors.py          # HTTPException factories (400/403/404/409/422/500/502/503)
 │   │   ├── health.py          # health_payload(): the {status, service, database_reachable} shape
+│   │   ├── kafka.py           # build_producer(), SchemaRegistryValidator, trace-header
+│   │   │                      #   inject/extract across the Kafka boundary (Week 3, D40)
+│   │   ├── events/            # The event contract: EventEnvelope + one pydantic model per
+│   │   │                      #   event type, shared by every producer and consumer (Week 3)
 │   │   ├── lifespan.py        # compose_lifespan(): chain several ASGI lifespans into one
-│   │   ├── logging_config.py  # Uniform log format
+│   │   ├── logging_config.py  # Uniform log format, now with trace/span id correlation (Week 3)
 │   │   ├── money.py           # Decimal currency resolution shared by Order and Payment
+│   │   ├── outbox.py          # append_outbox() + OutboxRelay — the transactional outbox
+│   │   │                      #   and the background publisher (Week 3, D39)
 │   │   ├── postgres.py        # PostgresPool: lifespan, cursor, health probe, constraint_of()
 │   │   ├── redis_store.py     # RedisStore: the connection lifecycle Menu's cache and User's
 │   │   │                      #   refresh store both need
 │   │   ├── repository.py      # Repository base: one()/all()/write_one() over a leased cursor
 │   │   ├── service_client.py  # Inter-service HTTP, failure translation, and ServiceFacade
+│   │   ├── telemetry.py       # OpenTelemetry tracing + Prometheus /metrics, one call per
+│   │   │                      #   service (Week 3, D41)
 │   │   └── temporal.py        # TemporalGateway + workflow_id_for() (Orchestrator Service +
-│   │                          #   worker only, since D36 — see below)
+│   │                          #   worker only, since D36) — now with TracingInterceptor (Week 3)
 │   ├── user/                  # main.py, deps.py, apis/{users,sessions,health}.py,
 │   │                          #   security.py, repositories/{users,sessions}.py,
 │   │                          #   schemas/{users,sessions}.py                     (:8001)
@@ -901,29 +1108,52 @@ smartfoodops-backend/
 │   │                          #   tracking,transitions}.py,
 │   │                          #   repositories/{orders,tracking,sql}.py, pricing.py
 │   │                          #   No Temporal client and no worker (D36) — see the
-│   │                          #   Orchestrator entry below                        (:8004)
+│   │                          #   Orchestrator entry below. Runs its own outbox relay
+│   │                          #   in-process (Week 3, D39)                        (:8004)
 │   ├── payment/                # + apis/{payments,saga}.py, clients/order.py,
-│   │                            #   authorise.py, gateway.py, amounts.py           (:8005)
+│   │                            #   authorise.py, gateway.py, amounts.py
+│   │                            #   Also runs its own outbox relay (Week 3, D39)   (:8005)
 │   ├── rider/                  # + apis/{profile,delivery,dispatch}.py,
 │   │                            #   clients/{user,order}.py, fleet.py, eta.py     (:8006)
-│   └── orchestrator/           # main.py, deps.py, worker.py, apis/{health,order}.py,
-│                                #   schemas/order.py, activities/order.py,
-│                                #   workflows/order.py, clients/order/{order_service,
-│                                #   payment,rider}.py
-│                                #   Split out of the Order Service (D36): its own image,
-│                                #   its own deployable, no database of its own at all —
-│                                #   the API side starts/signals sagas over HTTP, the
-│                                #   worker runs them, and both reach every fact they need,
-│                                #   including the order itself, over HTTP too. Every
-│                                #   subdirectory is entity-scoped (today: `order` only),
-│                                #   so a second workflow this service orchestrates adds
-│                                #   files beside these rather than growing them.  (:8007)
-├── scripts/smoke-test.sh      # End-to-end assertions across all seven services
+│   ├── orchestrator/           # main.py, deps.py, worker.py, apis/{health,order}.py,
+│   │                            #   schemas/order.py, activities/order.py,
+│   │                            #   workflows/order.py, clients/order/{order_service,
+│   │                            #   payment,rider}.py
+│   │                            #   Split out of the Order Service (D36): its own image,
+│   │                            #   its own deployable, no database of its own at all —
+│   │                            #   the API side starts/signals sagas over HTTP, the
+│   │                            #   worker runs them, and both reach every fact they need,
+│   │                            #   including the order itself, over HTTP too. Every
+│   │                            #   subdirectory is entity-scoped (today: `order` only),
+│   │                            #   so a second workflow this service orchestrates adds
+│   │                            #   files beside these rather than growing them. Holds no
+│   │                            #   Kafka client at all (Week 3, D38)              (:8007)
+│   ├── analytics/               # main.py, deps.py, consumer.py, apis/health.py,
+│   │                            #   repositories/projections.py
+│   │                            #   A pure Kafka read-model, its own database, no sibling
+│   │                            #   calls, no JWT keys (Week 3, D44)               (:8008)
+│   └── notification/            # worker.py (Celery app + tasks), consumer.py (the
+│                                 #   Kafka-to-Celery bridge), tasks.py, clients/user.py
+│                                 #   Two containers, one image (Week 3, D45) — see below
+├── scripts/
+│   ├── smoke-test.sh           # End-to-end assertions across the whole stack
+│   ├── saga-resilience-test.sh # Concurrency, durability and lost-signal recovery
+│   └── init_bootstrap.sh       # Regenerates .env / db/*/init.sql / docker-compose.yml /
+│                                #   prometheus.yml / grafana provisioning / kafka /
+│                                #   rabbitmq byte-for-byte (D20, D42) — the reproducible
+│                                #   path from an empty directory to this running stack
 ├── readme/                    # Blueprints, contracts, and the decision record
+├── postman/                   # The same contract as smoke-test.sh, importable into Postman
 ├── docker-compose.yml         # Orchestration
 ├── .gitignore                 # Excludes .env, __pycache__, venvs, OS cruft
 └── .env                       # Local environment variables — gitignored, create it yourself
 ```
+
+`notification-consumer` (`python -m notification.consumer`) and `notification-worker`
+(`celery -A notification.worker worker`) are two containers built from the same
+`services/notification/Dockerfile` — the split is what makes the Celery hop a real
+concurrency pool rather than decorative: the consumer commits its Kafka offset only *after*
+a task is enqueued, so Kafka is the durable ledger and RabbitMQ never has to be (D45).
 
 Each service directory is a Python *package* — it has an `__init__.py`, and its modules
 import each other absolutely (`from order.repositories.orders import ...`). The Dockerfile
@@ -1015,6 +1245,15 @@ in a single-repo Compose setup; if services ever ship on independent release cyc
 | A payment stuck at `pending` | The gateway call failed after the row was written. Nothing was charged; Week 2's compensation workflow is what will reconcile these |
 | `payments` still in `sfo_order_core` after upgrading | Its volume predates the split. `docker compose down -v`, or reset just that volume as above |
 | Edits do nothing | Image is stale. `docker compose up -d --build <service>`, or use the hot-reload override |
+| `GET /subjects` on the Schema Registry returns `[]` | Nothing registered yet, or the registry wasn't reachable when a service started. The relay retries registration in the background (5 attempts, 3s apart) — check `docker compose logs order-service \| grep -i schema` |
+| Outbox rows never get `published_at` set | The relay logged a Kafka connection failure and is swallowing it by design (checkout must not depend on Kafka). `docker compose ps kafka`, then `docker compose logs order-service \| grep -i outbox` |
+| `sfo_outbox_backlog` climbing in Grafana / Prometheus | Same as above, or the topic is missing — `docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list` should show `sfo.order.events.v1` |
+| Analytics counters not moving after a checkout | Either the outbox hasn't drained (see above) or the consumer is wedged — `docker compose logs analytics-service`, and check `sfo_consumer_last_message_seconds` in Prometheus |
+| No SMS/email in the logs after a cancellation | `docker compose ps rabbitmq notification-consumer notification-worker` — three containers, all three need to be up. Check `notification-consumer` logs for the Kafka side and `notification-worker` for the Celery side separately, since a wedge in either looks the same from outside |
+| RabbitMQ container unhealthy / `Connection refused` from Celery | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` missing from `.env` — see [Environment file](#environment-file) |
+| Grafana shows "No data" on every panel | The datasource is provisioned by file, not by hand — `docker compose ps prometheus grafana`, then confirm targets are `up` at `http://localhost:9090/targets` before suspecting the dashboard |
+| A new Prometheus target never shows up as `up` | Prometheus doesn't hot-reload `prometheus.yml`. `docker kill --signal=SIGHUP sfo-prometheus`, or recreate the container |
+| Jaeger shows a trace that stops at `POST /api/v1/orders` with nothing from the saga | Expected if the order never reached the orchestrator (e.g. Redis/menu failure short-circuited checkout). If the saga did run, check that `orchestrator-worker` came up after the last rebuild — a stale image predating the tracing interceptor won't propagate the trace |
 
 ---
 
@@ -1047,6 +1286,17 @@ correct. Each service reads plain `DATABASE_URL` — it has no idea another data
 Audit logging is best-effort. The order is already committed when the log call fires, so a
 Menu Service failure is logged loudly rather than returned as a `500` — a `500` there would
 tell the client the order failed when it exists.
+
+A draft Week 3 blueprint
+([readme/week3-event-driven-observability-blueprint.md](readme/week3-event-driven-observability-blueprint.md))
+proposed Kafka eventing and observability in a shape that would have broken checkout, undone
+the Week 2 saga, and shipped several silent-failure bugs. What was actually built departs from
+it point for point — the full verdict, the corrected architecture, and the reasoning behind
+every choice live in [readme/key-decisions.md](readme/key-decisions.md) as **D38–D45**. The
+short version: Temporal still owns every decision on the order's critical path; Kafka only
+carries facts already committed to a database, via the transactional outbox
+(`services/common/outbox.py`) rather than a post-commit publish, so nothing on checkout ever
+blocks on or fails because of Kafka.
 
 ### Deviations from the payments migration blueprint
 

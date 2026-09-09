@@ -16,6 +16,7 @@ import psycopg2
 from fastapi import HTTPException
 
 from common.errors import conflict
+from common.outbox import append_outbox
 from common.postgres import constraint_of
 from common.repository import Repository
 from payment.schemas.payments import PaymentAuthorizeRequest, PaymentCreateRequest
@@ -93,17 +94,65 @@ class PaymentRepository(Repository):
             return cur.fetchone()
 
     def mark_authorized(self, payment_id: UUID, reference: str) -> dict:
-        """Record the gateway's verdict against the row that claimed the key."""
-        return self.write_one(_MARK_AUTHORIZED, (reference, str(payment_id)))
+        """Record the gateway's verdict against the row that claimed the key.
+
+        Was a single-statement `write_one`; now an explicit transaction so the
+        `payment.authorized` outbox row commits atomically with the status change (D39) —
+        the same argument D24 made for order_tracking_logs, applied to this table's first
+        outbox write. `authorise()` only reaches this method on the non-replay path (it
+        returns early on a replay before ever calling here), so "emit once per real
+        authorisation" falls out of the existing call structure rather than needing a
+        second guard here.
+        """
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(_MARK_AUTHORIZED, (reference, str(payment_id)))
+            payment = self._row(cur.fetchone())
+            append_outbox(
+                cur,
+                table="payment_outbox",
+                aggregate_type="payment",
+                aggregate_id=payment["order_id"],
+                event_type="payment.authorized",
+                payload={
+                    "payment_id": str(payment["id"]),
+                    "order_id": str(payment["order_id"]),
+                    "amount": payment["amount"],
+                    "transaction_reference": payment["transaction_reference"],
+                },
+            )
+            return payment
 
     def mark_refunded(self, order_id: UUID, reference: str) -> dict | None:
         """Move an order's payment to `refunded`, if it is in a state that can be.
 
         Returns None when nothing was refundable — either there is no payment, or it is
         already `refunded`. The caller distinguishes those, because the second is success
-        for a compensating action and the first is worth saying out loud.
+        for a compensating action and the first is worth saying out loud. The outbox row
+        is written only in the branch that actually changed something — a payment already
+        `refunded` reaches this method's *caller*'s "no-op" path, never this one, so a
+        second refund attempt (Temporal retries the compensating activity) cannot double-
+        emit.
         """
-        return self.write_one(_MARK_REFUNDED, (reference, str(order_id)))
+        with self._db.cursor(commit=True) as cur:
+            cur.execute(_MARK_REFUNDED, (reference, str(order_id)))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            payment = self._row(row)
+            append_outbox(
+                cur,
+                table="payment_outbox",
+                aggregate_type="payment",
+                aggregate_id=order_id,
+                event_type="payment.refunded",
+                payload={
+                    "payment_id": str(payment["id"]),
+                    "order_id": str(payment["order_id"]),
+                    "amount": payment["amount"],
+                    "transaction_reference": payment["transaction_reference"],
+                },
+            )
+            return payment
 
     def _duplicate(
         self,

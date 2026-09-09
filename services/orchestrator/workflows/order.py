@@ -231,6 +231,14 @@ class OrderWorkflow:
         )
 
         # 4. Collection, then delivery. Both wait on the rider reporting in.
+        #
+        # Week 3 (D46): a timeout here no longer compensates outright. The signal that
+        # would have set `self._picked_up`/`self._delivered` can be lost the same way a
+        # kitchen decision's signal can (both relays commit the fact locally, then relay it
+        # — see order/apis/signals.py), so a genuine timeout and a lost signal look
+        # identical from inside `wait_condition`. `_recover_rider_report` tells them apart
+        # with one local-database read on the Order Service's side, the same shape
+        # `_recover_kitchen_decision` already established for the kitchen's answer.
         self._stage = "awaiting_pickup"
         try:
             await workflow.wait_condition(
@@ -238,9 +246,20 @@ class OrderWorkflow:
                 timeout=timedelta(seconds=DELIVERY_TIMEOUT_SECONDS),
             )
         except asyncio.TimeoutError:
-            return await self._compensate(
-                order_id, "pickup_timeout", "Rider never collected the order"
-            )
+            self._stage = "recovering_rider_report"
+            recovered_stage = await self._recover_rider_report(order_id)
+            if recovered_stage in ("picked_up", "delivered"):
+                self._picked_up = True
+                if recovered_stage == "delivered":
+                    # A lost pickup signal *and* a lost delivery signal, both reported and
+                    # both unheard — rare, but the same reasoning `rider_delivery`'s own
+                    # signal handler already applies (a delivery implies a pickup) applies
+                    # here too, from the recovered record instead of a live signal.
+                    self._delivered = True
+            else:
+                return await self._compensate(
+                    order_id, "pickup_timeout", "Rider never collected the order"
+                )
 
         await self._transition(order_id, "picked_up", "rider-service")
 
@@ -251,9 +270,14 @@ class OrderWorkflow:
                 timeout=timedelta(seconds=DELIVERY_TIMEOUT_SECONDS),
             )
         except asyncio.TimeoutError:
-            return await self._compensate(
-                order_id, "delivery_timeout", "Rider never completed the delivery"
-            )
+            self._stage = "recovering_rider_report"
+            recovered_stage = await self._recover_rider_report(order_id)
+            if recovered_stage == "delivered":
+                self._delivered = True
+            else:
+                return await self._compensate(
+                    order_id, "delivery_timeout", "Rider never completed the delivery"
+                )
 
         await self._transition(
             order_id, "delivered", "rider-service", metadata={"rider_id": self._rider_id}
@@ -338,6 +362,51 @@ class OrderWorkflow:
 
         workflow.logger.info(
             "Order %s has no kitchen decision on record; the wait was genuine silence",
+            order_id,
+        )
+        return None
+
+    async def _recover_rider_report(self, order_id: str) -> str | None:
+        """Ask the Order Service what the rider has reported, after a pickup or delivery
+        wait timed out (Week 3, D46).
+
+        Returns `"picked_up"`, `"delivered"`, or `None` for "nothing on record" — the exact
+        shape `_recover_kitchen_decision` returns for its own question, and for the same
+        reason: `orders.rider_reported_stage` is written before the signal that carries it
+        into this workflow is sent (order/apis/signals.py), so a lost signal and genuine
+        silence are indistinguishable from inside `wait_condition` alone.
+
+        A database (now a service, since D36) that will not answer is treated as no
+        report — the same safe-default bias `_recover_kitchen_decision` already applies,
+        for the same reason: refunding a delivered order is a real customer-visible
+        failure, and this is the one local read standing between a lost signal and that
+        outcome.
+        """
+        try:
+            recorded_on_order = await workflow.execute_activity(
+                OrderActivities.read_rider_report_activity,
+                {"order_id": order_id},
+                start_to_close_timeout=timedelta(seconds=10),
+                retry_policy=STATE,
+            )
+        except ActivityError as exc:
+            workflow.logger.error(
+                "Could not read the rider report for order %s after the timeout; "
+                "treating it as no report: %s",
+                order_id,
+                exc.cause or exc,
+            )
+            return None
+
+        recorded = recorded_on_order.get("stage")
+        if recorded in ("picked_up", "delivered"):
+            workflow.logger.info(
+                "Recovered a lost rider report for order %s: '%s'", order_id, recorded
+            )
+            return recorded
+
+        workflow.logger.info(
+            "Order %s has no rider report on record; the wait was genuine silence",
             order_id,
         )
         return None
