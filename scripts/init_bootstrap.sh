@@ -1091,9 +1091,11 @@ services:
       USER_SERVICE_URL: http://user-service:8001
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       MENU_SERVICE_URL: http://menu-service:8003
-      # This service starts the saga and relays signals into it, both as HTTP calls into
-      # the Orchestrator Service (D36) — it holds no Temporal client of its own any more.
-      ORCHESTRATOR_SERVICE_URL: http://orchestrator-service:8007
+      # This service starts the order saga and signals the kitchen's decision into it,
+      # holding its own Temporal client again (D47). D36 had replaced that client with HTTP
+      # calls into the Orchestrator Service, because naming a workflow by class reference
+      # dragged the orchestrator's imports into this process; naming it by string does not.
+      TEMPORAL_ADDRESS: temporal-server:7233
       # The outbox relay's target (Week 3, D39). Deliberately no `depends_on: kafka` below:
       # the relay's own reconnect loop is what handles Kafka not being ready yet, and a
       # hard startup dependency here would wrongly imply checkout needs Kafka to work.
@@ -1102,8 +1104,8 @@ services:
     depends_on:
       db-order-postgres:
         condition: service_healthy
-      orchestrator-service:
-        condition: service_started
+      temporal-server:
+        condition: service_healthy
     networks:
       - smartfoodops-network
 
@@ -1129,7 +1131,9 @@ services:
 
   # Owns the delivery fleet. It reads the User Service to confirm an account really holds
   # the `rider` role, and the Restaurant Service for the coordinates dispatch measures
-  # from; it reaches the Order Service only to relay pickup and delivery signals.
+  # from; it reaches the Order Service to record a rider's pickup or delivery against the
+  # order, then signals the saga itself (D47) — order state stays the Order Service's,
+  # the event goes straight to Temporal from the service that observed it.
   rider-service:
     build:
       context: ./services
@@ -1140,8 +1144,11 @@ services:
       <<: [*rider-db-env, *jwt-env]
       USER_SERVICE_URL: http://user-service:8001
       ORDER_SERVICE_URL: http://order-service:8004
+      TEMPORAL_ADDRESS: temporal-server:7233
     depends_on:
       db-rider-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -1206,13 +1213,17 @@ services:
     networks:
       - smartfoodops-network
 
-  # --- 4. ORCHESTRATOR (D36) ---
-  # The order saga's Temporal front door and its worker. Split out of the Order Service:
-  # before D36 `order-service` held a Temporal client directly and `order-worker` shared
-  # its image and database. Neither is true any more — this pair owns no database at all,
-  # and reaches every fact it needs, including the order itself, over HTTP on the internal
-  # key. See orchestrator/clients/order.py and order/apis/transitions.py for the boundary
-  # that replaced the direct database access.
+  # --- 4. ORCHESTRATOR (D36, D47) ---
+  # Where workflows live and run. Split out of the Order Service by D36: before that,
+  # `order-service` held a Temporal client directly and `order-worker` shared its image and
+  # database. This pair owns no database at all, and reaches every fact it needs, including
+  # the order itself, over HTTP on the internal key — see orchestrator/clients/order/ and
+  # order/apis/transitions.py for the boundary that replaced the direct database access.
+  #
+  # D47 took the saga routes off the API side. It was the front door for starting and
+  # signalling workflows; services do that themselves now, through their own Temporal
+  # client, so what is left here is the health probe and /metrics. The worker below is the
+  # half that does the work, and orchestrator/registry.py declares what it runs.
   orchestrator-service:
     build:
       context: ./services
@@ -1486,10 +1497,11 @@ http {
         }
 
         # 🎼 Route only the Orchestrator Service's health probe. `location =` is an exact
-        # match, not a prefix — /api/v1/orchestrator/sagas stays unroutable from here on
-        # purpose (D36): the only caller of that surface is the Order Service, over the
-        # internal network, and publishing it through the gateway would add public surface
-        # the split never needed to add.
+        # match, not a prefix, and since D47 there is nothing else on that service to
+        # match: the saga routes it once carried are gone, because services start and
+        # signal workflows through their own Temporal client rather than over HTTP. The
+        # exact match stays anyway — it is what keeps a future route on this service from
+        # becoming publicly reachable the moment someone adds one.
         location = /api/v1/orchestrator/health {
             proxy_pass http://orchestrator-service:8007;
             proxy_set_header Host $host;

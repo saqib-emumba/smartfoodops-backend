@@ -3467,7 +3467,7 @@
         },
         {
           "id": "4a433b39-5989-4818-8795-30f572f061f9",
-          "name": "Signal relay without the internal key -> 401",
+          "name": "Rider report without the internal key -> 401",
           "request": {
             "method": "POST",
             "header": [
@@ -3476,10 +3476,10 @@
                 "value": "application/json"
               }
             ],
-            "url": "{{base_url}}/api/v1/orders/{{order_id}}/signals",
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/rider-report",
             "body": {
               "mode": "raw",
-              "raw": "{\"signal\":\"rider_pickup\",\"payload\":{}}",
+              "raw": "{\"stage\":\"picked_up\"}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -3632,7 +3632,7 @@
           ]
         }
       ],
-      "description": "Registers the two-rider fleet dispatch will pick from, and proves every saga-internal endpoint (dispatch/release/authorize/refund/signals) refuses every user token, however privileged -- 'the workflow may do this' must never become 'anyone may do this'."
+      "description": "Registers the two-rider fleet dispatch will pick from, and proves every saga-internal endpoint (dispatch/release/authorize/refund/rider-report) refuses every user token, however privileged -- 'the workflow may do this' must never become 'anyone may do this'."
     },
     {
       "id": "4f809548-af9c-449c-9c91-59f567d25098",

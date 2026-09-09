@@ -4,7 +4,8 @@ Every container in `docker-compose.yml` as of Week 3, with real host/container p
 the actual dependency graph — not an idealized version. See
 [readme/key-decisions.md](../key-decisions.md) for the D-numbers behind the shape (D01
 database-per-service, D25 orchestration over choreography, D36 the orchestrator split,
-D38 Kafka carries facts / Temporal owns decisions, D39 the transactional outbox).
+D38 Kafka carries facts / Temporal owns decisions, D39 the transactional outbox, D47
+services hold their own Temporal client).
 
 ```mermaid
 flowchart TB
@@ -19,7 +20,7 @@ flowchart TB
         OrderSvc["Order Service<br/>8004"]
         PaymentSvc["Payment Service<br/>8005"]
         RiderSvc["Rider Service<br/>8006"]
-        OrchestratorAPI["Orchestrator Service<br/>8007"]
+        OrchestratorAPI["Orchestrator Service<br/>8007 health only"]
         AnalyticsSvc["Analytics Service<br/>8008"]
     end
 
@@ -69,11 +70,12 @@ flowchart TB
     OrderSvc -->|verify customer| UserSvc
     OrderSvc -->|verify restaurant| RestaurantSvc
     OrderSvc -->|fetch menu| MenuSvc
-    OrderSvc -->|start and signal saga| OrchestratorAPI
     PaymentSvc -->|verify order total| OrderSvc
-    RiderSvc -->|relay pickup and delivery| OrderSvc
+    RiderSvc -->|record pickup and delivery stage| OrderSvc
 
-    OrchestratorAPI -->|start and signal workflow| TemporalServer
+    OrderSvc -->|start saga and signal kitchen decision| TemporalServer
+    RiderSvc -->|signal pickup and delivery| TemporalServer
+    OrchestratorAPI -->|health probe only| TemporalServer
     OrchestratorWorker -->|poll order_tasks queue| TemporalServer
     OrchestratorWorker -->|authorize and refund| PaymentSvc
     OrchestratorWorker -->|transitions and internal reads| OrderSvc

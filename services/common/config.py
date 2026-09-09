@@ -58,14 +58,19 @@ DEFAULT_MENU_SERVICE_URL = "http://menu-service:8003"
 DEFAULT_ORDER_SERVICE_URL = "http://order-service:8004"
 DEFAULT_PAYMENT_SERVICE_URL = "http://payment-service:8005"
 DEFAULT_RIDER_SERVICE_URL = "http://rider-service:8006"
-# D36: the workflow orchestrator, split out of the Order Service's own image and database.
-DEFAULT_ORCHESTRATOR_SERVICE_URL = "http://orchestrator-service:8007"
+# No DEFAULT_ORCHESTRATOR_SERVICE_URL any more (D47). The Orchestrator Service kept its
+# container but lost its saga routes: services reach Temporal directly now, so nothing
+# addresses it over HTTP and there is no base URL left for anyone to hold.
 
-# The workflow orchestrator. gRPC, so no scheme.
+# The workflow orchestrator. gRPC, so no scheme. Held by order-service and rider-service —
+# which start and signal sagas — as well as by both orchestrator processes.
 DEFAULT_TEMPORAL_ADDRESS = "temporal-server:7233"
 
-# One task queue for the order saga. Named here rather than in the workflow so the service
-# that starts a workflow and the worker that runs it cannot disagree about where it goes.
+# One task queue for the order saga. Named here rather than in the workflow so the services
+# that start and signal a workflow and the worker that runs it cannot disagree about where
+# it goes. A second orchestrated entity gets its own constant beside this one and its own
+# entry in orchestrator/registry.py — that pair is the whole contract between a service
+# holding a SagaClient and the worker executing what it starts.
 ORDER_TASK_QUEUE = "order-tasks"
 
 # Ceiling on a single inter-service HTTP round trip. Kept well below the client-facing

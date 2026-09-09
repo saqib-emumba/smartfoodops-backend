@@ -128,7 +128,7 @@ alive.
 
 | Port | What | Notes |
 |---|---|---|
-| `:7233` | gRPC workflow API | Used by `orchestrator-service` and `orchestrator-worker` only — no other service holds a Temporal client |
+| `:7233` | gRPC workflow API | Used by `orchestrator-worker`, and since D47 by `order-service` and `rider-service`, which start and signal workflows directly. `orchestrator-service` holds a client only for its health probe |
 | `:8233` | Web UI | Browse every workflow by id (`order-<ORDER_UUID>`), its full event history, and replay it step by step. **Deliberately not behind the gateway — it has no auth of its own** (see §8) |
 | `:9233` | Prometheus metrics | Pinned specifically for Week 3 — scraped by `prometheus.yml`'s `temporal-server` job like any other target |
 
@@ -199,10 +199,12 @@ Two boundaries HTTPX auto-instrumentation can't reach, handled explicitly:
 
 - **Temporal.** `TracingInterceptor` is registered on the **Client** only — never the Worker,
   confirmed against Temporal's own docs — in both places a client is constructed:
-  `common/temporal.py`'s `Client.connect()` (used by `orchestrator-service`) and
-  `orchestrator/worker.py`, which now routes through the same `TemporalGateway` rather than
-  calling `Client.connect()` a second, uninstrumented way. Without this on *both*, a trace
-  snaps at `POST /api/v1/orders` and none of the saga's activities appear in it.
+  `common/temporal.py`'s `Client.connect()` — which every client now goes through, including
+  `order-service`'s and `rider-service`'s since D47 — and `orchestrator/worker.py`, which
+  routes through the same `TemporalGateway` rather than calling `Client.connect()` a second,
+  uninstrumented way. One connect path means a service that gains a Temporal client gains
+  trace propagation with it, rather than having to remember. Without this, a trace snaps at
+  `POST /api/v1/orders` and none of the saga's activities appear in it.
 - **Kafka.** There is no HTTP call to instrument automatically, so `common/kafka.py` carries
   the propagation by hand:
   - `inject_trace_headers(traceparent, tracestate)` — called by the relay at publish time,
@@ -223,13 +225,11 @@ rider produces one trace with (at least) these spans, all under one `trace_id`:
 ```
 order-service       POST /api/v1/orders                         (server span)
  ├─ psycopg2         INSERT INTO orders / order_outbox           (DB span)
- ├─ httpx            POST orchestrator-service/.../sagas         (client span)
- │   └─ orchestrator-service  POST /api/v1/orchestrator/sagas    (server span)
- │       └─ temporal          StartWorkflow                       (Temporal span, TracingInterceptor)
- │           └─ orchestrator-worker  OrderWorkflow.run             (workflow task)
- │               ├─ httpx     POST payment-service/authorize      (client span)
- │               │   └─ payment-service  ...                      (server + DB span)
- │               └─ httpx     POST rider-service/dispatch          (client span)
+ ├─ temporal         StartWorkflow                              (Temporal span, TracingInterceptor)
+ │   └─ orchestrator-worker  OrderWorkflow.run                    (workflow task)
+ │       ├─ httpx     POST payment-service/authorize              (client span)
+ │       │   └─ payment-service  ...                              (server + DB span)
+ │       └─ httpx     POST rider-service/dispatch                  (client span)
  │                   └─ rider-service  ...                         (server + DB span)
  └─ (later, async, same trace_id via Kafka headers)
      analytics.consume         order.confirmed                    (consumer span)
@@ -338,7 +338,7 @@ scrape_configs:
   - job_name: "order-service"         # :8004
   - job_name: "payment-service"       # :8005
   - job_name: "rider-service"         # :8006
-  - job_name: "orchestrator-service"  # :8007
+  - job_name: "orchestrator-service"  # :8007 — health and /metrics only since D47
   - job_name: "orchestrator-worker"   # :9108 — bare prometheus_client server, no FastAPI app
   - job_name: "analytics-service"     # :8008
   - job_name: "notification-consumer" # :9110 — same reasoning as orchestrator-worker

@@ -28,7 +28,7 @@
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
 #   POST   /api/v1/orders/{id}/reject          POST   /api/v1/payments/refund
 #   GET    /api/v1/orders/kitchen/{id}         POST   /api/v1/riders/dispatch
-#   POST   /api/v1/orders/{id}/signals         POST   /api/v1/riders/release
+#   POST   /api/v1/orders/{id}/rider-report    POST   /api/v1/riders/release
 #   POST   /api/v1/riders                      GET    /api/v1/riders/me
 #   PATCH  /api/v1/riders/me/location          PATCH  /api/v1/riders/me/availability
 #   POST   /api/v1/riders/me/orders/{id}/picked-up
@@ -683,8 +683,8 @@ expect "refund without the internal key -> 401" 401 POST /api/v1/payments/refund
   "{\"order_id\":\"$ORDER_ID\"}"
 expect "authorize without the internal key -> 401" 401 POST /api/v1/payments/authorize \
   "{\"order_id\":\"$ORDER_ID\",\"amount\":\"27.00\",\"idempotency_key\":\"nope\"}"
-expect "signal relay without the internal key -> 401" 401 POST "/api/v1/orders/$ORDER_ID/signals" \
-  "{\"signal\":\"rider_pickup\",\"payload\":{}}"
+expect "rider report without the internal key -> 401" 401 POST "/api/v1/orders/$ORDER_ID/rider-report" \
+  "{\"stage\":\"picked_up\"}"
 expect "internal order read without the key -> 401" 401 GET "/api/v1/orders/$ORDER_ID/internal"
 
 # The kitchen path is no longer internal at all. Since D32 an admin decides an order
@@ -716,11 +716,13 @@ expect "a restaurant_admin who does not own this restaurant cannot publish its m
   POST /api/v1/menus "$MENU" "${OWNER2_AUTH[@]}"
 
 if [[ -n "$INTERNAL_KEY" ]]; then
-  # The relay now carries rider events only: a kitchen decision has its own authenticated
+  # This route records rider stages only: a kitchen decision has its own authenticated
   # endpoint, and leaving it reachable here too would be a second way to do one thing.
-  expect "the relay no longer accepts a kitchen decision -> 422" 422 \
-    POST "/api/v1/orders/$ORDER_ID/signals" \
-    '{"signal":"restaurant_decision","payload":{"decision":"accepted"}}' "${INTERNAL[@]}"
+  # Since D47 the route records without relaying — the Rider Service signals the saga
+  # itself — so the constrained field is a stage, not a signal name.
+  expect "the rider report route rejects a kitchen decision -> 422" 422 \
+    POST "/api/v1/orders/$ORDER_ID/rider-report" \
+    '{"stage":"restaurant_decision"}' "${INTERNAL[@]}"
 fi
 
 # --- happy path all the way to delivered -------------------------------------------------

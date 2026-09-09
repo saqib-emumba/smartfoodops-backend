@@ -4,14 +4,14 @@ The non-deterministic half of the workflow: HTTP calls to sibling services — e
 them, since D36 moved this worker out of the Order Service's image and database. Before
 that, `transition_order_activity` and `read_kitchen_decision_activity` were the two
 exceptions, writing and reading `sfo_order_core` directly through a shared
-`OrderRepository`; now all six activities reach every service they touch, including the
+`OrderRepository`; now all seven activities reach every service they touch, including the
 Order Service itself, over HTTP on the internal key. See
 orchestrator/clients/order/order_service.py for what replaced the direct access.
 
-This module — like `clients/order/`, `schemas/order.py`, `apis/order.py` and
-`workflows/order.py` — is scoped to the `order` entity specifically, so a future second
-entity this service orchestrates gets its own `activities/<entity>.py` beside this one
-rather than a second class crammed in here.
+This module — like `clients/order/` and `workflows/order.py` — is scoped to the `order`
+entity specifically, so a future second entity this service orchestrates gets its own
+`activities/<entity>.py` beside this one rather than a second class crammed in here, and
+declares it in `registry.py`.
 
 Two rules decide the shape of every function below, unchanged by the move.
 
@@ -60,8 +60,10 @@ class OrderActivities:
     derivation — `ClassName.method_name` never appears; Temporal names an activity by its
     *method*, and `OrderActivities` supplies the shared state each method needs. Before
     D36 this took an injected `OrderRepository`; now it takes `OrderServiceClient`, the
-    HTTP client that replaced it — the constructor's shape changed, the six method names
+    HTTP client that replaced it — the constructor's shape changed, the seven method names
     Temporal has recorded in every workflow's history did not.
+
+    Constructed in `registry.py`, which is where the method list Temporal registers lives.
     """
 
     def __init__(self, *, orders: OrderServiceClient, logger: Logger):

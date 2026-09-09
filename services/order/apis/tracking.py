@@ -1,6 +1,6 @@
 """The append-only audit trail: a sibling's write, and a caller's read.
 
-Unlike signals.py, the guard here stays per-route rather than moving to the router: this
+Unlike rider_reports.py, the guard here stays per-route rather than moving to the router: this
 router's two routes carry different credentials — the write is internal-key only, the read
 is a bearer token checked against the order's owner — so a single router-level dependency
 would either lock the read out from behind a bearer or leave the write unguarded.

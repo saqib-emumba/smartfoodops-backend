@@ -19,10 +19,10 @@ sequenceDiagram
     participant RestaurantSvc as Restaurant Service (FastAPI)
     participant MenuSvc as Menu Service (FastAPI)
     participant OrderDB as PostgreSQL (sfo_order_core)
-    participant Orchestrator as Orchestrator Service (Temporal saga)
+    participant Temporal as Temporal Server (the order saga)
 
     %% 1. SUCCESS PATH
-    Note over Customer, Orchestrator: Flow: POST /api/v1/orders — success path
+    Note over Customer, Temporal: Flow: POST /api/v1/orders — success path
     Customer->>Gateway: POST /api/v1/orders (payload + X-Idempotency-Key + Bearer token)
     Gateway->>OrderSvc: Forward request
 
@@ -56,17 +56,17 @@ sequenceDiagram
     end
 
     rect rgb(240, 248, 240)
-        Note over OrderSvc, Orchestrator: 5. Hand the committed order to the saga (fire-and-forget)
-        OrderSvc-)Orchestrator: POST /api/v1/orchestrator/sagas [X-Internal-Key]
-        Note over OrderSvc, Orchestrator: Payload: order_id, restaurant_id, amount,<br/>capacity, restaurant latitude/longitude
-        Note over OrderSvc, Orchestrator: Deliberately non-fatal (D09): the order is already committed,<br/>so a failure here is logged, never returned to the client.<br/>Payment authorization, kitchen decision, rider dispatch and delivery<br/>all happen asynchronously from here — see order-saga-orchestration-guide.md
+        Note over OrderSvc, Temporal: 5. Hand the committed order to the saga (fire-and-forget)
+        OrderSvc-)Temporal: start OrderWorkflow, id order-{order_id} [SagaClient]
+        Note over OrderSvc, Temporal: Payload: order_id, restaurant_id, amount,<br/>capacity, restaurant latitude/longitude
+        Note over OrderSvc, Temporal: Named by string, never by class (D47), so this service<br/>imports nothing from the orchestrator. Deliberately non-fatal (D09):<br/>the order is already committed, so a failure here is logged, never<br/>returned to the client. Payment authorization, kitchen decision, rider<br/>dispatch and delivery all follow asynchronously.
     end
 
     OrderSvc-->>Gateway: 201 Created — Envelope[OrderResponse] (status: "created")
     Gateway-->>Customer: 201 Created
 
     %% 2. ERROR & EDGE CASES
-    Note over Customer, Orchestrator: Flow: POST /api/v1/orders — error & edge cases
+    Note over Customer, Temporal: Flow: POST /api/v1/orders — error & edge cases
     Customer->>Gateway: POST /api/v1/orders
     Gateway->>OrderSvc: Forward request
 
@@ -78,8 +78,8 @@ sequenceDiagram
         OrderSvc->>OrderDB: SELECT * FROM orders WHERE idempotency_key = :key
         OrderDB-->>OrderSvc: Existing order row (order_id, total_amount, ...)
         OrderSvc->>OrderSvc: require_self_or_admin(caller, existing.customer_id)
-        OrderSvc-)Orchestrator: POST /api/v1/orchestrator/sagas [idempotent retry]
-        Note over OrderSvc, Orchestrator: Self-healing: a no-op if that saga is already running
+        OrderSvc-)Temporal: start OrderWorkflow [idempotent retry]
+        Note over OrderSvc, Temporal: Self-healing: WorkflowIDConflictPolicy.USE_EXISTING<br/>makes this a no-op if that saga is already running
         OrderSvc-->>Gateway: 200 OK — the SAME order, unchanged (message: "Replayed")
         Gateway-->>Customer: 200 OK
     else Edge Case C: Item sold out / unknown option / total mismatch

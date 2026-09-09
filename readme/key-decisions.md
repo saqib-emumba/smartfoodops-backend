@@ -62,6 +62,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D43](#d43--the-riders-report-becomes-a-durable-column-on-orders) | The rider's report becomes a durable column on `orders` | 2026-09-08 | Accepted |
 | [D44](#d44--the-analytics-service-gets-its-own-database-and-dedups-by-consumer_group-event_id) | The Analytics Service gets its own database, dedups by `(consumer_group, event_id)` | 2026-09-08 | Accepted |
 | [D45](#d45--kafka-is-the-ledger-rabbitmqcelery-is-the-concurrency-pool) | Kafka is the ledger, RabbitMQ/Celery is the concurrency pool | 2026-09-09 | Accepted |
+| [D47](#d47--services-hold-their-own-temporal-client-and-name-workflows-by-string) | Services hold their own Temporal client and name workflows by string | 2026-09-09 | Accepted |
 
 ---
 
@@ -1102,7 +1103,9 @@ this as done.
 **What this does *not* do:** invent a route, a database, or a shared abstraction for a
 second entity that does not exist yet. `apis/order.py`'s URLs (`/api/v1/orchestrator/sagas`,
 `.../sagas/{id}/signals`) are unchanged — a second entity would need its own prefix, added
-when it exists, not reserved in advance. No `clients/shared/` was created for the case where
+when it exists, not reserved in advance. (D47 deleted `apis/order.py` outright: services
+name workflows by string on their own Temporal client, so a second entity needs no route at
+all — only an entry in `orchestrator/registry.py`.) No `clients/shared/` was created for the case where
 two entities might one day want the *same* payment or rider client: today's three clients
 are order-shaped and duplicating a genuinely reusable client, if one turns out to be needed,
 is a decision for when a second entity's requirements are known, not a guess made now.
@@ -1231,7 +1234,10 @@ for every phase of this work.
 D31's guard compares with `>`) and `orders.rider_reported_at`.
 `POST /api/v1/orders/{id}/signals` records the stage, guarded forward-only, **before**
 relaying to the orchestrator — mirroring D27's rule for kitchen tickets exactly: commit the
-fact, then relay it, and never roll the fact back if the relay fails. A new
+fact, then relay it, and never roll the fact back if the relay fails. (That route is
+`POST /api/v1/orders/{id}/rider-report` as of D47, and it no longer relays: the Rider Service
+signals Temporal itself, immediately after this write. The ordering rule is unchanged, and is
+the reason the write still crosses a service boundary at all.) A new
 `read_rider_report_activity`, shaped identically to `read_kitchen_decision_activity`, lets
 the saga read it back when a pickup or delivery wait times out, and resume instead of
 compensating if the rider genuinely reported.
@@ -1383,6 +1389,84 @@ Week 3 blueprint had already flagged in a different file. Fixed by requiring
 the credential-free hostname may default. And a second stateful broker in the observability
 week, whose durability this design deliberately does not lean on — see the "instead of"
 above for why that is the point, not an oversight.
+
+---
+
+### D47 — Services hold their own Temporal client and name workflows by string
+
+**Decided:** the services that observe a saga fact talk to Temporal directly, through a
+shared `SagaClient` in [services/common/temporal.py](../services/common/temporal.py), instead
+of posting to the Orchestrator Service. `order-service` starts `OrderWorkflow` and signals
+`restaurant_decision`; `rider-service` signals `rider_pickup` and `rider_delivery`. The
+Orchestrator Service keeps its container but loses its two saga routes — `apis/order.py` and
+`schemas/order.py` are deleted, leaving `apis/health.py` and the `/metrics` route
+`instrument_app` mounts. What the worker runs moves out of `worker.py` into a new
+[orchestrator/registry.py](../services/orchestrator/registry.py), and
+`order/apis/signals.py` becomes `apis/rider_reports.py`, keeping the durable write and
+dropping the relay.
+
+**The mechanism that makes it safe is naming the workflow by string.** `SagaClient.start`
+takes `"OrderWorkflow"`, not `OrderWorkflow.run`. That is the whole difference from what D36
+found unworkable: a class reference means importing `orchestrator.workflows.order`, which
+imports `activities/order.py`, which loads the payment and rider clients into a process where
+neither `PAYMENT_SERVICE_URL` nor `RIDER_SERVICE_URL` is set. A string imports nothing. So no
+service outside `services/orchestrator/` may import a workflow or activity module, and the
+contract between them is `SagaClient` plus the task-queue and signal-name constants in
+`common/config.py`. Verified the way D34 and D36 verified their equivalent claims — reading
+`sys.modules` inside the running containers, which lists no `orchestrator.*` module in either
+`order-service` or `rider-service`.
+
+**Instead of:** D36's HTTP facade, whose two route bodies were `client.start_workflow(...)`
+and `handle.signal(...)` and nothing else. Also instead of moving the seven activities into
+the services that own their data — that would dissolve D36's whole cost list, but it makes
+the orchestrator a workflow-only host rather than the place workflows live and run, and it
+needs a drain. Recorded here as considered and declined, not overlooked.
+
+**Why:** the facade was a workaround for an import problem, and the import problem has a
+cheaper fix. Holding a Temporal client is how Temporal is designed to be used — the client is
+a stateless gRPC connection, not a heavyweight resource, and one per service that needs it is
+the ordinary shape. The facade also taxed every future workflow: per D37, a second entity
+needed `apis/<entity>.py` and `schemas/<entity>.py` purely to forward two calls. With the
+registry, a new entity costs `workflows/<entity>.py`, `activities/<entity>.py`, a task-queue
+constant and one registry line — no HTTP surface at all.
+
+**What deliberately did not change:** the workflow type name, all seven `@activity.defn`
+names, the task queue (`order-tasks`), the workflow-id prefix (`order-`), the three signal
+names and the `stage` query are identical, so durable history stays compatible and **no
+workflow drain was needed** — unlike D36's own deploy. Activities still execute in
+`orchestrator-worker` over HTTP. `orders.rider_reported_stage` stays on `orders`: an order's
+state is the Order Service's to hold (D01), and it is what `read_rider_report_activity` reads
+back on a timeout, so `rider-service` keeps one HTTP call to record it and then signals the
+saga itself. Recording into `sfo_rider_core` instead was considered and rejected — the stage
+would survive onto the rider's *next* order unless `_CLAIM_NEAREST` cleared it, a silent
+"already delivered" fault an hour later.
+
+**Cost, named rather than hidden:**
+
+* **The `require_internal` gate and the Pydantic validation in front of the saga are gone.**
+  `apis/order.py` authenticated every start and signal on the internal key and validated the
+  payload through `OrderSagaStartRequest`. Nothing replaces either: authorisation now rests on
+  network isolation — anything that can reach `temporal-server:7233` can start or signal any
+  workflow. That is the posture `docker-compose.yml` already documents for Kafka, RabbitMQ,
+  Jaeger and the Temporal UI, and it is fine on a laptop, but it is a real reduction and the
+  honest fix is a Temporal namespace with mTLS or an API key, which this does not do.
+* **`amount` as a string now rests on a comment.** It has to survive JSON into workflow
+  history exactly (D07); `OrderSagaStartRequest.amount: str` used to enforce that at the
+  boundary, and the only thing enforcing it now is `str(order["total_amount"])` in
+  `order/clients/orchestrator.py`.
+* **Three requirements files pin `temporalio`** where one did before, so a version skew
+  between a client and the worker whose workflows it starts is newly possible — with no local
+  symptom, since it surfaces as a wire incompatibility.
+* **The rider path is two calls where it was one**, and their order is load-bearing: record,
+  then signal. Reversed, a signal that lands while the record fails leaves a timeout with
+  nothing to read back — the gap D43 closed.
+
+**Citation drift found while doing this, not introduced by it:** twelve places across
+`services/`, `scripts/` and `readme/diagrams/erd.md` cite **D46** for the rider's durable
+report. There is no D46; the record is
+[D43](#d43--the-riders-report-becomes-a-durable-column-on-orders). Code written for this
+decision cites D43 and says so inline; the pre-existing citations are left alone rather than
+swept into an unrelated change.
 
 ---
 

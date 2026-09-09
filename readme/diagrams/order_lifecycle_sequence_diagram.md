@@ -3,7 +3,7 @@
 Happy path only, `created` through `delivered`, verified against
 `services/order/apis/checkout.py`, `services/orchestrator/workflows/order.py`,
 `services/orchestrator/activities/order.py`, `services/order/apis/kitchen.py`,
-`services/order/apis/signals.py`, `services/order/apis/transitions.py`, and
+`services/order/apis/rider_reports.py`, `services/order/apis/transitions.py`, and
 `services/rider/apis/delivery.py`. See
 [readme/order-saga-orchestration-guide.md](../order-saga-orchestration-guide.md) for the
 full reasoning behind each step, and
@@ -19,7 +19,7 @@ sequenceDiagram
     participant OrderSvc as Order Service
     participant PaymentSvc as Payment Service
     participant RiderSvc as Rider Service
-    participant OrchestratorAPI as Orchestrator Service
+    participant Temporal as Temporal Server
     participant Worker as Orchestrator Worker
 
     rect rgb(235, 245, 255)
@@ -27,8 +27,8 @@ sequenceDiagram
         Customer->>Gateway: POST /api/v1/orders
         Gateway->>OrderSvc: forward
         OrderSvc->>OrderSvc: price, verify customer & restaurant, commit order
-        OrderSvc-)OrchestratorAPI: POST /api/v1/orchestrator/sagas
-        OrchestratorAPI->>Worker: start OrderWorkflow
+        OrderSvc-)Temporal: start OrderWorkflow [SagaClient]
+        Temporal->>Worker: dispatch workflow task
         OrderSvc-->>Gateway: 201 Created
         Gateway-->>Customer: 201 Created
     end
@@ -47,8 +47,8 @@ sequenceDiagram
         Owner->>Gateway: POST /api/v1/orders/{order_id}/accept
         Gateway->>OrderSvc: forward
         OrderSvc->>OrderSvc: record kitchen_decision accepted
-        OrderSvc-)OrchestratorAPI: POST /api/v1/orchestrator/sagas/{order_id}/signals [restaurant_decision]
-        OrchestratorAPI->>Worker: signal restaurant_decision
+        OrderSvc-)Temporal: signal restaurant_decision [SagaClient]
+        Temporal->>Worker: deliver restaurant_decision
         OrderSvc-->>Gateway: 200 OK
         Gateway-->>Owner: 200 OK
     end
@@ -66,10 +66,11 @@ sequenceDiagram
         Worker->>Worker: wait for rider_pickup
         Rider->>Gateway: POST /api/v1/riders/me/orders/{order_id}/picked-up
         Gateway->>RiderSvc: forward
-        RiderSvc->>OrderSvc: POST /api/v1/orders/{order_id}/signals [rider_pickup]
+        RiderSvc->>OrderSvc: POST /api/v1/orders/{order_id}/rider-report [picked_up]
         OrderSvc->>OrderSvc: record rider_reported_stage picked_up
-        OrderSvc-)OrchestratorAPI: POST /api/v1/orchestrator/sagas/{order_id}/signals [rider_pickup]
-        OrchestratorAPI->>Worker: signal rider_pickup
+        OrderSvc-->>RiderSvc: 202 Accepted
+        RiderSvc-)Temporal: signal rider_pickup [SagaClient]
+        Temporal->>Worker: deliver rider_pickup
         RiderSvc-->>Gateway: 200 OK
         Gateway-->>Rider: 200 OK
         Worker->>OrderSvc: POST /api/v1/orders/{order_id}/transitions [picked_up]
@@ -81,10 +82,11 @@ sequenceDiagram
         Worker->>Worker: wait for rider_delivery
         Rider->>Gateway: POST /api/v1/riders/me/orders/{order_id}/delivered
         Gateway->>RiderSvc: forward
-        RiderSvc->>OrderSvc: POST /api/v1/orders/{order_id}/signals [rider_delivery]
+        RiderSvc->>OrderSvc: POST /api/v1/orders/{order_id}/rider-report [delivered]
         OrderSvc->>OrderSvc: record rider_reported_stage delivered
-        OrderSvc-)OrchestratorAPI: POST /api/v1/orchestrator/sagas/{order_id}/signals [rider_delivery]
-        OrchestratorAPI->>Worker: signal rider_delivery
+        OrderSvc-->>RiderSvc: 202 Accepted
+        RiderSvc-)Temporal: signal rider_delivery [SagaClient]
+        Temporal->>Worker: deliver rider_delivery
         RiderSvc-->>Gateway: 200 OK
         Gateway-->>Rider: 200 OK
         Worker->>OrderSvc: POST /api/v1/orders/{order_id}/transitions [delivered]

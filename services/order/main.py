@@ -13,10 +13,12 @@ This module is the composition root: it builds the app and mounts the six router
 Singletons live in deps.py, the saga hand-off in clients/orchestrator.py, and the routes
 are grouped by domain area in apis/.
 
-D36 took this down to one lifespan; Week 3 brings it back to two, for a different
-reason. `db.lifespan` still holds the connection pool; `deps.outbox_relay.lifespan` (D39)
-runs the background relay that publishes `order_outbox` rows to Kafka — genuinely a second,
-independent concern this time, not the Temporal client D36 removed.
+Three lifespans now. D36 took this down to one; Week 3's outbox relay made it two; D47
+brings the Temporal client back as the third. `db.lifespan` holds the connection pool,
+`deps.outbox_relay.lifespan` (D39) publishes `order_outbox` rows to Kafka in the background,
+and `deps.temporal.lifespan` connects the client this service starts and signals sagas with
+— log-and-swallow on failure, because orders must stay creatable and readable when Temporal
+is down.
 """
 
 from fastapi import FastAPI
@@ -25,14 +27,13 @@ from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from order import deps
-from order.apis import checkout, health, kitchen, signals, tracking, transitions
+from order.apis import checkout, health, kitchen, rider_reports, tracking, transitions
 
-# Two lifespans again as of Week 3, having been one since D36: the outbox relay
-# (deps.outbox_relay, D39) runs alongside the connection pool for this process' whole
-# life, publishing order_outbox rows to Kafka in the background.
 app = FastAPI(
     title="SmartFoodOps Order Service",
-    lifespan=compose_lifespan(deps.db.lifespan, deps.outbox_relay.lifespan),
+    lifespan=compose_lifespan(
+        deps.db.lifespan, deps.outbox_relay.lifespan, deps.temporal.lifespan
+    ),
 )
 install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)
@@ -43,7 +44,7 @@ instrument_app(app, deps.SERVICE_NAME)
 app.include_router(health.router)
 app.include_router(checkout.router)
 app.include_router(kitchen.router)
-app.include_router(signals.router)
+app.include_router(rider_reports.router)
 app.include_router(tracking.router)
 app.include_router(transitions.router)
 

@@ -15,14 +15,14 @@ client alongside the sync one). Sized generically now, not against a connection 
 process no longer has — see `orders`/`activities` construction below, which takes an
 `OrderServiceClient` instead of the `OrderRepository` this file built before the split.
 
-One worker process, one task queue, and — since `activities/`, `clients/`, `schemas/` and
-`workflows/` were all made entity-scoped — potentially several entities' workflows and
-activities registered on it. A second entity does not need a second `worker.py`: it needs
-its own `OrderWorkflow`-shaped class in `workflows/<entity>.py` and `Activities` class in
-`activities/<entity>.py`, both added to the `workflows=[...]`/`activities=[...]` lists
-below, exactly like `OrderWorkflow` and `OrderActivities` are today. A second task queue,
-and therefore a second `Worker(...)`, is only needed if a future entity's workflows should
-scale or deploy independently of this one.
+One worker process, one `Worker` per task queue, and — since `activities/`, `clients/` and
+`workflows/` are all entity-scoped — potentially several entities registered on it. What
+runs is declared in `registry.py`, not here: this file knows how to *run* a registration,
+not which ones exist. A second entity needs `workflows/<entity>.py`,
+`activities/<entity>.py`, a task-queue constant, and one line in that registry — and no
+HTTP surface at all, since services name workflows by string through
+`common.temporal.SagaClient`. A second *container* is only warranted if a future entity
+should scale or deploy independently of this one.
 
 Connects through `TemporalGateway` rather than a bare `Client.connect()` (Week 3): that is
 the one place `TracingInterceptor` is wired in, so this process and the Orchestrator
@@ -40,17 +40,16 @@ import asyncio
 import os
 import signal
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AsyncExitStack
 from datetime import timedelta
 
 from prometheus_client import start_http_server
 from temporalio.worker import Worker
 
 from common.bootstrap import bootstrap
-from common.config import DEFAULT_TEMPORAL_ADDRESS, ORDER_TASK_QUEUE
+from common.config import DEFAULT_TEMPORAL_ADDRESS
 from common.temporal import TemporalGateway
-from orchestrator.activities.order import OrderActivities
-from orchestrator.clients.order.order_service import OrderServiceClient
-from orchestrator.workflows.order import OrderWorkflow
+from orchestrator.registry import registrations
 
 SERVICE_NAME = "orchestrator-worker"
 
@@ -74,37 +73,14 @@ async def main() -> None:
 
     temporal = TemporalGateway(address, logger=logger)
     client = await temporal.connect()
-    activities = OrderActivities(orders=OrderServiceClient(logger), logger=logger)
+    registered = registrations(logger)
 
     # No connection pool to bound against any more; a modest fixed size instead of the
     # unbounded default, since each activity call is a blocking HTTP request and the point
     # of an executor at all is to stop one slow one from stalling every other workflow.
+    # Shared across every Worker below: the bound that matters is this process's total
+    # concurrent activity count, not a per-task-queue one.
     with ThreadPoolExecutor(max_workers=20, thread_name_prefix="sfo-activity") as executor:
-        worker = Worker(
-            client,
-            task_queue=ORDER_TASK_QUEUE,
-            workflows=[OrderWorkflow],
-            activities=[
-                activities.transition_order_activity,
-                activities.authorize_payment_activity,
-                activities.refund_payment_activity,
-                activities.read_kitchen_decision_activity,
-                activities.dispatch_rider_activity,
-                activities.release_rider_activity,
-                # Week 3, D46 — a seventh activity added to a live registration list. Safe
-                # for workflows *started* after this deploys; see workflows/order.py's own
-                # comment on why a workflow already mid-flight needs draining first, not
-                # this addition alone, to replay safely against the new code.
-                activities.read_rider_report_activity,
-            ],
-            activity_executor=executor,
-            # Time allowed for in-flight activities to finish after shutdown starts.
-            # Anything still running when it expires is cancelled — and because every
-            # activity here is idempotent, Temporal simply re-runs it on the next
-            # worker, which is the property the durability test exercises.
-            graceful_shutdown_timeout=timedelta(seconds=30),
-        )
-
         # `docker compose stop` sends SIGTERM. Without a handler nothing listens, the
         # container is SIGKILLed after the grace period, and in-flight activities are
         # abandoned rather than finishing and reporting back.
@@ -113,10 +89,37 @@ async def main() -> None:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
 
-        logger.info("Worker polling task queue '%s' at %s", ORDER_TASK_QUEUE, address)
-        # `Worker.run()` takes no arguments and blocks forever; entering the worker as
-        # an async context manager is how the SDK exposes "run until I say stop".
-        async with worker:
+        # One Worker per task queue — a Worker polls exactly one — entered together and
+        # exited in reverse, the same AsyncExitStack shape `common/lifespan.py` uses to
+        # compose a service's dependencies. `Worker.run()` blocks forever and takes no
+        # arguments; entering it as an async context manager is how the SDK exposes
+        # "run until I say stop".
+        async with AsyncExitStack() as stack:
+            for registration in registered:
+                await stack.enter_async_context(
+                    Worker(
+                        client,
+                        task_queue=registration.task_queue,
+                        workflows=list(registration.workflows),
+                        activities=list(registration.activities),
+                        activity_executor=executor,
+                        # Time allowed for in-flight activities to finish after shutdown
+                        # starts. Anything still running when it expires is cancelled —
+                        # and because every activity is idempotent, Temporal simply
+                        # re-runs it on the next worker, which is the property the
+                        # durability test exercises.
+                        graceful_shutdown_timeout=timedelta(seconds=30),
+                    )
+                )
+                # Logged per queue, and the resilience suite greps for this exact prefix
+                # to know the worker is back after a restart — see
+                # scripts/saga-resilience-test.sh's "Worker polling" poll.
+                logger.info(
+                    "Worker polling task queue '%s' at %s",
+                    registration.task_queue,
+                    address,
+                )
+
             await stop.wait()
         logger.info("Worker shut down cleanly")
 

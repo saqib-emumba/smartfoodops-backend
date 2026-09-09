@@ -325,11 +325,12 @@ PAY=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -
 assert "  and refunds the customer" "$PAY" "refunded"
 
 # ==================================================== 5. lost rider signal
-# The other half of D43/D46: a pickup or delivery report is written to
-# `orders.rider_reported_stage` before the signal carrying it into the workflow is sent
-# (order/apis/signals.py), so a lost relay leaves the fact recorded and the saga still
-# waiting — simulated here exactly as section 4 simulates a lost kitchen decision: write
-# the column directly, bypassing the endpoint that would have relayed it.
+# The other half of D43: a pickup or delivery report is written to
+# `orders.rider_reported_stage` (rider-service -> order/apis/rider_reports.py) before the
+# rider service signals the workflow on its own Temporal client (D47), so a lost signal
+# leaves the fact recorded and the saga still waiting — simulated here exactly as section 4
+# simulates a lost kitchen decision: write the column directly, bypassing the report
+# endpoint and the signal that would have followed it.
 #
 # What this section deliberately does NOT do: wait out a live recovery the way section 4
 # waits out RESTAURANT_DECISION_TIMEOUT_SECONDS (120s). The pickup/delivery wait uses

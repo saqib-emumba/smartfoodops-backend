@@ -6,7 +6,7 @@ worker shared this service's image and database. It no longer does, so the write
 to be a Python call is now a request, carrying the same arguments the call always took.
 
 The only route this router carries is internal-key only, so the guard sits on the router
-itself — same shape as signals.py.
+itself — same shape as rider_reports.py.
 """
 
 from uuid import UUID

@@ -1,5 +1,11 @@
 -r ../common/requirements.txt
 
-# httpx for the User Service account check and the Order Service signal relay.
+# httpx for the User Service account check and recording a rider's report against the order.
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
+
+# temporalio for signalling a pickup or delivery into the order's saga (D47) — a client
+# only, never a worker. Pinned identically to order/ and orchestrator/: a skew between a
+# client and the worker whose workflows it signals is a wire-compatibility bug with no
+# local symptom, so all three move together.
+temporalio==1.31.0

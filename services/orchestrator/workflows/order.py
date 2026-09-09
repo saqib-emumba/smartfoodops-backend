@@ -234,8 +234,8 @@ class OrderWorkflow:
         #
         # Week 3 (D46): a timeout here no longer compensates outright. The signal that
         # would have set `self._picked_up`/`self._delivered` can be lost the same way a
-        # kitchen decision's signal can (both relays commit the fact locally, then relay it
-        # — see order/apis/signals.py), so a genuine timeout and a lost signal look
+        # kitchen decision's signal can (both commit the fact locally, then signal —
+        # see order/apis/rider_reports.py), so a genuine timeout and a lost signal look
         # identical from inside `wait_condition`. `_recover_rider_report` tells them apart
         # with one local-database read on the Order Service's side, the same shape
         # `_recover_kitchen_decision` already established for the kitchen's answer.
@@ -373,7 +373,8 @@ class OrderWorkflow:
         Returns `"picked_up"`, `"delivered"`, or `None` for "nothing on record" — the exact
         shape `_recover_kitchen_decision` returns for its own question, and for the same
         reason: `orders.rider_reported_stage` is written before the signal that carries it
-        into this workflow is sent (order/apis/signals.py), so a lost signal and genuine
+        into this workflow is sent (order/apis/rider_reports.py, written by rider-service
+        before it signals on its own Temporal client — D47), so a lost signal and genuine
         silence are indistinguishable from inside `wait_condition` alone.
 
         A database (now a service, since D36) that will not answer is treated as no

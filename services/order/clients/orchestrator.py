@@ -1,46 +1,62 @@
-"""Handing an order to the orchestrator, and telling it about events afterward.
+"""Handing an order to the saga, and telling it what the kitchen decided.
 
-Before D36 this was `order/saga.py`, holding a Temporal client directly — this service and
-its worker were the only two processes in the platform that did. Now this service holds
-none: starting a saga and relaying a signal into one are both HTTP calls into the
-Orchestrator Service, on the internal key, exactly like every other cross-service write this
-service makes.
+Three shapes have held this job. Before D36 it was `order/saga.py`, with a Temporal client
+built here and `client.start_workflow(OrderWorkflow.run, ...)` naming the workflow by class
+reference — which imported `orchestrator.workflows.order`, which imported the activities,
+which loaded the payment and rider clients into this process with neither
+`PAYMENT_SERVICE_URL` nor `RIDER_SERVICE_URL` set. D36 fixed that by putting the
+Orchestrator Service's REST facade in front of Temporal and making this an HTTP client.
 
-Two shapes coexist here because the platform already needed both. `start_saga` and
-`signal_saga_best_effort` swallow every failure — the order or the decision is already
-committed, and D09's argument holds regardless of which process is doing the committing:
-a write that already succeeded must not be reported to the client as a failure. `signal`
-does the opposite, because `apis/signals.py` is itself a relay another service's request
-depends on succeeding or failing honestly — a rider reporting a pickup needs to know whether
-it landed, not have this service decide on their behalf that it does not matter.
+D47 removes the facade instead. `SagaClient` names the workflow by *string*
+(`"OrderWorkflow"`), so this service holds a Temporal client again while importing nothing
+from `orchestrator` — the property D36 actually needed, obtained without the extra hop. The
+smoke check for it is in the plan: `sys.modules` inside the running container must list no
+`orchestrator.*` module.
+
+Both methods here swallow every failure, and that is deliberate rather than lazy. The order
+or the decision is already committed by the time either runs, and D09's argument holds
+regardless of which process is doing the committing: a write that already succeeded must not
+be reported to the client as a failure. The relay that used to raise honestly —
+`signal(order_id, ...)`, called by the rider report route — is gone with that route; the
+Rider Service now signals Temporal itself, so it is the one that learns whether its signal
+landed.
 """
 
 from uuid import UUID
 
-from common.auth import internal_headers
-from common.config import DEFAULT_ORCHESTRATOR_SERVICE_URL
-from common.errors import conflict, not_found
-from common.service_client import ServiceFacade
+from common.config import ORDER_TASK_QUEUE
+from common.temporal import SagaClient, workflow_id_for
+
+ORDER_WORKFLOW = "OrderWorkflow"
 
 
-class OrchestratorClient(ServiceFacade):
-    display_name = "Orchestrator Service"
-    env_var = "ORCHESTRATOR_SERVICE_URL"
-    default_url = DEFAULT_ORCHESTRATOR_SERVICE_URL
+class OrchestratorClient:
+    """This service's view of the order saga: start it, and signal the kitchen's answer."""
+
+    def __init__(self, saga: SagaClient, *, logger):
+        self._saga = saga
+        self._logger = logger
 
     async def start_saga(self, order: dict, restaurant: dict) -> None:
-        """Hand a committed order to the orchestrator. Deliberately after the commit, and
+        """Hand a committed order to the saga. Deliberately after the commit, and
         deliberately not fatal — see the module docstring and D09.
 
         `capacity`, `latitude` and `longitude` are snapshots taken at checkout (D32), so
         this call carries everything the saga needs and the orchestrator never has to ask
         the Restaurant Service anything.
+
+        `amount` is stringified rather than passed as a `Decimal`: it has to survive JSON
+        into workflow history exactly (D07), and a float would not. That used to be enforced
+        by `OrderSagaStartRequest.amount: str` on the facade's Pydantic model; with the
+        facade gone there is no validator left to catch it, so it rests on this line.
         """
         order_id = order["id"]
         try:
-            await self._client.apost(
-                "/api/v1/orchestrator/sagas",
-                json={
+            await self._saga.start(
+                ORDER_WORKFLOW,
+                task_queue=ORDER_TASK_QUEUE,
+                wf_id=workflow_id_for(order_id),
+                payload={
                     "order_id": str(order_id),
                     "restaurant_id": str(order["restaurant_id"]),
                     "amount": str(order["total_amount"]),
@@ -48,9 +64,6 @@ class OrchestratorClient(ServiceFacade):
                     "restaurant_latitude": restaurant["latitude"],
                     "restaurant_longitude": restaurant["longitude"],
                 },
-                missing=f"Order {order_id} was not found by the orchestrator",
-                unreachable_hint="the saga was not started",
-                headers=internal_headers(),
             )
         except Exception as exc:  # noqa: BLE001 - the order is committed; never fail on this
             # Error rather than warning: an order with no saga stays at `created` forever
@@ -71,7 +84,7 @@ class OrchestratorClient(ServiceFacade):
         designed as a pair.
         """
         try:
-            await self.signal(order_id, signal, body)
+            await self._saga.signal(workflow_id_for(order_id), signal, body)
         except Exception as exc:  # noqa: BLE001 - the decision is committed; do not undo it
             self._logger.error(
                 "Recorded the decision for order %s but could not signal the saga; "
@@ -79,24 +92,3 @@ class OrchestratorClient(ServiceFacade):
                 order_id,
                 exc,
             )
-
-    async def signal(self, order_id: UUID, signal: str, body: dict) -> None:
-        """Relay one event, honestly — the caller decides whether a failure matters.
-
-        Used by `apis/signals.py`, whose own caller (a sibling reporting a pickup or a
-        delivery) is entitled to a real `404`/`409` rather than a swallowed failure: unlike
-        a kitchen decision, there is no local record for a lost rider event to be recovered
-        from (see the Open Questions entry on this).
-        """
-        await self._client.apost(
-            f"/api/v1/orchestrator/sagas/{order_id}/signals",
-            json={"signal": signal, "payload": body},
-            missing=(
-                f"Order {order_id} has no running saga to signal; it may have already "
-                "finished or been cancelled"
-            ),
-            missing_error=not_found,
-            unreachable_hint="cannot signal the saga",
-            headers=internal_headers(),
-            passthrough={409: conflict},
-        )

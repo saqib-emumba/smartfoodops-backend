@@ -11,6 +11,11 @@ own profile and report pickups and deliveries. The order saga, on the internal k
 and releases them. No end user may reach `/dispatch` or `/release`: which rider carries which
 order is the fleet's business, not a customer's.
 
+This service knows Temporal exists as of D47. A reported pickup or delivery is recorded
+against the order through the Order Service and then signalled into the saga from here —
+previously both halves were one relay call and the Order Service did the signalling. See
+apis/delivery.py for why the write still crosses a boundary and the signal does not.
+
 Authorisation for a pickup or delivery is settled entirely here, from `current_order_id` on
 the rider's own row, rather than by asking the Order Service who was assigned. One place
 decides, so there is no second place to drift (D16).
@@ -23,12 +28,21 @@ import os
 
 from fastapi import FastAPI
 
+from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from rider import deps
 from rider.apis import delivery, dispatch, health, profile
 
-app = FastAPI(title="SmartFoodOps Rider Service", lifespan=deps.db.lifespan)
+# Two lifespans as of D47, having been the platform's last bare single one: the connection
+# pool, and the Temporal client this service signals the saga with. The gateway's own
+# lifespan log-and-swallows a startup failure, so a rider can still register and move while
+# Temporal is down — what fails then is the signal, and the saga's timeout read-back of
+# `orders.rider_reported_stage` is what repairs that.
+app = FastAPI(
+    title="SmartFoodOps Rider Service",
+    lifespan=compose_lifespan(deps.db.lifespan, deps.temporal.lifespan),
+)
 install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)
 

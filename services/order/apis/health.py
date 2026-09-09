@@ -7,9 +7,11 @@ registered first would swallow /health and answer 422 trying to parse "health" a
 Same fix as everywhere else — register this router first — with no special case left in
 main.py.
 
-No `temporal_reachable` any more (D36): this service holds no Temporal client, so what it
-can report is whether the Orchestrator Service answers over HTTP, the same shape every other
-sibling dependency is reported in.
+`temporal_reachable` again (D47), having been replaced by an `orchestrator_service_url` for
+the span of D36: this service holds a Temporal client once more, so what it can report is
+whether Temporal itself answers rather than whether a facade in front of it does.
+`common/health.py`'s own docstring — "The Order Service's route stays `async` because it
+awaits Temporal" — was written for the first arrangement and is accurate again.
 """
 
 from fastapi import APIRouter
@@ -29,6 +31,7 @@ async def health():
         user_service_url=deps.user_service.base_url,
         restaurant_service_url=deps.restaurant_service.base_url,
         menu_service_url=deps.menu_service.base_url,
-        orchestrator_service_url=deps.orchestrator_service.base_url,
+        temporal_reachable=await deps.temporal.is_reachable(),
+        temporal_address=deps.temporal.address,
     )
     return ok(payload, message="Orders Service operational")

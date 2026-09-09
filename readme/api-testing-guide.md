@@ -1032,27 +1032,31 @@ history (D26). Every one of these answers `401` with a user token, however privi
 
 ```bash
 for p in "riders/dispatch" "riders/release" "payments/refund" "payments/authorize" \
-         "orders/$ORDER_ID/signals"; do
+         "orders/$ORDER_ID/rider-report"; do
   printf '%-34s ' "$p"
   curl -s -o /dev/null -w '[%{http_code}]\n' -X POST "$BASE/api/v1/$p" \
     -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' -d '{}'
 done
 ```
 
-With the key, the signal relay is the one door into a running saga:
+With the key, this route records the stage the saga reads back on a timeout. Since D47 it
+does **not** signal — the Rider Service holds its own Temporal client and signals directly
+after this returns — so what you can exercise here is the write and its validation, not the
+saga's reaction:
 
 ```bash
 export INTERNAL_KEY=$(grep -m1 '^INTERNAL_API_KEY=' .env | cut -d= -f2-)
 
-# An invented signal name -> 422, rather than a signal Temporal accepts and nothing reads
-curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" \
+# An invented stage -> 422, rather than a value the enum cannot store
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/rider-report" \
   -H "X-Internal-Key: $INTERNAL_KEY" -H 'Content-Type: application/json' \
-  -d '{"signal":"teleported","payload":{}}'
+  -d '{"stage":"teleported"}'
 
-# An order whose saga has finished -> 404, distinct from "no such order"
-curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/signals" \
+# A real stage -> 202, and repeating it is a no-op: the guard is forward-only, so a
+# retried report (or an older stage arriving after a newer one) changes nothing
+curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders/$ORDER_ID/rider-report" \
   -H "X-Internal-Key: $INTERNAL_KEY" -H 'Content-Type: application/json' \
-  -d '{"signal":"rider_pickup","payload":{}}'
+  -d '{"stage":"picked_up"}'
 ```
 
 ### 8.6 Simulating a lost decision signal

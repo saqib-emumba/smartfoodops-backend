@@ -1,18 +1,20 @@
-"""SmartFoodOps Orchestrator Service — the order saga's Temporal front door (Port 8007).
+"""SmartFoodOps Orchestrator Service — the saga's health and telemetry surface (Port 8007).
 
-Owns no database. Split out of the Order Service (D36): before this, `order-service` held
-its own Temporal client to start workflows and relay signals, and `order-worker` — sharing
-its image and database — executed them. Now this service's API side does the former and
-`orchestrator/worker.py` the latter, and neither touches `sfo_order_core`; every fact about
-an order's state is reached over HTTP, through `orchestrator/clients/order/order_service.py`.
+Owns no database, and as of D47 owns no saga routes either. It once carried
+`POST /api/v1/orchestrator/sagas` and `.../signals`, a pair of routes whose entire body was
+`start_workflow` and `handle.signal` — an HTTP hop D36 introduced because starting a
+workflow by class reference (`OrderWorkflow.run`) would have pulled the activities and their
+payment/rider clients into the Order Service's process. Naming the workflow by *string*
+closes that hole without the hop, so the services that observe saga facts now hold their own
+Temporal client through `common.temporal.SagaClient` and talk to Temporal directly.
 
-Internal-key only, end to end. No end user, and no sibling but the Order Service, ever
-calls this service directly — see `apis/order.py`'s router-level guard.
+What remains here is the deployable's API side: a health probe reporting whether Temporal
+answers, and the `/metrics` route `instrument_app` mounts. The real work of this service is
+in the sibling process — `orchestrator/worker.py`, running whatever `registry.py` declares.
 
-This module is the composition root: it builds the app, holds the Temporal lifespan, and
-mounts the routers. Singletons live in deps.py, routes in apis/ — one router per entity
-this service orchestrates, plus `health`. A future second entity's routes mount here the
-same way `order.router` does.
+Adding a workflow does not touch this file. That is the point of the split: a new entity
+needs `workflows/<entity>.py`, `activities/<entity>.py`, a task-queue constant, and one
+registry line — never a route and never a schema.
 """
 
 from fastapi import FastAPI
@@ -20,7 +22,7 @@ from fastapi import FastAPI
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from orchestrator import deps
-from orchestrator.apis import health, order
+from orchestrator.apis import health
 
 # One dependency, so no compose_lifespan — see common/lifespan.py's docstring for when
 # that earns its keep (order, menu and user each hold two).
@@ -29,7 +31,6 @@ install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
-app.include_router(order.router)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 orders.py       line items, checkout request/response — the customer-facing shape
 kitchen.py      the narrower projection a restaurant admin sees, and its decision outcome
-signals.py      the one relay request from a sibling service into the workflow
+rider_reports.py  the stage the Rider Service records before signalling the saga itself
 tracking.py     the append-only audit trail, in both directions
 transitions.py  the orchestrator's one write into this service (D36)
 

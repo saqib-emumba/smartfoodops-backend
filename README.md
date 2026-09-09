@@ -37,9 +37,9 @@ would need does not exist.
  Postgres  Postgres  PG  Redis       Postgres  Postgres  Postgres
   :5432     :5433  :5436 :6379        :5434     :5435     :5437
                   (menus)(cache)   (+ tracking)         (fleet)
-                                        │▲ HTTP, X-Internal-Key
-                                  HTTP  ││ (start saga / signal saga /
-                                        ▼│  transition / read — D36)
+                                        │▲ gRPC (start/signal, D47)
+                                  HTTP  ││ + HTTP, X-Internal-Key
+                                        ▼│  (transition / read — D36)
                           ┌──────────────────────┐
                           │ orchestrator-service │  :8007 — no database
                           └─────────┬────────────┘
@@ -64,10 +64,10 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | `user-service` | 8001 | `roles`, `users` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
 | `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
-| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Orchestrator Service (start/signal a saga) |
+| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal (starts the saga, signals the kitchen's decision — D47) |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
-| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (pickup/delivery signal relay) |
-| `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; the gateway proxies just its `/health` |
+| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (records the pickup/delivery stage), Temporal (signals the saga — D47) |
+| `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; health and `/metrics` alone since D47, and the gateway proxies just its `/health` |
 | `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
 | `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls, no JWT keys (D44) |
 | `notification-consumer` | — | nothing — no database | — | Kafka (reads), User Service (resolves contact details, D45), RabbitMQ (enqueues) |
@@ -84,10 +84,12 @@ Rules the code enforces deliberately:
 - The kitchen's queue is a query over `orders`, not a table of its own. A restaurant
   admin reads and decides it on the Order Service; whether they *own* that restaurant is
   still resolved against the Restaurant Service over HTTP (D32).
-- Only two processes hold a Temporal client: `orchestrator-service` (starts sagas, relays
-  signals) and `orchestrator-worker` (runs them). Every other service — including
-  `order-service` itself, since D36 — reports what it observed over HTTP and is unaware an
-  orchestrator exists.
+- Four processes hold a Temporal client (D47): `order-service` starts the saga and signals
+  the kitchen's decision, `rider-service` signals pickups and deliveries, `orchestrator-worker`
+  runs the workflows, and `orchestrator-service` uses one only for its health probe. Each
+  names workflows and signals by **string**, so no service outside `services/orchestrator/`
+  imports a workflow or activity module — that import edge is what D36's HTTP facade existed
+  to prevent, and it is asserted in the smoke test rather than assumed.
 - **Kafka carries facts; Temporal still owns every decision (D38).** Nothing on the
   checkout path or inside the saga waits on Kafka, the Schema Registry, RabbitMQ or Celery —
   every one of those can be stopped and checkout still completes, because each producer
@@ -291,7 +293,6 @@ MENU_SERVICE_URL=http://menu-service:8003
 ORDER_SERVICE_URL=http://order-service:8004
 PAYMENT_SERVICE_URL=http://payment-service:8005
 RIDER_SERVICE_URL=http://rider-service:8006
-ORCHESTRATOR_SERVICE_URL=http://orchestrator-service:8007
 
 # Workflow orchestrator (gRPC, so no scheme). docker-compose.yml also sets this
 # per-container; it is here for scripts and for a worker run outside Compose.
@@ -806,7 +807,7 @@ docker compose logs notification-worker | grep DISPATCH
 | Method | Path | Called by | Notes |
 |---|---|---|---|
 | `POST` | `/api/v1/orders/logs` | any service | Appends one reported transition; `422` on an unknown order or undefined status |
-| `POST` | `/api/v1/orders/{order_id}/signals` | Rider | Carries pickup/delivery only — a kitchen decision has its own authenticated endpoint (D32) |
+| `POST` | `/api/v1/orders/{order_id}/rider-report` | Rider | Records the pickup/delivery stage the saga reads back on a timeout; the Rider Service signals Temporal itself (D47) |
 | `GET` | `/api/v1/orders/{order_id}/internal` | Payment, worker | Same order as the bearer path, for callers with no user |
 | `POST` | `/api/v1/payments/authorize` | worker | Amount as a **string** so the decimal stays exact (D07) |
 | `POST` | `/api/v1/payments/refund` | worker | Compensation; idempotent by status, and sweeps stranded `pending` rows |

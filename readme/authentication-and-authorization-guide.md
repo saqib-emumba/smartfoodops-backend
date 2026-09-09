@@ -198,7 +198,7 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 | Menu | `GET /menus/{id}` | `get_current_user` (any authenticated caller) |
 | Order | `POST /orders` | `require_role("customer")` |
 | Order | `GET /orders/{id}`, `GET /orders/{id}/logs` | `get_current_user` + `require_self_or_admin` on `customer_id` |
-| Order | `GET /orders/{id}/internal`, `POST /orders/logs`, `POST /orders/{id}/signals` | `require_internal` |
+| Order | `GET /orders/{id}/internal`, `POST /orders/logs`, `POST /orders/{id}/rider-report` | `require_internal` |
 | Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service (D32) |
 | Payment | `POST /payments`, `GET /payments/{id}` | `require_role("customer")` (ownership settled by reading the order, §4.2) |
 | Payment | `POST /payments/authorize`, `POST /payments/refund` | `require_internal` |

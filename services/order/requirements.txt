@@ -1,10 +1,17 @@
 -r ../common/requirements.txt
 
-# httpx for the request-path lookups and the saga hand-off into the Orchestrator Service.
-# No temporalio (D36): this image no longer runs a worker, and holds no Temporal client of
-# its own — orchestrator/requirements.txt is the only one that needs it now.
+# httpx for the request-path lookups into user, restaurant and menu.
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
+
+# temporalio for the saga hand-off (D47): this service starts OrderWorkflow and signals the
+# kitchen's decision into it through common.temporal.SagaClient. It still runs no worker —
+# only a client. Kept out of common/requirements.txt by that file's own rule (only modules
+# in common/ that import it unconditionally belong there, and common/temporal.py is imported
+# on demand), so order, rider and orchestrator each pin it. Pin all three identically: a
+# skew between a client and the worker it starts workflows on is a wire-compatibility bug
+# with no local symptom.
+temporalio==1.31.0
 
 # common.kafka + common.outbox (Week 3, D39): the outbox relay's Kafka producer
 # and the schema-registry hot-path validator. Only order, payment, analytics and

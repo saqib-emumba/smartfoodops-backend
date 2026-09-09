@@ -4,9 +4,10 @@ WORKDIR /app
 
 # Pins live in requirements.txt rather than here: the repo had no dependency manifest
 # at all, so nothing could feed a vulnerability scan or answer "what is in this image".
-# (httpx for the request-path lookups and the saga hand-off; PyJWT[crypto] to verify RS256
-#  tokens, never to sign them. No temporalio — see requirements.txt; D36 moved the worker,
-#  and this image's Temporal client, to services/orchestrator/.)
+# (httpx for the request-path lookups; PyJWT[crypto] to verify RS256 tokens, never to sign
+#  them; temporalio for the saga hand-off — a client only, never a worker. D36 moved both
+#  the worker and the client to services/orchestrator/; D47 brought the client back, since
+#  naming a workflow by string no longer drags the orchestrator's imports along with it.)
 #
 # Requirements are copied before the source so editing a .py file does not invalidate
 # the pip layer. The service file `-r`s the shared chassis list, and the two land in the

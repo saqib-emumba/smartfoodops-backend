@@ -38,12 +38,12 @@ stays completely unaware that an orchestrator exists — they see HTTP requests 
    ▼          ▼          ▼              ▼           ▼           ▼
  User      Restaurant   Menu         Order        Payment      Rider
  :8001       :8002     :8003         :8004         :8005       :8006
-                                    │▲     HTTP, X-Internal-Key
-                              HTTP  ││     (start saga / signal saga)
-                                    ▼│
+                                    │▲     gRPC: order & rider services
+                              HTTP  ││     start and signal workflows
+                                    ▼│     directly (D47)
                             ┌────────────────────┐
-                            │ orchestrator-service│  :8007  Temporal front door
-                            └──────────┬──────────┘         (no database)
+                            │ orchestrator-service│  :8007  health + /metrics only
+                            └──────────┬──────────┘         (no database, no saga routes)
                                        │▲ gRPC
                                  gRPC  ││
                                        ▼│
@@ -67,26 +67,32 @@ credential but travel in opposite directions:
  orchestrator-worker ──X-Internal-Key──▶ order-service     (transition / read — D36; this
                                                              was local SQL before the split)
 
- rider-service ──X-Internal-Key──▶ order-service    POST /orders/{id}/signals
-                                                    (pickup / delivery only)
+ rider-service ──X-Internal-Key──▶ order-service    POST /orders/{id}/rider-report
+                                                    (records the stage; no relay)
+ rider-service ──gRPC────────────▶ Temporal         signal rider_pickup / rider_delivery
+                                                    (record first, then signal — D47)
 
- order-service ──X-Internal-Key──▶ orchestrator-service   POST /orchestrator/sagas
-                                                          POST .../sagas/{id}/signals
+ order-service ──gRPC────────────▶ Temporal         start OrderWorkflow
+                                                    signal restaurant_decision
 
  restaurant admin ──bearer token──▶ order-service   POST /orders/{id}/accept|reject
-                                                    (no relay through orchestrator-service
-                                                     for the decision itself — only the
-                                                     signal that follows it is)
+                                                    (the decision is committed here first;
+                                                     the signal that follows is best-effort)
 ```
 
-- **`order-service`** starts a saga when an order is created and relays a signal into one,
-  both as HTTP calls into `orchestrator-service` (D36) — it holds no Temporal client of its
-  own. It also answers `orchestrator-worker`'s two calls back into it: recording a
-  transition, and reading `kitchen_decision` for the lost-signal recovery in §6.5.
-- **`orchestrator-service`** is the Temporal front door: `POST /api/v1/orchestrator/sagas`
-  starts a workflow, `POST .../sagas/{id}/signals` relays an event into a running one. It
-  is internal-key only end to end — no end user, and no sibling but the Order Service, ever
-  calls it — and the gateway proxies nothing from it but its health probe.
+- **`order-service`** starts the saga when an order is created and signals the kitchen's
+  decision into it, both on its own Temporal client (D47) — naming the workflow
+  `"OrderWorkflow"` as a string, so it imports nothing from `services/orchestrator/`. It
+  also answers `orchestrator-worker`'s calls back into it: recording a transition, and
+  reading `kitchen_decision` and `rider_reported_stage` for the lost-signal recovery in §6.5.
+- **`rider-service`** records a pickup or delivery against the order through
+  `POST /orders/{id}/rider-report` and then signals Temporal itself. Record first, signal
+  second: the column is what the saga reads back when its timer expires, so a signal that
+  never lands is still recoverable (D43).
+- **`orchestrator-service`** carries no saga routes since D47 — it once had
+  `POST /api/v1/orchestrator/sagas` and `.../signals`, whose entire bodies were
+  `start_workflow` and `handle.signal`. What is left is the health probe and `/metrics`, and
+  the gateway proxies only the former.
 - **`orchestrator-worker`** is a separate deployable from `orchestrator-service` — same
   image, only the command differs, mirroring the shape `order-service`/`order-worker` had
   before the split. It polls the `order-tasks` task queue and hosts the workflow's *logic*
@@ -536,9 +542,9 @@ had actually been taken. So the timeout is a prompt to **go and look**, not a co
  t2   admin: POST /api/v1/orders/<id>/accept
  t3   order-service: UPDATE orders SET kitchen_decision='accepted'   ── COMMITTED
  t4   order-service: orchestrator_service.signal_saga_best_effort(...)
-                      ──▶ POST orchestrator-service/sagas/<id>/signals
-                          ──▶ handle.signal(...)   ✗ LOST (Temporal unreachable, orchestrator
-                                                    down, worker gone, ...)
+                      ──▶ SagaClient.signal("order-<id>", "restaurant_decision", ...)
+                          ──▶ handle.signal(...)   ✗ LOST (Temporal unreachable, worker
+                                                    gone, ...)
               │
               │   the decision is on record; the workflow has no idea
               ▼
