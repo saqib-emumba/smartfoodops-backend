@@ -53,6 +53,53 @@ Individual folders can be re-run later in the same Postman session (e.g. iterati
 Service folder) as long as folder 2 has already populated tokens this session — reopening Postman
 resets collection variables, so start from folder 1 again after a restart.
 
+## Testing just the happy path
+
+To walk through register → onboard → order → deliver without the authorisation-boundary and
+validation-edge-case noise mixed into folders 2–6, send these requests **in this order**. None of
+them loop, so individual `Send` clicks are fine here — no Collection Runner needed yet:
+
+| # | Folder | Request |
+|---|---|---|
+| 1 | 2. Authentication & Identity | **Register Restaurant Owner** |
+| 2 | 2. Authentication & Identity | **Register Customer** |
+| 3 | 2. Authentication & Identity | **Register Rider** |
+| 4 | 2. Authentication & Identity | **Login Owner** |
+| 5 | 2. Authentication & Identity | **Login Customer** |
+| 6 | 2. Authentication & Identity | **Login Rider** |
+| 7 | 3. Restaurant Service | **Onboard restaurant** |
+| 8 | 4. Menu Service | **Publish menu** |
+| 9 | 5. Order Service -- Core | **Create order** |
+| 10 | 6. Order Saga -- Fleet Setup & Internal Boundaries | **Rider registers a profile** |
+
+That covers user registration, restaurant + menu creation, customer registration, and placing the
+order — the saga takes over from here (authorising payment, confirming the order, dispatching the
+rider), so the rest has to be watched for asynchronously rather than sent once.
+
+**From here, run all of folder 7 — "Order Saga -- Happy Path to 'delivered'" — with the
+Collection Runner**, not individual `Send` clicks. Every poll request in it is wired via
+`postman.setNextRequest(...)` to the *next specific request in that folder*, so it only works
+running the folder as a whole (see "Running it" above for why, and the ~2000ms delay setting).
+Running it end to end takes you through, in order:
+
+1. **Poll: order reaches 'confirmed'** — waits out payment authorisation
+2. **Kitchen queue shows the order**, then **Kitchen accepts the order** — the restaurant owner's decision
+3. **Poll: order reaches 'assigned'** — waits out rider dispatch, and resolves which of your
+   registered riders actually got it into `{{carrier_token}}`
+4. **Rider reports the pickup**, then **Poll: order reaches 'picked_up'**
+5. **Rider reports the delivery**, then **Poll: order reaches 'delivered'**
+6. **The trail records the full lifecycle** — asserts the whole
+   `created → confirmed → assigned → picked_up → delivered` sequence in one read
+
+A handful of authorisation-boundary requests are interleaved into folder 7 itself (the
+system_admin/restaurant_admin kitchen-queue checks, "the other rider cannot report this
+delivery"); they're read-only or refused on purpose, so leaving them in the run doesn't touch
+order state — there's no need to strip them out for a happy-path run.
+
+If you only want to *watch* a run rather than drive it — e.g. you already have the stack up and
+just want to see the lifecycle happen — [scripts/smoke-test.sh](../scripts/smoke-test.sh) does the
+identical sequence from the terminal in one command and prints each step as it passes.
+
 ## What this can't check that `smoke-test.sh` can
 
 Named here rather than silently missing:
