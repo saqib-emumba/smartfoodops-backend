@@ -35,6 +35,8 @@ def service_url(env_var: str, default: str) -> str:
     """
     return os.getenv(env_var, default)
 
+# TODO: configs should come from the process env variables
+
 
 # Credential-free datastore endpoints (mirrored by docker-compose.yml).
 DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
