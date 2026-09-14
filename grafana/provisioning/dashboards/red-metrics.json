@@ -81,7 +81,7 @@
     },
     {
       "id": 3,
-      "title": "P95 request latency by service",
+      "title": "P95 / P99 request latency by service",
       "type": "timeseries",
       "datasource": "Prometheus",
       "gridPos": {
@@ -95,7 +95,13 @@
           "datasource": "Prometheus",
           "expr": "histogram_quantile(0.95, sum by (job, le) (rate(sfo_http_request_duration_seconds_bucket[5m])))",
           "refId": "A",
-          "legendFormat": "{{job}}"
+          "legendFormat": "{{job}} p95"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, sum by (job, le) (rate(sfo_http_request_duration_seconds_bucket[5m])))",
+          "refId": "B",
+          "legendFormat": "{{job}} p99"
         }
       ],
       "fieldConfig": {
