@@ -37,25 +37,53 @@ would need does not exist.
  Postgres  Postgres  PG  Redis       Postgres  Postgres  Postgres
   :5432     :5433  :5436 :6379        :5434     :5435     :5437
                   (menus)(cache)   (+ tracking)         (fleet)
-                                        │▲ gRPC (start/signal, D47)
-                                  HTTP  ││ + HTTP, X-Internal-Key
-                                        ▼│  (transition / read — D36)
-                          ┌──────────────────────┐
-                          │ orchestrator-service │  :8007 — no database
-                          └─────────┬────────────┘
-                                    │▲ gRPC
-                              gRPC  ││
-                                    ▼│
-                          ┌─────────────────────────┐
-                          │   Temporal dev server    │
-                          │   :7233 gRPC  :8233 UI   │
-                          │   :9233 /metrics         │
-                          └─────────────┬─────────────┘
-                                        │ polls "order-tasks"
-                              ┌─────────┴──────────┐
-                              │ orchestrator-worker │  ← runs the saga,
-                              └─────────────────────┘    no database either
+                                        │                   │
+                                        │ gRPC: start saga, │ gRPC: signal
+                                        │ signal kitchen    │ pickup /
+                                        │ decision (D47)    │ delivery (D47)
+                                        └─────────┬─────────┘
+                                                  ▼
+                                 ┌────────────────────────────────────┐
+                                 │        Temporal dev server         │
+                                 │ :7233 gRPC :8233 UI :9233 /metrics │
+                                 └───────┬─────────────────┬──────────┘
+                                         │ health only     │ polls "order-tasks"
+                                         ▼                 ▼
+                  ┌───────────────────────┐     ┌─────────────────────────┐
+                  │  orchestrator-service │     │   orchestrator-worker   │
+                  │   :8007, no database  │     │   runs the saga, no db  │
+                  └───────────────────────┘     └────────────┬────────────┘
+                                                              │ HTTP, X-Internal-Key:
+                                                              │  order transitions/read
+                                                              │  payment authorize/refund
+                                                              │  rider dispatch/release
 ```
+
+Order Service and Rider Service each hold their own Temporal client (D47) and reach it
+directly by gRPC — naming the workflow and its signals by **string**, so neither imports
+anything from `services/orchestrator/`. The Orchestrator Service kept its container but lost
+its saga routes: it now exists only to answer its own health probe, which the gateway proxies.
+`orchestrator-worker` is the one process that still runs the workflow and its activities, and
+it reaches Order, Payment and Rider the same way it always has — over HTTP, on the internal
+key (D36).
+
+Two things this diagram deliberately leaves out, because they cut across every box in it
+rather than sitting on one path:
+
+- **Kafka.** `order-service` and `payment-service` each write a row to their own
+  `order_outbox`/`payment_outbox` table in the *same transaction* as the change it
+  describes, and a background relay in each process publishes it to Kafka's
+  `sfo.order.events.v1` topic — picked up by the Analytics Service and the Notification
+  Consumer. It is a side effect of the synchronous path above, not a dependency of it: the
+  full smoke suite passes with the Kafka container stopped. The complete pipeline, with its
+  own diagram, is in [Eventing and observability](#eventing-and-observability) below.
+- **Telemetry.** Every process pictured here — all eleven of them — exports traces to Jaeger
+  via OpenTelemetry, with `TracingInterceptor` carrying the trace across the Temporal
+  boundary too, and serves `/metrics` in Prometheus's own format, scraped by Prometheus and
+  rendered in Grafana. It is on by default; nothing above opts in or out of it. More detail
+  just below in [Eventing and observability](#eventing-and-observability); UI URLs and
+  credentials for Jaeger, Prometheus and Grafana are under
+  [Verify everything routes](#verify-everything-routes).
 
 Arrows between services are **HTTP calls, not shared tables**. Each service owns its data:
 

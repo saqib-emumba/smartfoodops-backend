@@ -111,7 +111,7 @@ POOL_MAX_CONNECTIONS = 10
 # How long a kitchen has to accept or decline before the order is cancelled and refunded.
 # Generous on purpose: the alternative is cancelling orders a busy restaurant would have
 # taken, which costs a real sale to save a few seconds.
-RESTAURANT_DECISION_TIMEOUT_SECONDS = 120
+RESTAURANT_DECISION_TIMEOUT_SECONDS = 300
 
 # Rider search. Repeated short attempts separated by durable timers rather than one long
 # call, because "no rider free right now" is a condition that resolves with time, and a

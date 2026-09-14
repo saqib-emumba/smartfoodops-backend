@@ -7,10 +7,14 @@ database-per-service, D25 orchestration over choreography, D36 the orchestrator 
 D38 Kafka carries facts / Temporal owns decisions, D39 the transactional outbox, D47
 services hold their own Temporal client).
 
+Nodes are color-coded by subsystem (application services, the Temporal saga,
+Kafka/schema-registry eventing, the notification bridge, databases, observability) so a
+line's color/region tells you what it belongs to even where paths cross.
+
 ```mermaid
+%%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 35, "rankSpacing": 55, "htmlLabels": true}}}%%
 flowchart TB
     Client["Customer / Owner / Rider client"]
-
     Gateway["Nginx API Gateway<br/>host 80"]
 
     subgraph AppServices ["Application Services"]
@@ -25,9 +29,8 @@ flowchart TB
     end
 
     subgraph Saga ["Orchestration (Temporal)"]
+        TemporalServer["Temporal Server (dev, embedded SQLite)<br/>7233 / 8233 / 9233"]
         OrchestratorWorker["Orchestrator Worker<br/>metrics 9108"]
-        TemporalServer["Temporal Server<br/>7233 / 8233 / 9233"]
-        TemporalDB["Temporal Postgres"]
     end
 
     subgraph Eventing ["Eventing"]
@@ -37,8 +40,8 @@ flowchart TB
 
     subgraph Notify ["Notifications"]
         NotifConsumer["Notification Consumer<br/>metrics 9110"]
-        NotifWorker["Notification Worker (Celery)"]
         RabbitMQ["RabbitMQ<br/>5672 / 15672 / 15692"]
+        NotifWorker["Notification Worker (Celery)"]
     end
 
     subgraph Data ["Databases and Cache"]
@@ -58,30 +61,28 @@ flowchart TB
         Grafana["Grafana<br/>3000"]
     end
 
+    %% -- request entry --
     Client --> Gateway
-    Gateway --> UserSvc
-    Gateway --> RestaurantSvc
-    Gateway --> MenuSvc
-    Gateway --> OrderSvc
-    Gateway --> PaymentSvc
-    Gateway --> RiderSvc
+    Gateway --> UserSvc & RestaurantSvc & MenuSvc & OrderSvc & PaymentSvc & RiderSvc
     Gateway -->|health only| OrchestratorAPI
 
+    %% -- synchronous service-to-service calls --
     OrderSvc -->|verify customer| UserSvc
     OrderSvc -->|verify restaurant| RestaurantSvc
     OrderSvc -->|fetch menu| MenuSvc
     PaymentSvc -->|verify order total| OrderSvc
-    RiderSvc -->|record pickup and delivery stage| OrderSvc
+    RiderSvc -->|record pickup / delivery stage| OrderSvc
 
-    OrderSvc -->|start saga and signal kitchen decision| TemporalServer
-    RiderSvc -->|signal pickup and delivery| TemporalServer
-    OrchestratorAPI -->|health probe only| TemporalServer
-    OrchestratorWorker -->|poll order_tasks queue| TemporalServer
-    OrchestratorWorker -->|authorize and refund| PaymentSvc
-    OrchestratorWorker -->|transitions and internal reads| OrderSvc
-    OrchestratorWorker -->|dispatch and release| RiderSvc
-    TemporalServer --> TemporalDB
+    %% -- saga: services hold their own Temporal client (D47) --
+    OrderSvc -->|start saga, signal kitchen decision| TemporalServer
+    RiderSvc -->|signal pickup / delivery| TemporalServer
+    OrchestratorAPI -.->|health probe only| TemporalServer
+    TemporalServer -->|dispatch workflow task| OrchestratorWorker
+    OrchestratorWorker -->|authorize / refund| PaymentSvc
+    OrchestratorWorker -->|transitions, internal reads| OrderSvc
+    OrchestratorWorker -->|dispatch / release| RiderSvc
 
+    %% -- each service owns one database --
     UserSvc --> UserDB
     RestaurantSvc --> RestaurantDB
     MenuSvc --> MenuDB
@@ -89,27 +90,57 @@ flowchart TB
     PaymentSvc --> PaymentDB
     RiderSvc --> RiderDB
     AnalyticsSvc --> AnalyticsDB
-    MenuSvc -->|menu cache| Redis
-    UserSvc -->|refresh tokens| Redis
+    MenuSvc -.->|menu cache| Redis
+    UserSvc -.->|refresh tokens| Redis
 
+    %% -- eventing: outbox relay, consumers, schema registry --
     OrderSvc -->|outbox relay| Kafka
     PaymentSvc -->|outbox relay| Kafka
-    AnalyticsSvc -->|consume| Kafka
-    NotifConsumer -->|consume| Kafka
-    OrderSvc -.->|register and validate schema| SchemaRegistry
-    PaymentSvc -.->|register and validate schema| SchemaRegistry
-    AnalyticsSvc -.->|validate schema| SchemaRegistry
-    NotifConsumer -.->|validate schema| SchemaRegistry
+    Kafka -->|consume| AnalyticsSvc
+    Kafka -->|consume| NotifConsumer
+    OrderSvc -.->|schema| SchemaRegistry
+    PaymentSvc -.->|schema| SchemaRegistry
+    AnalyticsSvc -.->|schema| SchemaRegistry
+    NotifConsumer -.->|schema| SchemaRegistry
 
+    %% -- notifications: Kafka to Celery bridge --
     NotifConsumer -->|enqueue task| RabbitMQ
     RabbitMQ --> NotifWorker
     NotifWorker -->|resolve contact| UserSvc
 
-    AppServices -.->|traces| Jaeger
-    OrchestratorWorker -.->|traces| Jaeger
-    AppServices -.->|metrics| Prometheus
-    OrchestratorWorker -.->|metrics| Prometheus
-    TemporalServer -.->|metrics| Prometheus
-    RabbitMQ -.->|metrics| Prometheus
+    %% -- observability: every service traces + exposes /metrics (target node implies which) --
+    AppServices -.-> Jaeger
+    OrchestratorWorker -.-> Jaeger
+    NotifConsumer -.-> Jaeger
+    AppServices -.-> Prometheus
+    OrchestratorWorker -.-> Prometheus
+    NotifConsumer -.-> Prometheus
+    TemporalServer -.-> Prometheus
+    RabbitMQ -.-> Prometheus
     Grafana -->|query| Prometheus
+
+    classDef app fill:#dbeafe,stroke:#2563eb,color:#1e3a8a;
+    classDef saga fill:#ede9fe,stroke:#7c3aed,color:#4c1d95;
+    classDef evt fill:#ffedd5,stroke:#ea580c,color:#7c2d12;
+    classDef notify fill:#ccfbf1,stroke:#0d9488,color:#134e4a;
+    classDef data fill:#dcfce7,stroke:#16a34a,color:#14532d;
+    classDef obs fill:#f3f4f6,stroke:#6b7280,color:#1f2937;
+    classDef edge fill:#fff,stroke:#111827,color:#111827;
+
+    class UserSvc,RestaurantSvc,MenuSvc,OrderSvc,PaymentSvc,RiderSvc,OrchestratorAPI,AnalyticsSvc app;
+    class TemporalServer,OrchestratorWorker saga;
+    class Kafka,SchemaRegistry evt;
+    class NotifConsumer,RabbitMQ,NotifWorker notify;
+    class UserDB,RestaurantDB,OrderDB,PaymentDB,MenuDB,RiderDB,AnalyticsDB,Redis data;
+    class Jaeger,Prometheus,Grafana obs;
+    class Client,Gateway edge;
+
+    linkStyle default stroke:#111827,stroke-width:1.2px;
+
+    style AppServices fill:#eff6ff,stroke:#2563eb,stroke-width:1px;
+    style Saga fill:#f5f3ff,stroke:#7c3aed,stroke-width:1px;
+    style Eventing fill:#fff7ed,stroke:#ea580c,stroke-width:1px;
+    style Notify fill:#f0fdfa,stroke:#0d9488,stroke-width:1px;
+    style Data fill:#f0fdf4,stroke:#16a34a,stroke-width:1px;
+    style Observability fill:#f9fafb,stroke:#6b7280,stroke-width:1px;
 ```
