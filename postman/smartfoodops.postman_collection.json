@@ -3502,6 +3502,42 @@
           ]
         },
         {
+          "id": "b7e2f1d4-6c3a-4e2b-9f0a-1d5c8e7a2b9f",
+          "name": "Transition without the internal key -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/transitions",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"status\": \"confirmed\", \"service\": \"orchestrator-worker\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "id": "c667f8a0-8219-49e9-9e5d-ff21ee3d3904",
           "name": "Deciding an order with no token -> 401",
           "request": {
