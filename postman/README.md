@@ -2,13 +2,14 @@
 
 `smartfoodops.postman_collection.json` is every route the Nginx gateway exposes across all 7
 services (user, restaurant, menu, order, payment, rider, orchestrator), built from the same
-contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 129 requests across 9 folders,
+contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 130 requests across 9 folders,
 covering the happy path, authorisation boundaries, validation edge cases, and the Temporal-driven
 order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery).
 
-It was generated from a script rather than hand-written, precisely so its 129 requests could be
-checked for duplicate names and well-formedness before being trusted — see the header comment in
-that script if you ever need to regenerate or extend it rather than hand-editing the JSON.
+The JSON is hand-maintained directly — there is no generator script in this repo despite what an
+earlier version of this doc said. When you add or change a request, check it for duplicate names
+and valid JSON yourself before trusting it (e.g. `python3 -c "import json;
+json.load(open('smartfoodops.postman_collection.json'))"`).
 
 ## Import
 
