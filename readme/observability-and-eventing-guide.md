@@ -28,11 +28,64 @@ One rule governs all of it, and everything below is a consequence of it:
 
 ---
 
+## In plain words: how a trace reaches Jaeger, and a metric reaches Grafana
+
+Skip the code for a second — here's the short version of §4 and §5 below.
+
+**Jaeger gets traces, and a service *pushes* them.** Every request a service handles gets wrapped
+in a "span" automatically (no code written per-route for this). The service batches up its spans
+in memory and sends them over to Jaeger on its own schedule. Jaeger just sits there and stores
+whatever arrives — it never asks a service for anything.
+
+**Grafana never talks to a service at all — it only talks to Prometheus, and Prometheus does
+the asking.** Every service keeps a running tally of its own numbers (how many requests, how
+long each one took) behind a `/metrics` page that just sits there with the current numbers on
+it. Prometheus is the one that walks around every few seconds and reads that page from every
+service. Grafana then draws its charts purely from what Prometheus already collected — it
+never goes anywhere near the services themselves.
+
+**How each side actually does that, in one paragraph each:**
+
+- *Traces.* `configure_telemetry()` runs once at startup and wraps FastAPI, `httpx`, and the
+  Postgres driver with auto-instrumentation (`FastAPIInstrumentor`, `HTTPXClientInstrumentor`,
+  `Psycopg2Instrumentor`) — nothing is written per-route to make this happen. Every request,
+  outbound call, and DB query through one of those then creates a span on its own. Spans don't
+  go out one at a time; they queue in an in-memory `BatchSpanProcessor` and get flushed to
+  Jaeger together, over OTLP/HTTP, whenever the batch fills or a short timer fires.
+- *Metrics.* Two Prometheus objects — a `Counter` and a `Histogram` — are created exactly once
+  when the process starts (never inside a request handler, or Prometheus would reject the
+  duplicate). One small piece of middleware bumps both on every request: which route, what
+  status code, how long it took. That's it — the numbers just sit there in memory. The
+  `/metrics` route hands out their current values as plain text whenever something asks; the
+  service itself never reaches out anywhere.
+
+```
+   TRACES  (a service pushes, live)             METRICS  (Prometheus pulls, on a timer)
+   ──────────────────────────────               ────────────────────────────────────────
+
+   order-service ──┐                             order-service   [ /metrics page ]
+   payment-service ─┼─ send ──▶  Jaeger                 ▲                  ▲
+   ...              ┘           (just stores it)        │  read every      │  read every
+                                                          │  10 seconds     │  10 seconds
+                                                     Prometheus ◀───────────┘
+                                                          │
+                                                          │  Grafana asks Prometheus
+                                                          ▼  a question, draws a chart
+                                                       Grafana
+```
+
+So: a **trace** answers "what happened during this one request?" and gets there by the service
+*sending it*. A **metric** answers "how is the system doing overall, over time?" and gets there
+by Prometheus *fetching it*. Nothing a service does ever fails or slows down because Jaeger or
+Grafana happen to be offline — see §4.4 and §5.5 for exactly why.
+
+---
+
 ## 1. The six pieces, and what each one owns
 
 | Piece | Role | Talks to |
 |---|---|---|
-| **Temporal** | Durable saga state — every order's workflow history, timers, and retries. Not optional infrastructure like the other five; the saga *is* Temporal | `orchestrator-service`/`worker` (gRPC `:7233`); exposes its own Web UI (`:8233`) and Prometheus metrics (`:9233`) |
+| **Temporal** | Durable saga state — every order's workflow history, timers, and retries. Not optional infrastructure like the other five; the saga *is* Temporal | gRPC `:7233` — held directly by `order-service` and `rider-service` since D47 (they start/signal workflows themselves), and by `orchestrator-worker` (which polls and runs the actual workflow/activity tasks); `orchestrator-service` keeps a client only for its own health probe. Exposes its own Web UI (`:8233`) and Prometheus metrics (`:9233`) |
 | **OpenTelemetry** | The instrumentation layer *inside* every process — creates spans, propagates trace context across HTTP, Kafka, and Temporal boundaries | Nothing external directly; hands finished spans to an exporter |
 | **Jaeger** | Trace storage + UI. `jaegertracing/jaeger:2.x` is itself an OTel Collector distribution, so it receives OTLP natively — no separate Collector container | Receives OTLP from every service over HTTP (`:4318`) |
 | **Prometheus** | Metrics storage + query engine. Pulls, never pushed to | Scrapes every service's `/metrics`, plus Temporal's own `:9233`, on a 10s interval |
@@ -54,28 +107,46 @@ same chassis modules — `common/telemetry.py` for tracing and metrics, `common/
 ## 2. The whole picture
 
 ```
-                                POST /api/v1/orders           (a customer places an order)
-                                        │
-                                        ▼
-                              ┌────────────────────┐
-                              │   order-service      │──── 1. INSERT order ────▶ ┌────────────────┐
-                              │   :8004               │     INSERT order_outbox  │ sfo_order_core   │
-                              └──────────┬────────────┘     (same transaction)   └────────┬─────────┘
-                                         │ starts the saga                                 │
-                                         │ (HTTP, X-Internal-Key)             2. background │ relay polls
-                                         ▼                                    FOR UPDATE SKIP LOCKED
-                        ┌────────────────────────────┐                                    ▼
-                        │ orchestrator-service/worker  │             ┌──────────────────────────┐
-                        │ starts/runs the saga          │◀── gRPC ──▶│  temporal-server           │
-                        └──────────┬─────────────────────┘  :7233   │  durable workflow state     │
-                                   │                                 │  :8233  Web UI               │
-                                   │ HTTP: authorize, dispatch,      │  :9233  Prometheus metrics    │
-                                   │       transition, refund        └──────────────────────────────┘
-                                   ▼                                              │
-                    payment-service / rider-service           ┌─────────────────▼──────────┐
+                          POST /api/v1/orders          (a customer places an order)
+                                  │
+                                  ▼
+                    ┌─────────────────────┐                           ┌────────────────┐
+                    │ order-service :8004 │  ── 1. INSERT order, ──▶  │ sfo_order_core │
+                    └─────────────────────┘     INSERT order_outbox   └────────────────┘
+
+                                  │
+                                  │ StartWorkflow — order-service's own SagaClient
+                                  │ (D47: no HTTP hop through orchestrator-service)
+                                  ▼
+              ┌──────────────────────────┐
+              │ temporal-server          │  ◀── gRPC ──▶  ┌─────────────────────┐
+              │ durable workflow state   │      dispatch  │ orchestrator-worker │
+              │ :7233 gRPC               │       task     │ polls order-tasks,  │
+              │ :8233 Web UI             │                │ runs the workflow   │
+              │ :9233 Prometheus metrics │                └─────────────────────┘
+              └──────────────────────────┘
+                                  │                                                    │
+                                  │ gRPC, signals only —                               │ HTTP: authorize / refund,
+                                  │ rider-service (after recording                      │       transition,
+                                  │ the stage over HTTP to                               │       dispatch / release
+                                  │ order-service first), and                            ▼
+                                  │ order-service (its own                    payment-service / rider-service
+                                  │ kitchen decision) each
+                                  │ signal Temporal directly
+                                  ▼
+                          rider-service :8006
+
+     orchestrator-service :8007 is health-only — it keeps a Temporal client only to probe
+     reachability, never to start or signal a workflow (the REST facade this used to be,
+     apis/order.py, was deleted in D47)
+
+     2. background: the OutboxRelay inside order-service / payment-service polls
+        order_outbox / payment_outbox, FOR UPDATE SKIP LOCKED, once a second
+
+                                                                ┌──────────────────────────┐
                                                                 │  OutboxRelay                │
                                                                 │  (in-process, common/       │
-                                                                │   outbox.py) — 3. validate,  │
+                                                                │   outbox.py) — 3. validate, │
                                                                 │   publish, mark published   │
                                                                 └─────────────────┬────────────┘
                                                               validate against    │
@@ -366,10 +437,10 @@ running Prometheus before being checked in (not guessed from source):
 
 | Dashboard | Covers |
 |---|---|
-| **Service RED Metrics** | Request rate / error rate / P95 latency per service, top routes by traffic, scrape-target health, resident memory |
+| **Service RED Metrics** | Request rate / error rate / P95 & P99 latency per service, top routes by traffic, scrape-target health, resident memory |
 | **Eventing & Outbox** | `sfo_outbox_backlog`/`sfo_outbox_lag_seconds` per table, publish rate and failures, consumer staleness (`time() - sfo_consumer_last_message_timestamp_seconds`), notification enqueue rate, RabbitMQ queue depth |
 | **Business Metrics** | The analytics read-model's own counters — orders placed/delivered/cancelled, average delivery time, cancellation rate |
-| **Temporal Saga** | `temporal-server:9233`'s own metrics — workflow completions, activity success/fail by type, task-queue poll health, schedule-to-start and schedule-to-close latency, all scoped to `order_tasks` / `OrderWorkflow` |
+| **Temporal Saga** | `temporal-server:9233`'s own metrics — workflow completions, activity success/fail by type, task-queue poll health, schedule-to-start and schedule-to-close latency (P95 & P99), all scoped to `order_tasks` / `OrderWorkflow` |
 
 Kafka's own broker has no Prometheus exporter in this stack, so the Eventing dashboard observes
 it through its consequences (outbox lag, consumer staleness) rather than broker-internal
