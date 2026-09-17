@@ -53,7 +53,7 @@ async def create_order(
                 existing["restaurant_id"], current_user.token
             ),
         )
-        return ok(OrderResponse(**existing), message="Replayed", status=200)
+        return ok(OrderResponse(**existing), message="This order has already been placed", status=200)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
     menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user.token)
