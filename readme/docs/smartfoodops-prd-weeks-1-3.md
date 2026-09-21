@@ -45,38 +45,41 @@ QuickServe's legacy platform suffered from critical operational bottlenecks duri
 SmartFoodOps enforces a **Database-per-Service (Option B)** zero-shared-state architecture. Each microservice completely owns its private storage engine and communicates exclusively via validated REST APIs, Temporal state workflows, or Kafka event streams.
 
 ```
-                                 ┌───────────────────────────┐
-                                 │   API Gateway (Nginx)     │
-                                 └─────────────┬─────────────┘
-                                               │
-             ┌─────────────────────────────────┼─────────────────────────────────┐
-             │                                 │                                 │
-             ▼                                 ▼                                 ▼
-┌─────────────────────────┐       ┌─────────────────────────┐       ┌─────────────────────────┐
-│      User Service       │       │   Restaurant Service    │       │      Menu Service       │
-│  (Postgres: 5432)       │       │   (Postgres: 5433)      │       │ (Postgres:5436 + Redis) │
-└─────────────────────────┘       └─────────────────────────┘       └─────────────────────────┘
-             │                                 │                                 │
-             └─────────────────────────────────┼─────────────────────────────────┘
-                                               │
-                                               ▼
-                                 ┌───────────────────────────┐
-                                 │       Order Service       │
-                                 │   (Postgres: 5434)        │
-                                 └─────────────┬─────────────┘
-                                               │
-                       ┌───────────────────────┴───────────────────────┐
-                       ▼                                               ▼
-       ┌───────────────────────────────┐               ┌───────────────────────────────┐
-       │   Orchestration Service       │               │      Kafka Event Spine        │
-       │   (Temporal Workflow Engine)  │               │   (Confluent Schema Reg.)     │
-       └───────────────┬───────────────┘               └───────────────┬───────────────┘
-                       │                                               │
-                       ▼                                               ▼
-       ┌───────────────────────────────┐               ┌───────────────────────────────┐
-       │       Payment Service         │               │   Celery + RabbitMQ Workers   │
-       │   (Postgres: 5435)            │               │   (Notifications & Telemetry) │
-       └───────────────────────────────┘               └───────────────────────────────┘
+                          ┌───────────────────────┐
+     http://localhost:80  │   Nginx API Gateway   │
+     ────────────────────▶│  (path-based routing) │
+                          └───────────┬───────────┘
+   ┌──────────┬──────────┬────────────┴───┬──────────┬──────────┐
+   ▼          ▼          ▼                ▼          ▼          ▼
+┌────────┐┌────────┐┌────────┐      ┌────────┐┌────────┐┌────────┐
+│  User  ││Restaur.││  Menu  │      │ Order  ││Payment ││ Rider  │
+│ :8001  ││ :8002  ││ :8003  │      │ :8004  ││ :8005  ││ :8006  │
+└───┬────┘└───┬────┘└───┬────┘      └───┬────┘└───┬────┘└───┬────┘
+    │         │      ┌──┴──┐            │         │         │
+    ▼         ▼      ▼     ▼            ▼         ▼         ▼
+ Postgres  Postgres  PG  Redis       Postgres  Postgres  Postgres
+  :5432     :5433  :5436 :6379        :5434     :5435     :5437
+                  (menus)(cache)   (+ tracking)         (fleet)
+                                        │                   │
+                                        │ gRPC: start saga, │ gRPC: signal
+                                        │ signal kitchen    │ pickup /
+                                        │ decision (D47)    │ delivery (D47)
+                                        └─────────┬─────────┘
+                                                  ▼
+                                 ┌────────────────────────────────────┐
+                                 │        Temporal dev server         │
+                                 │ :7233 gRPC :8233 UI :9233 /metrics │
+                                 └───────┬─────────────────┬──────────┘
+                                         │ health only     │ polls "order-tasks"
+                                         ▼                 ▼
+                  ┌───────────────────────┐     ┌─────────────────────────┐
+                  │  orchestrator-service │     │   orchestrator-worker   │
+                  │   :8007, no database  │     │   runs the saga, no db  │
+                  └───────────────────────┘     └────────────┬────────────┘
+                                                              │ HTTP, X-Internal-Key:
+                                                              │  order transitions/read
+                                                              │  payment authorize/refund
+                                                              │  rider dispatch/release
 ```
 
 ### 3.1 Guiding Architectural Principles
