@@ -35,6 +35,13 @@ class UserResponse(BaseModel):
     email: EmailStr
     full_name: str
     phone: str
-    role: str  # Resolves database roles table lookup via SQL Join query on role_id
+    roles: list[str]  # Every role currently granted via user_roles, not just the first
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class RoleGrantRequest(BaseModel):
+    # Kept as a plain string, not the UserRole enum, for the same reason as
+    # UserRegisterRequest.role: an unknown name is a 400 from the roles-table lookup, not a
+    # 422 from schema validation.
+    role: str = Field(..., min_length=2)

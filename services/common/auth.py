@@ -67,22 +67,31 @@ class CurrentUser(BaseModel):
     """The verified identity behind a request."""
 
     user_id: UUID
-    role: str
+    roles: list[str]
     # The raw bearer, kept so route handlers can forward it to downstream services. See
     # the module docstring: downstream calls run as the original caller, never as more.
     token: str
 
     @property
     def is_admin(self) -> bool:
-        return self.role == ADMIN_ROLE
+        return ADMIN_ROLE in self.roles
+
+    @property
+    def role(self) -> str:
+        """Compatibility shim for call sites not yet migrated to `roles`.
+
+        Returns the first granted role. Temporary for the rollout — delete once
+        `grep -rn '\\.role\\b' services/` (excluding `.roles`) comes back empty.
+        """
+        return self.roles[0]
 
 
-def issue_access_token(user_id: UUID, role: str) -> str:
+def issue_access_token(user_id: UUID, roles: list[str]) -> str:
     """Sign a short-lived access token. Only the User Service can call this."""
     now = datetime.now(timezone.utc)
     claims = {
         "sub": str(user_id),
-        "role": role,
+        "roles": roles,
         "iss": ISSUER,
         "iat": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_TTL_MINUTES),
@@ -109,7 +118,7 @@ def get_current_user(
             PUBLIC_KEY,
             algorithms=[ALGORITHM],
             issuer=ISSUER,
-            options={"require": ["sub", "role", "exp", "iss"]},
+            options={"require": ["sub", "roles", "exp", "iss"]},
         )
     except jwt.ExpiredSignatureError as exc:
         raise unauthorized("Access token has expired; refresh it") from exc
@@ -118,20 +127,20 @@ def get_current_user(
         # logged nowhere and never returned: it would tell an attacker which part to fix.
         raise unauthorized("Access token is invalid") from exc
 
-    return CurrentUser(user_id=UUID(claims["sub"]), role=claims["role"], token=token)
+    return CurrentUser(user_id=UUID(claims["sub"]), roles=claims["roles"], token=token)
 
 
 def require_role(*allowed: str):
-    """Build a dependency admitting only the listed roles.
+    """Build a dependency admitting callers who hold at least one of the listed roles.
 
     Usage: ``current_user = Depends(require_role("restaurant_admin"))``. `system_admin` is
     always admitted so an operator is never locked out of an endpoint.
     """
 
     def dependency(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-        if current_user.role not in allowed and not current_user.is_admin:
+        if not (set(current_user.roles) & set(allowed)) and not current_user.is_admin:
             raise forbidden(
-                f"Role '{current_user.role}' may not perform this action "
+                f"Role(s) '{', '.join(current_user.roles)}' may not perform this action "
                 f"(requires one of: {', '.join(sorted(allowed))})"
             )
         return current_user
@@ -162,7 +171,7 @@ def require_self_or_admin(
         raise forbidden(detail)
 
 
-def assert_account_role(account: dict, *, required: str, detail: str) -> dict:
+def assert_account_has_role(account: dict, *, required: str, detail: str) -> dict:
     """Assert a fetched account currently holds a role, independent of its token.
 
     Three services do this after reading `GET /api/v1/users/{id}`, and the reason is the
@@ -173,7 +182,7 @@ def assert_account_role(account: dict, *, required: str, detail: str) -> dict:
     produced this dict and how a rejection is worded belong to the calling service — those
     messages are distinct response bodies, not boilerplate.
     """
-    if account.get("role") != required:
+    if required not in account.get("roles", []):
         raise forbidden(detail)
     return account
 

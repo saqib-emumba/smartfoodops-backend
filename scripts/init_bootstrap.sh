@@ -130,13 +130,25 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     full_name VARCHAR(255) NOT NULL,
     phone VARCHAR(50) UNIQUE NOT NULL,
-    role_id INT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Case-insensitive unique constraint index for emails (prevent duplicate registrations)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
+
+-- 1c. User <-> Role grants (many-to-many). Replaces the single users.role_id column: a
+-- user can hold more than one role (e.g. a restaurant_admin who also places orders as a
+-- customer). Composite PK is the grant's whole identity -- "this user holds this role" has
+-- no attributes worth a surrogate id, and it doubles as the no-duplicate-grant constraint.
+-- ON DELETE CASCADE on user_id (deleting a user drops their grants); ON DELETE RESTRICT on
+-- role_id, matching the old column's behavior (a role is reference data, not disposable).
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id INT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    granted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, role_id)
+);
 EOF
 
 cat << 'EOF' > db/restaurant/init.sql

@@ -11,7 +11,7 @@ credential at all.
 
 from uuid import UUID
 
-from common.auth import assert_account_role, bearer
+from common.auth import assert_account_has_role, bearer
 from common.config import DEFAULT_USER_SERVICE_URL
 from common.service_client import ServiceFacade
 
@@ -39,11 +39,11 @@ class UserServiceClient(ServiceFacade):
             bad_gateway_hint="verifying owner",
             headers=bearer(token),
         )
-        return assert_account_role(
+        return assert_account_has_role(
             owner,
             required=OWNER_ROLE,
             detail=(
-                f"Owner {owner_id} has role '{owner.get('role')}' and is not authorised "
-                f"to onboard restaurants (requires '{OWNER_ROLE}')"
+                f"Owner {owner_id} holds role(s) '{', '.join(owner.get('roles', []))}' and "
+                f"is not authorised to onboard restaurants (requires '{OWNER_ROLE}')"
             ),
         )

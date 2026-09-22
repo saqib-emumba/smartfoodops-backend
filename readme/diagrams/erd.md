@@ -6,7 +6,7 @@ see [readme/key-decisions.md](../key-decisions.md) for the D-numbers cited inlin
 ```mermaid
 erDiagram
     %% ---- sfo_user_core ----
-    ROLES ||--o{ USERS : "defines_role_of"
+    ROLES }o--o{ USERS : "grants_role_to (via USER_ROLES)"
 
     %% ---- cross-database references, verified over HTTP, no engine FK ----
     USERS ||--o{ RESTAURANTS : "onboards / owns"
@@ -42,9 +42,14 @@ erDiagram
         varchar password_hash
         varchar full_name
         varchar phone "Unique"
-        int role_id FK "References ROLES.id, ON DELETE RESTRICT"
         timestamp created_at
         timestamp updated_at
+    }
+
+    USER_ROLES {
+        uuid user_id FK "References USERS.id, ON DELETE CASCADE"
+        int role_id FK "References ROLES.id, ON DELETE RESTRICT"
+        timestamp granted_at
     }
 
     RESTAURANTS {

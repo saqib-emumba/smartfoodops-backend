@@ -35,7 +35,7 @@ def verify_password(plaintext: str, password_hash: str) -> bool:
     return bcrypt.checkpw(plaintext.encode("utf-8"), password_hash.encode("utf-8"))
 
 
-def issue_session(store, user_id: UUID, role: str) -> TokenResponse:
+def issue_session(store, user_id: UUID, roles: list[str]) -> TokenResponse:
     """Mint an access token and open a refresh session for it.
 
     `store` is the RefreshTokenStore, passed in rather than imported, so this module stays
@@ -44,7 +44,7 @@ def issue_session(store, user_id: UUID, role: str) -> TokenResponse:
     refresh_token = generate_refresh_token()
     store.store(refresh_token, user_id)
     return TokenResponse(
-        access_token=issue_access_token(user_id, role),
+        access_token=issue_access_token(user_id, roles),
         refresh_token=refresh_token,
         expires_in=ACCESS_TOKEN_TTL_MINUTES * 60,
     )

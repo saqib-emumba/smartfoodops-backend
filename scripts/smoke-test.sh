@@ -258,6 +258,10 @@ ADMIN_EMAIL="admin_${TAG}@example.com"
 ADMIN_PHONE="+1999${RANDOM}${RANDOM}"
 OWNER2_EMAIL="owner2_${TAG}@example.com"
 OWNER2_PHONE="+1222${RANDOM}${RANDOM}"
+# Registers as restaurant_admin only, then self-grants customer mid-run -- the multi-role
+# RBAC scenario (see readme/multi-role-rbac-design.md).
+DUAL_EMAIL="dual_${TAG}@example.com"
+DUAL_PHONE="+1333${RANDOM}${RANDOM}"
 
 # The restaurant every order in this run is placed against, and the coordinates dispatch
 # measures from. Riders are seeded close to it so the 10km radius is satisfied.
@@ -292,7 +296,7 @@ section "Authentication"
 expect "register restaurant owner" 201 POST /api/v1/users/register \
   "{\"email\":\"$OWNER_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Owner\",\"phone\":\"$OWNER_PHONE\",\"role\":\"restaurant_admin\"}"
 OWNER_ID=$(jfield "['id']")
-assert "  owner role resolved from roles table" "$(jfield "['role']")" "restaurant_admin"
+assert "  owner role resolved from roles table" "$(jfield "['roles'][0]")" "restaurant_admin"
 
 expect "register customer" 201 POST /api/v1/users/register \
   "{\"email\":\"$CUST_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Customer\",\"phone\":\"$CUST_PHONE\",\"role\":\"customer\"}"
@@ -307,7 +311,7 @@ OTHER_ID=$(jfield "['id']")
 expect "register rider" 201 POST /api/v1/users/register \
   "{\"email\":\"$RIDER_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Rider\",\"phone\":\"$RIDER_PHONE\",\"role\":\"rider\"}"
 RIDER_USER_ID=$(jfield "['id']")
-assert "  rider role resolved from roles table" "$(jfield "['role']")" "rider"
+assert "  rider role resolved from roles table" "$(jfield "['roles'][0]")" "rider"
 
 expect "register second rider" 201 POST /api/v1/users/register \
   "{\"email\":\"$RIDER2_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Second Rider\",\"phone\":\"$RIDER2_PHONE\",\"role\":\"rider\"}"
@@ -318,10 +322,14 @@ RIDER2_USER_ID=$(jfield "['id']")
 # distinct from each other, on the Order Service's kitchen routes.
 expect "register system admin" 201 POST /api/v1/users/register \
   "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Smoke Admin\",\"phone\":\"$ADMIN_PHONE\",\"role\":\"system_admin\"}"
-assert "  admin role resolved from roles table" "$(jfield "['role']")" "system_admin"
+assert "  admin role resolved from roles table" "$(jfield "['roles'][0]")" "system_admin"
 
 expect "register second restaurant owner" 201 POST /api/v1/users/register \
   "{\"email\":\"$OWNER2_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Other Owner\",\"phone\":\"$OWNER2_PHONE\",\"role\":\"restaurant_admin\"}"
+
+expect "register dual-role principal (restaurant_admin only, for now)" 201 POST /api/v1/users/register \
+  "{\"email\":\"$DUAL_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Dual Role\",\"phone\":\"$DUAL_PHONE\",\"role\":\"restaurant_admin\"}"
+DUAL_ID=$(jfield "['id']")
 
 expect "login with correct credentials" 200 POST /api/v1/users/login \
   "{\"email\":\"$OWNER_EMAIL\",\"password\":\"$PASSWORD\"}"
@@ -342,6 +350,7 @@ do_login "$RIDER_EMAIL" "$PASSWORD"; RIDER_TOKEN="$ACCESS_TOKEN"
 do_login "$RIDER2_EMAIL" "$PASSWORD"; RIDER2_TOKEN="$ACCESS_TOKEN"
 do_login "$ADMIN_EMAIL" "$PASSWORD";  ADMIN_TOKEN="$ACCESS_TOKEN"
 do_login "$OWNER2_EMAIL" "$PASSWORD"; OWNER2_TOKEN="$ACCESS_TOKEN"
+do_login "$DUAL_EMAIL" "$PASSWORD"; DUAL_TOKEN="$ACCESS_TOKEN"
 
 OWNER_AUTH=(-H "Authorization: Bearer $OWNER_TOKEN")
 CUST_AUTH=(-H "Authorization: Bearer $CUST_TOKEN")
@@ -350,6 +359,7 @@ RIDER_AUTH=(-H "Authorization: Bearer $RIDER_TOKEN")
 RIDER2_AUTH=(-H "Authorization: Bearer $RIDER2_TOKEN")
 ADMIN_AUTH=(-H "Authorization: Bearer $ADMIN_TOKEN")
 OWNER2_AUTH=(-H "Authorization: Bearer $OWNER2_TOKEN")
+DUAL_AUTH=(-H "Authorization: Bearer $DUAL_TOKEN")
 INTERNAL=(-H "X-Internal-Key: $INTERNAL_KEY")
 
 expect "no token -> 401" 401 GET "/api/v1/users/$OWNER_ID"
@@ -460,13 +470,65 @@ expect "customer cannot onboard a restaurant -> 403" 403 POST /api/v1/restaurant
   "{\"name\":\"Customer Diner\",\"address\":\"2 Nowhere Road\",\"latitude\":10,\"longitude\":10,\"capacity\":5}" \
   "${CUST_AUTH[@]}"
 expect "customer cannot publish a menu -> 403" 403 POST /api/v1/menus "$MENU" "${CUST_AUTH[@]}"
-expect "restaurant owner cannot place an order -> 403" 403 POST /api/v1/orders "$ORDER" \
+expect "restaurant owner without the customer role cannot place an order -> 403" 403 POST /api/v1/orders "$ORDER" \
   -H "X-Idempotency-Key: $IDEM-ownerorder" "${OWNER_AUTH[@]}"
 expect "reading another customer's order -> 403" 403 GET "/api/v1/orders/$ORDER_ID" "" "${OTHER_AUTH[@]}"
 expect "paying for another customer's order -> 403" 403 POST /api/v1/payments \
   "{\"order_id\":\"$ORDER_ID\",\"amount\":27.00,\"idempotency_key\":\"$PAY_IDEM-steal\"}" \
   -H "X-Idempotency-Key: $PAY_IDEM-steal" "${OTHER_AUTH[@]}"
 expect "reading another customer's payment -> 403" 403 GET "/api/v1/payments/$PAYMENT_ID" "" "${OTHER_AUTH[@]}"
+
+# ------------------------------------------------------------ multi-role RBAC
+# A restaurant_admin who wants to also act as a customer, without giving up being a
+# restaurant_admin (readme/multi-role-rbac-design.md). user_roles (a junction table) is what
+# makes "holds more than one role at once" representable; these are the RBAC rules layered
+# on top of it: self-grant/self-revoke works for every role except system_admin, which
+# requires the caller to already be one, on either side of the change.
+section "Multi-role RBAC"
+
+expect "restaurant owner self-grants the customer role" 200 POST "/api/v1/users/$DUAL_ID/roles" \
+  "{\"role\":\"customer\"}" "${DUAL_AUTH[@]}"
+
+# The grant is real in the database immediately, but DUAL_AUTH was minted at login, before
+# the grant -- the token's role claim only reflects what was true then (D18), so the stale
+# token must still be refused until the caller logs in or refreshes again.
+DUAL_IDEM="idem-dual-$TAG"
+expect "the pre-grant token still cannot place an order -> 403" 403 POST /api/v1/orders "$ORDER" \
+  -H "X-Idempotency-Key: $DUAL_IDEM-stale" "${DUAL_AUTH[@]}"
+
+do_login "$DUAL_EMAIL" "$PASSWORD"; DUAL_TOKEN="$ACCESS_TOKEN"
+DUAL_AUTH=(-H "Authorization: Bearer $DUAL_TOKEN")
+
+expect "a restaurant_admin holding the customer role can place an order" 201 POST /api/v1/orders "$ORDER" \
+  -H "X-Idempotency-Key: $DUAL_IDEM" "${DUAL_AUTH[@]}"
+assert "  customer taken from the token, not the body, even for a dual-role caller" \
+  "$(jfield "['customer_id']")" "$DUAL_ID"
+
+# He never stopped being a restaurant_admin -- holding an added role only adds capability,
+# it does not shadow the ones already held.
+expect "still a restaurant_admin: can onboard a restaurant" 201 POST /api/v1/restaurants/onboard \
+  "{\"name\":\"Dual Diner\",\"address\":\"1 Dual Street\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":10}" \
+  "${DUAL_AUTH[@]}"
+
+expect "revoking a user's last remaining role -> 409" 409 DELETE "/api/v1/users/$OTHER_ID/roles/customer" \
+  "" "${OTHER_AUTH[@]}"
+expect "granting a role to another user without admin -> 403" 403 POST "/api/v1/users/$OTHER_ID/roles" \
+  "{\"role\":\"rider\"}" "${OWNER_AUTH[@]}"
+expect "a system_admin may grant a role to any user" 200 POST "/api/v1/users/$OTHER_ID/roles" \
+  "{\"role\":\"rider\"}" "${ADMIN_AUTH[@]}"
+
+# system_admin is the one role that is not self-service in either direction -- it bypasses
+# every ownership check in the platform, so holding the label already is the access.
+expect "a non-admin cannot self-grant system_admin -> 403" 403 POST "/api/v1/users/$CUST_ID/roles" \
+  "{\"role\":\"system_admin\"}" "${CUST_AUTH[@]}"
+expect "a non-admin cannot grant system_admin to someone else -> 403" 403 POST "/api/v1/users/$OTHER_ID/roles" \
+  "{\"role\":\"system_admin\"}" "${OWNER_AUTH[@]}"
+expect "a system_admin can grant system_admin to another user" 200 POST "/api/v1/users/$OTHER_ID/roles" \
+  "{\"role\":\"system_admin\"}" "${ADMIN_AUTH[@]}"
+expect "a non-admin cannot revoke someone else's system_admin -> 403" 403 DELETE "/api/v1/users/$OTHER_ID/roles/system_admin" \
+  "" "${CUST_AUTH[@]}"
+expect "a system_admin can revoke another account's system_admin" 200 DELETE "/api/v1/users/$OTHER_ID/roles/system_admin" \
+  "" "${ADMIN_AUTH[@]}"
 
 # ------------------------------------------------------- session lifecycle
 section "Session lifecycle"

@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from common.auth import assert_account_role, bearer
+from common.auth import assert_account_has_role, bearer
 from common.config import DEFAULT_USER_SERVICE_URL
 from common.service_client import ServiceFacade
 
@@ -29,11 +29,11 @@ class UserServiceClient(ServiceFacade):
             bad_gateway_hint="verifying the rider account",
             headers=bearer(token),
         )
-        return assert_account_role(
+        return assert_account_has_role(
             account,
             required=RIDER_ROLE,
             detail=(
-                f"Account {user_id} has role '{account.get('role')}' and is not authorised "
-                f"to join the delivery fleet (requires '{RIDER_ROLE}')"
+                f"Account {user_id} holds role(s) '{', '.join(account.get('roles', []))}' and "
+                f"is not authorised to join the delivery fleet (requires '{RIDER_ROLE}')"
             ),
         )

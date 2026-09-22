@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
-from user.apis import health, sessions, users
+from user.apis import health, roles, sessions, users
 from user import deps
 
 
@@ -42,6 +42,7 @@ instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
 app.include_router(users.router)
+app.include_router(roles.router)
 app.include_router(sessions.router)
 
 

@@ -31,7 +31,7 @@ def login(payload: LoginRequest) -> Envelope[TokenResponse]:
         deps.logger.info("Failed login attempt for %s", payload.email)
         raise unauthorized(INVALID_CREDENTIALS)
 
-    token = issue_session(deps.refresh_tokens, record["id"], record["role"])
+    token = issue_session(deps.refresh_tokens, record["id"], record["roles"])
     return ok(token, message="Logged in")
 
 
@@ -46,12 +46,12 @@ def refresh_session(payload: RefreshRequest) -> Envelope[TokenResponse]:
     if user_id is None:
         raise unauthorized("Refresh token is invalid, expired or already used")
 
-    # Re-read the role rather than trusting one captured at login — see find_role.
-    record = deps.users.find_role(user_id)
+    # Re-read the role set rather than trusting one captured at login — see find_roles.
+    record = deps.users.find_roles(user_id)
     if record is None:
         raise unauthorized("The account behind this session no longer exists")
 
-    token = issue_session(deps.refresh_tokens, user_id, record["role"])
+    token = issue_session(deps.refresh_tokens, user_id, record["roles"])
     return ok(token, message="Session refreshed")
 
 

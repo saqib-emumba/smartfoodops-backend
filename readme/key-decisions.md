@@ -63,6 +63,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D44](#d44--the-analytics-service-gets-its-own-database-and-dedups-by-consumer_group-event_id) | The Analytics Service gets its own database, dedups by `(consumer_group, event_id)` | 2026-09-08 | Accepted |
 | [D45](#d45--kafka-is-the-ledger-rabbitmqcelery-is-the-concurrency-pool) | Kafka is the ledger, RabbitMQ/Celery is the concurrency pool | 2026-09-09 | Accepted |
 | [D47](#d47--services-hold-their-own-temporal-client-and-name-workflows-by-string) | Services hold their own Temporal client and name workflows by string | 2026-09-09 | Accepted |
+| [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Accepted |
 
 ---
 
@@ -1467,6 +1468,68 @@ report. There is no D46; the record is
 [D43](#d43--the-riders-report-becomes-a-durable-column-on-orders). Code written for this
 decision cites D43 and says so inline; the pre-existing citations are left alone rather than
 swept into an unrelated change.
+
+---
+
+## Week 4 — multi-role access control
+
+### D48 — Multiple roles per user via a junction table, not an implicit "everyone is a customer" rule
+
+**Decided:** `users.role_id` (a single `NOT NULL` foreign key — one role per user) is replaced
+by `user_roles`, a `(user_id, role_id)` junction table (`db/user/init.sql`,
+`scripts/init_bootstrap.sh`). The access token's `role` claim becomes `roles`, a list; every
+guard in `services/common/auth.py` that compared against one value now checks membership —
+`require_role` is a set intersection, and `assert_account_role` is renamed
+`assert_account_has_role` to make the plural-aware check explicit rather than a silent
+behavior change under the old name. Two new endpoints, `POST`/`DELETE
+/api/v1/users/{id}/roles`, let an account grant or revoke a role on itself (or, for an admin,
+on anyone) — self-service for `customer`/`restaurant_admin`/`rider`, but touching
+`system_admin` on any account, including the caller's own, additionally requires the caller
+to already be a `system_admin`. Full rationale, the RBAC decision table across every route,
+and the worked scenario live in
+[multi-role-rbac-design.md](multi-role-rbac-design.md); this entry is the changelog-style
+record of what shipped.
+
+**Instead of:**
+
+- **Implicit "everyone is a customer,"** i.e. dropping the role gate on checkout entirely
+  rather than requiring an explicit grant. Rejected because it doesn't generalise — it patches
+  exactly the one scenario named (a restaurant_admin ordering for himself) and nothing else,
+  where the junction table lets *any* two roles combine.
+- **A role hierarchy** (`restaurant_admin` implying `customer`). Roles stay a flat set;
+  `system_admin` is a distinct label that bypasses every gate it meets, not "every other role
+  combined." A hierarchy is a bigger, separate decision not needed to solve this.
+- **A versioned or dual-format JWT** for a gradual, mixed-version rollout. Rejected because
+  there is no live traffic to protect here — a clean, one-time cutover of the claim shape
+  costs nothing this environment can't absorb, where the dual-format version would be the
+  correct call in production.
+- **A second policy table naming which roles require elevation to grant.** A single `role ==
+  "system_admin"` check in the two new route handlers covers the entire requirement; a
+  separate schema concept for this one exception would be unused machinery.
+
+**Why:** `services/common/auth.py` is copied into every service image at build time (D04), so
+this is a breaking change to a contract seven services share — there is no way to make the
+claim shape multi-role-aware for some services and not others. Accepting one atomic cutover
+(named explicitly rather than glossed over) was cheaper than building the machinery a gradual
+rollout would need, given nothing is currently depending on that gradualness.
+
+**Cost:**
+
+- **Every access token issued before the cutover is invalidated immediately** — `get_current_user`
+  now requires `roles` in the claims, which no pre-cutover token carries. Short-lived access
+  tokens make this a minor blip (a forced `/refresh` or `/login`), not a production incident,
+  precisely because there is no production traffic yet.
+- **All seven services rebuild and redeploy together.** No canary or rolling path exists
+  without a versioned claim (rejected above), so this is a maintenance-window change.
+- **`verify_customer` (`services/order/clients/user.py`) still only checks that the customer
+  id exists — it was never converted to `assert_account_has_role`, unlike `verify_owner` and
+  `verify_rider`.** This asymmetry predates this decision and is left as a known gap: a user
+  who is demoted out of `customer` mid-session could still place one more order before their
+  token expires or refreshes. Named here rather than silently carried forward.
+- A temporary `CurrentUser.role` compatibility property (returns the first granted role)
+  ships alongside `.roles` so a not-yet-audited call site fails soft rather than crashing.
+  Tracked for deletion once `grep -rn '\.role\b' services/` (excluding `.roles`) comes back
+  empty — not meant to be a permanent second name for the same thing.
 
 ---
 
