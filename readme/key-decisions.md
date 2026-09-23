@@ -64,6 +64,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D45](#d45--kafka-is-the-ledger-rabbitmqcelery-is-the-concurrency-pool) | Kafka is the ledger, RabbitMQ/Celery is the concurrency pool | 2026-09-09 | Accepted |
 | [D47](#d47--services-hold-their-own-temporal-client-and-name-workflows-by-string) | Services hold their own Temporal client and name workflows by string | 2026-09-09 | Accepted |
 | [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Accepted |
+| [D49](#d49--rider-live-location-moves-from-postgres-columns-to-a-redis-geo-index) | Rider live location moves from Postgres to a Redis GEO index | 2026-09-23 | Accepted |
 
 ---
 
@@ -1530,6 +1531,57 @@ rollout would need, given nothing is currently depending on that gradualness.
   ships alongside `.roles` so a not-yet-audited call site fails soft rather than crashing.
   Tracked for deletion once `grep -rn '\.role\b' services/` (excluding `.roles`) comes back
   empty — not meant to be a permanent second name for the same thing.
+
+### D49 — Rider live location moves from Postgres columns to a Redis GEO index
+
+**Decided:** `riders.current_latitude`/`current_longitude` (`DECIMAL(9,6)`) are replaced by
+one Redis GEO sorted set, `riders:geo` (logical database 2), member = `user_id`, written
+through a new `RiderGeoStore` (`services/rider/repositories/geo.py`). `is_available`/
+`current_order_id` and the `FOR UPDATE SKIP LOCKED` claim stay in Postgres unchanged.
+Dispatch becomes two steps: `GEOSEARCH ... BYRADIUS ... ASC COUNT 50 WITHDIST` for a
+distance-ordered candidate list (`RIDER_DISPATCH_CANDIDATE_CAP`), then a Postgres claim
+restricted to `user_id = ANY(candidates)`, ordered by `array_position` to reproduce Redis's
+distance order without recomputing distance in SQL. `haversine_km` and
+`idx_riders_dispatchable` are dropped; `idx_riders_current_order` is untouched. Full
+rationale and the exact request/response flow live in
+[rider-location-redis-design.md](rider-location-redis-design.md); this entry is the
+changelog-style record of what shipped.
+
+**Instead of:**
+
+- **All-Postgres, as before.** Rejected per the motivation that started this: in production,
+  thousands of riders pinging every few seconds is write-hot, ephemeral, loseable-on-restart
+  data that causes MVCC bloat/vacuum pressure with no transactional need, competing with the
+  claim query's own lock on the same table.
+- **All-Redis, including the availability claim.** Rejected: only Postgres's
+  `FOR UPDATE SKIP LOCKED` plus the unique partial index on `current_order_id` gives the
+  at-most-one-rider-per-order guarantee a retried Temporal dispatch activity depends on
+  (D29); Redis has no equivalent primitive without reimplementing it.
+- **A Lua-scripted atomic claim inside Redis**, mirroring `is_available` into Redis as a
+  second copy. Rejected: it would duplicate state Postgres already owns authoritatively,
+  reopening the two-writers-for-one-fact problem D01 exists to prevent.
+
+**Why:** removes the actual bottleneck (per-ping Postgres writes) while keeping the one
+place that already needs a serialisable, uniqueness-enforced claim exactly where it already
+works — a minimal, targeted change rather than a rearchitecture of dispatch.
+
+**Cost:**
+
+- **A bounded, nameable approximation in "nearest available."** The `COUNT 50` cap on the
+  Redis candidate list can return zero available riders even when one exists further out, if
+  50+ strictly-closer riders are all busy — today's uncapped Postgres scan could never miss
+  an eligible rider. Accepted as a bounded, tunable approximation rather than an unbounded
+  one; not a race-window artifact, a structural cap.
+- **No per-entry staleness/TTL on the geo set** — unchanged from before, where a reported
+  position was also trusted indefinitely until overwritten. Not a new gap.
+- **Redis becomes a hard, blocking dependency for dispatch and location reporting
+  specifically** — a `503`, not a graceful degradation, unlike the Menu Service's
+  cache-aside (falls back to Postgres) or the User Service's refresh store (forces
+  re-login). This extends an already-operated dependency's blast radius into a service that
+  previously had none on Redis at all, rather than adding new infrastructure to the stack.
+- **The migration is not pure SQL** (cross-system) and needs
+  `scripts/migrate_rider_locations_to_redis.sh` plus manual, epsilon-tolerant verification
+  before `db/rider/drop_rider_location_columns.sql` is safe to run.
 
 ---
 

@@ -13,13 +13,15 @@ reads back on a timeout, and an order's state is not this service's to hold (D01
 """
 
 from common.bootstrap import bootstrap
-from common.config import DEFAULT_TEMPORAL_ADDRESS, service_url
+from common.config import DEFAULT_RIDER_REDIS_URL, DEFAULT_TEMPORAL_ADDRESS, service_url
 from common.temporal import SagaClient, TemporalGateway
 from rider.clients.order import OrderServiceClient
 from rider.clients.user import UserServiceClient
+from rider.repositories.geo import RiderGeoStore
 from rider.repositories.riders import RiderRepository
 
 TEMPORAL_ADDRESS = service_url("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
+RIDER_REDIS_URL = service_url("RIDER_REDIS_URL", DEFAULT_RIDER_REDIS_URL)
 
 runtime = bootstrap(
     "rider-service",
@@ -31,6 +33,7 @@ logger = runtime.logger
 db = runtime.db
 
 riders = RiderRepository(db, logger=logger)
+geo = RiderGeoStore(RIDER_REDIS_URL, logger=logger)
 user_service = UserServiceClient(logger)
 order_service = OrderServiceClient(logger)
 

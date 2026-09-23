@@ -25,6 +25,7 @@ Singletons live in deps.py; the routes are grouped by who may call them in api/.
 """
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
@@ -34,14 +35,27 @@ from common.telemetry import instrument_app
 from rider import deps
 from rider.apis import delivery, dispatch, health, profile
 
-# Two lifespans as of D47, having been the platform's last bare single one: the connection
-# pool, and the Temporal client this service signals the saga with. The gateway's own
-# lifespan log-and-swallows a startup failure, so a rider can still register and move while
-# Temporal is down — what fails then is the signal, and the saga's timeout read-back of
-# `orders.rider_reported_stage` is what repairs that.
+
+@asynccontextmanager
+async def _geo_lifespan(_: FastAPI):
+    """Hold the fleet's Redis geo-index connection open for the whole process (D49)."""
+    deps.geo.connect()
+    try:
+        yield
+    finally:
+        deps.geo.close()
+
+
+# Three lifespans as of D49: the connection pool, the Temporal client this service signals
+# the saga with (D47), and the Redis geo-index rider location now lives in. The gateway's
+# own lifespan log-and-swallows a startup failure, so a rider can still register and move
+# while Temporal is down — what fails then is the signal, and the saga's timeout read-back
+# of `orders.rider_reported_stage` is what repairs that. Redis has no such fallback for
+# dispatch specifically (see repositories/geo.py) — a location ping or a dispatch attempt
+# genuinely fails while it's down.
 app = FastAPI(
     title="SmartFoodOps Rider Service",
-    lifespan=compose_lifespan(deps.db.lifespan, deps.temporal.lifespan),
+    lifespan=compose_lifespan(deps.db.lifespan, deps.temporal.lifespan, _geo_lifespan),
 )
 install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)

@@ -7,10 +7,10 @@ row via the token's subject — there is no path that takes a rider id from the 
 from fastapi import APIRouter, Depends, status
 
 from common.auth import CurrentUser, require_role
-from common.errors import conflict, not_found
+from common.errors import conflict
 from common.responses import Envelope, ok
 from rider import deps
-from rider.fleet import own_profile
+from rider.fleet import own_profile, with_location
 from rider.schemas.riders import (
     RiderAvailabilityRequest,
     RiderLocationRequest,
@@ -33,14 +33,24 @@ def register_rider(
     """
     deps.user_service.verify_rider(current_user.user_id, current_user.token)
     row = deps.riders.register(payload, current_user.user_id)
-    return ok(RiderResponse(**row), message="Rider enrolled", status=201)
+    if payload.current_latitude is not None:
+        deps.geo.set_location(
+            current_user.user_id, payload.current_latitude, payload.current_longitude
+        )
+    merged = {
+        **row,
+        "current_latitude": payload.current_latitude,
+        "current_longitude": payload.current_longitude,
+    }
+    return ok(RiderResponse(**merged), message="Rider enrolled", status=201)
 
 
 @router.get("/me", response_model=Envelope[RiderResponse])
 def get_own_profile(
     current_user: CurrentUser = Depends(require_role("rider")),
 ) -> Envelope[RiderResponse]:
-    return ok(RiderResponse(**own_profile(deps.riders, current_user)), message="Rider found")
+    rider = with_location(own_profile(deps.riders, current_user), deps.geo)
+    return ok(RiderResponse(**rider), message="Rider found")
 
 
 @router.patch("/me/location", response_model=Envelope[RiderResponse])
@@ -50,18 +60,24 @@ def update_location(
 ) -> Envelope[RiderResponse]:
     """Report the rider's current position.
 
-    Until a rider has reported one they are invisible to dispatch: the partial index that
-    backs the search excludes rows with a null coordinate, because a rider whose location
-    is unknown cannot be measured against a restaurant.
+    Until a rider has reported one they are invisible to dispatch — Redis's geo-index (D49)
+    only ever contains riders who have checked in, so a rider with no location simply has no
+    entry to be found by a nearby-search.
+
+    Written to Redis only: this is the write-hot path the whole D49 migration exists for, so
+    it must not touch Postgres at all. `own_profile` is what still yields the 404 when the
+    caller has no rider profile.
     """
-    updated = deps.riders.update_location(
+    row = own_profile(deps.riders, current_user)
+    deps.geo.set_location(
         current_user.user_id, payload.current_latitude, payload.current_longitude
     )
-    if updated is None:
-        raise not_found(
-            "You have no rider profile; register one with POST /api/v1/riders first"
-        )
-    return ok(RiderResponse(**updated), message="Location updated")
+    merged = {
+        **row,
+        "current_latitude": payload.current_latitude,
+        "current_longitude": payload.current_longitude,
+    }
+    return ok(RiderResponse(**merged), message="Location updated")
 
 
 @router.patch("/me/availability", response_model=Envelope[RiderResponse])
@@ -77,7 +93,10 @@ def set_availability(
     """
     updated = deps.riders.set_availability(current_user.user_id, payload.is_available)
     if updated is not None:
-        return ok(RiderResponse(**updated), message="Availability updated")
+        return ok(
+            RiderResponse(**with_location(updated, deps.geo)),
+            message="Availability updated",
+        )
 
     # The UPDATE matched no row. Either there is no profile, or there is one mid-delivery.
     # Distinguishing them costs one read and is the difference between "register first"

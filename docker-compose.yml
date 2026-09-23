@@ -556,10 +556,15 @@ services:
       USER_SERVICE_URL: http://user-service:8001
       ORDER_SERVICE_URL: http://order-service:8004
       TEMPORAL_ADDRESS: temporal-server:7233
+      # Database 2, apart from the Menu Service's cache (0) and the User Service's refresh
+      # tokens (1): the fleet's live location index (D49).
+      RIDER_REDIS_URL: redis://cache-redis:6379/2
     depends_on:
       db-rider-postgres:
         condition: service_healthy
       temporal-server:
+        condition: service_healthy
+      cache-redis:
         condition: service_healthy
     networks:
       - smartfoodops-network

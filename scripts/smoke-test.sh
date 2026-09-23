@@ -717,6 +717,14 @@ expect "rider reports a location" 200 PATCH /api/v1/riders/me/location \
   "{\"current_latitude\":$REST_LAT,\"current_longitude\":$REST_LON}" "${RIDER_AUTH[@]}"
 expect "rider reads own profile" 200 GET /api/v1/riders/me "" "${RIDER_AUTH[@]}"
 
+# Week 4 (D49): location lives in Redis now, not Postgres. This is the Redis-side
+# equivalent of the direct-psql groundings below — cheap insurance against a location ping
+# silently no-op'ing instead of actually landing in riders:geo.
+if have_container sfo-redis; then
+  GEO_POS=$(docker exec sfo-redis redis-cli -n 2 GEOPOS riders:geo "$RIDER_USER_ID" 2>/dev/null | tr -d '[:space:]')
+  assert "  the reported location landed in Redis" "$([[ -n "$GEO_POS" ]] && echo present)" "present"
+fi
+
 # There is no delete endpoint for a rider — correctly, since riders are permanent fleet
 # members, not test fixtures — so every prior run of this script has left its own two
 # riders behind, at these exact coordinates. Left alone, a dispatch below could pick a

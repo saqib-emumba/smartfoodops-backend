@@ -4,6 +4,9 @@
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
 
+# redis for the fleet's live location index (GEOADD/GEOSEARCH) — see repositories/geo.py.
+redis==5.2.1
+
 # temporalio for signalling a pickup or delivery into the order's saga (D47) — a client
 # only, never a worker. Pinned identically to order/ and orchestrator/: a skew between a
 # client and the worker whose workflows it signals is a wire-compatibility bug with no

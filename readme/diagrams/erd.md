@@ -71,12 +71,13 @@ erDiagram
         varchar vehicle_type
         varchar vehicle_number "Unique"
         boolean is_available
-        decimal current_latitude "Nullable until first location report"
-        decimal current_longitude "Nullable until first location report"
         uuid current_order_id "References ORDERS.id -- cross-db; unique partial index (at most one rider per order)"
         timestamp created_at
         timestamp updated_at
     }
+    %% current_latitude/current_longitude moved out of this table in D49 -- live location
+    %% is now a Redis GEO index (riders:geo), not a Postgres column. Not representable in
+    %% a relational ERD, so it is noted here rather than drawn as a fifth entity.
 
     MENUS {
         uuid id PK

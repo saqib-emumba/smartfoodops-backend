@@ -3,7 +3,7 @@
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class RiderRegisterRequest(BaseModel):
@@ -12,9 +12,22 @@ class RiderRegisterRequest(BaseModel):
     vehicle_type: str = Field(..., min_length=2, max_length=100)
     vehicle_number: str = Field(..., min_length=2, max_length=100)
     # A rider who has never reported a location is not dispatchable, so both are optional
-    # here and simply exclude the rider from the partial index until they check in.
+    # here and simply leave the rider out of the Redis geo-index until they check in (D49).
     current_latitude: Optional[float] = Field(None, ge=-90, le=90)
     current_longitude: Optional[float] = Field(None, ge=-180, le=180)
+
+    @model_validator(mode="after")
+    def _both_or_neither(self) -> "RiderRegisterRequest":
+        """A latitude without a longitude is not a position — same rule as
+        RiderLocationRequest, but enforced here rather than by the schema's optionality
+        because a Redis GEO member has no partial state to fall back to."""
+        has_lat = self.current_latitude is not None
+        has_lon = self.current_longitude is not None
+        if has_lat != has_lon:
+            raise ValueError(
+                "current_latitude and current_longitude must be provided together"
+            )
+        return self
 
 
 class RiderLocationRequest(BaseModel):

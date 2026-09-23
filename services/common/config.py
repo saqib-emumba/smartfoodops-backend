@@ -45,6 +45,10 @@ DEFAULT_REDIS_URL = "redis://cache-redis:6379/0"
 # cache in database 0: an accidental FLUSHDB on one must not sign every user out.
 DEFAULT_AUTH_REDIS_URL = "redis://cache-redis:6379/1"
 
+# Rider live location lives in logical database 2, apart from the cache (0) and refresh
+# tokens (1): an accidental FLUSHDB on the fleet's position index must not touch either.
+DEFAULT_RIDER_REDIS_URL = "redis://cache-redis:6379/2"
+
 # Token lifetimes. The access token is deliberately short because it cannot be revoked
 # before it expires — logout invalidates the refresh token, not tokens already issued.
 ACCESS_TOKEN_TTL_MINUTES = 15
@@ -123,6 +127,12 @@ RIDER_SEARCH_INTERVAL_SECONDS = 10
 
 # Nothing beyond this is offered the order; a rider 30km away is not a delivery.
 RIDER_MAX_DISTANCE_KM = 10.0
+
+# Bounds the candidate list a Redis GEOSEARCH hands to the Postgres claim query, so a
+# dense fleet can't turn one dispatch attempt into an unbounded scan. Availability is
+# unknown to Redis, so this is a real (if generous) cap on how many busy riders can sit
+# ahead of an available one before dispatch gives up too early — see D49.
+RIDER_DISPATCH_CANDIDATE_CAP = 50
 
 # The one leg with a human walking around in it, so its bound is an hour rather than
 # seconds. Exceeding it means something went wrong that no retry will fix.

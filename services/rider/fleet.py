@@ -26,6 +26,19 @@ def own_profile(riders, current_user: CurrentUser) -> dict:
     return rider
 
 
+def with_location(row: dict, geo) -> dict:
+    """Merge a rider's Postgres row with its Redis-resident coordinates (D49) before
+    serialisation into RiderResponse.
+
+    Fails soft: a cache miss or a Redis outage here returns the rider profile with a null
+    location rather than a 404/503 — the schema already treats "no reported location" as
+    legitimate, so a lookup failure degrades to that same, already-modelled state.
+    """
+    location = geo.get_location(row["user_id"])
+    lat, lon = location if location is not None else (None, None)
+    return {**row, "current_latitude": lat, "current_longitude": lon}
+
+
 async def report_event(
     order_service, saga, rider: dict, order_id: UUID, *, stage: str, signal: str
 ) -> None:

@@ -29,9 +29,9 @@ class Repository:
     def _row(self, row: dict | None) -> dict | None:
         """Hook applied to every row on its way out. Identity by default.
 
-        Exists for the Rider Service, which converts `DECIMAL(9,6)` coordinates to the
-        floats its schemas declare. Without this hook the base class would silently drop
-        that conversion from every read.
+        An extension point for a repository that needs to convert a driver-native type
+        (e.g. `Decimal`) to the plain type its schemas declare. Without this hook the base
+        class would silently drop that conversion from every read.
         """
         return row
 

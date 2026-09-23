@@ -8,7 +8,7 @@ to forward (D26).
 from fastapi import APIRouter, Depends
 
 from common.auth import require_internal
-from common.config import RIDER_MAX_DISTANCE_KM
+from common.config import RIDER_DISPATCH_CANDIDATE_CAP, RIDER_MAX_DISTANCE_KM
 from common.responses import Envelope, ok
 from rider import deps
 from rider.eta import eta_minutes
@@ -26,18 +26,26 @@ router = APIRouter(prefix="/api/v1/riders", dependencies=[Depends(require_intern
 def dispatch_rider(payload: DispatchRequest) -> Envelope[DispatchResponse]:
     """Claim the nearest available rider for an order.
 
+    Two steps as of D49: Redis (`deps.geo.nearby`) answers "nearest, regardless of busy or
+    free" with a distance-ordered candidate list bounded by `RIDER_DISPATCH_CANDIDATE_CAP`;
+    Postgres (`deps.riders.dispatch`) then claims the nearest *available* rider from within
+    that list, transactionally. Availability is decided in exactly one place, same as before
+    — Redis only ever contributes candidate identity and order.
+
     An empty fleet answers `200` with body `{"assigned": false, ...}` rather than an error
     status. The workflow treats those differently — no rider available means wait and ask
     again, while a `503` means the Rider Service itself is broken — and collapsing them into
     one status would make the saga retry the wrong thing.
     """
     max_km = payload.max_distance_km or RIDER_MAX_DISTANCE_KM
-    claimed = deps.riders.dispatch(
-        payload.order_id,
+    candidates = deps.geo.nearby(
         payload.restaurant_latitude,
         payload.restaurant_longitude,
         max_km,
+        RIDER_DISPATCH_CANDIDATE_CAP,
     )
+    distance_by_user_id = dict(candidates)
+    claimed = deps.riders.dispatch(payload.order_id, [user_id for user_id, _ in candidates])
 
     if claimed is None:
         deps.logger.info(
@@ -56,7 +64,9 @@ def dispatch_rider(payload: DispatchRequest) -> Envelope[DispatchResponse]:
             message="No rider in range",
         )
 
-    distance = claimed.get("distance_km")
+    # None for a rider claimed on a retry via the already-held branch: Redis was never
+    # consulted for that path, so there is no candidate distance to look up.
+    distance = distance_by_user_id.get(str(claimed["user_id"]))
     deps.logger.info(
         "Assigned rider %s to order %s (%.2fkm)",
         claimed["id"],

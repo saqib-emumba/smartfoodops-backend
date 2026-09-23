@@ -24,5 +24,6 @@ async def health():
         order_service_url=deps.order_service.base_url,
         temporal_reachable=await deps.temporal.is_reachable(),
         temporal_address=deps.temporal.address,
+        location_cache_reachable=deps.geo.is_reachable(),
     )
     return ok(payload, message="Rider Service is operational")

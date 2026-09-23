@@ -11,9 +11,14 @@ it — pushing the race back to the caller and re-running the whole search.
 
 `user_id` is a plain UUID pointing into the User Service's database, so main.py verifies the
 account over HTTP before the insert (D02, D18).
+
+Location moved to Redis in D49 — `current_latitude`/`current_longitude` no longer live here.
+Dispatch is now two steps: `rider.geo.RiderGeoStore.nearby()` returns a distance-ordered
+candidate list, and `dispatch()` below claims the nearest *available* rider from within it.
+Distance itself is never recomputed in SQL; the caller matches a claimed `user_id` back
+against the candidate list Redis already returned.
 """
 
-from decimal import Decimal
 from uuid import UUID
 
 import psycopg2
@@ -23,43 +28,21 @@ from common.postgres import constraint_of
 from common.repository import Repository
 from rider.schemas.riders import RiderRegisterRequest
 
-_COLUMNS = (
-    "id, user_id, vehicle_type, vehicle_number, is_available, "
-    "current_latitude, current_longitude, current_order_id"
-)
-
-# Distance from the pickup point, in kilometres. Written once and interpolated into the
-# three places the dispatch statement needs it, so the ORDER BY, the radius filter and the
-# returned value can never be computed differently from one another.
-_DISTANCE = (
-    "haversine_km(current_latitude::double precision, "
-    "current_longitude::double precision, %(lat)s, %(lon)s)"
-)
+_COLUMNS = "id, user_id, vehicle_type, vehicle_number, is_available, current_order_id"
 
 _SELECT_BY_ID = f"SELECT {_COLUMNS} FROM riders WHERE id = %s"
 
 _SELECT_BY_USER = f"SELECT {_COLUMNS} FROM riders WHERE user_id = %s"
 
 _SELECT_BY_ORDER = f"""
-    SELECT {_COLUMNS},
-           NULL::double precision AS distance_km
+    SELECT {_COLUMNS}
       FROM riders
      WHERE current_order_id = %(order_id)s
 """
 
 _INSERT_RIDER = f"""
-    INSERT INTO riders
-        (user_id, vehicle_type, vehicle_number, current_latitude, current_longitude)
-    VALUES (%s, %s, %s, %s, %s)
-    RETURNING {_COLUMNS}
-"""
-
-_UPDATE_LOCATION = f"""
-    UPDATE riders
-       SET current_latitude = %s,
-           current_longitude = %s,
-           updated_at = CURRENT_TIMESTAMP
-     WHERE user_id = %s
+    INSERT INTO riders (user_id, vehicle_type, vehicle_number)
+    VALUES (%s, %s, %s)
     RETURNING {_COLUMNS}
 """
 
@@ -74,6 +57,10 @@ _UPDATE_AVAILABILITY = f"""
     RETURNING {_COLUMNS}
 """
 
+# `candidate_user_ids` arrives already ordered by distance (nearest first) from a Redis
+# GEOSEARCH. `array_position` is a deterministic restatement of that order: filtering out
+# busy rows via `WHERE is_available` before it runs can never reorder what survives, so the
+# nearest *available* candidate among the ones considered is still picked exactly — see D49.
 _CLAIM_NEAREST = f"""
     UPDATE riders
        SET is_available = FALSE,
@@ -84,15 +71,13 @@ _CLAIM_NEAREST = f"""
                FROM riders
               WHERE is_available
                 AND current_order_id IS NULL
-                AND current_latitude IS NOT NULL
-                AND current_longitude IS NOT NULL
-                AND {_DISTANCE} <= %(max_km)s
-              ORDER BY {_DISTANCE}
+                AND user_id = ANY(%(candidate_user_ids)s::uuid[])
+              ORDER BY array_position(%(candidate_user_ids)s::uuid[], user_id)
               LIMIT 1
               FOR UPDATE SKIP LOCKED
            )
        AND is_available
-    RETURNING {_COLUMNS}, {_DISTANCE} AS distance_km
+    RETURNING {_COLUMNS}
 """
 
 _RELEASE = f"""
@@ -105,26 +90,7 @@ _RELEASE = f"""
 """
 
 
-def _to_float(row: dict | None) -> dict | None:
-    """Convert psycopg2's `Decimal` coordinates to the floats the schemas declare.
-
-    The columns are `DECIMAL(9,6)` because a coordinate is a fixed-precision quantity, but
-    unlike money nothing arithmetic depends on it staying exact — D07's reasoning does not
-    reach here, and Pydantic wants floats.
-    """
-    if row is None:
-        return None
-    return {
-        key: float(value) if isinstance(value, Decimal) else value
-        for key, value in row.items()
-    }
-
-
 class RiderRepository(Repository):
-    def _row(self, row: dict | None) -> dict | None:
-        """Every row leaving this repository carries coordinates — see _to_float."""
-        return _to_float(row)
-
     def find(self, rider_id: UUID) -> dict | None:
         return self.one(_SELECT_BY_ID, (str(rider_id),))
 
@@ -137,20 +103,11 @@ class RiderRepository(Repository):
             try:
                 cur.execute(
                     _INSERT_RIDER,
-                    (
-                        str(user_id),
-                        payload.vehicle_type,
-                        payload.vehicle_number,
-                        payload.current_latitude,
-                        payload.current_longitude,
-                    ),
+                    (str(user_id), payload.vehicle_type, payload.vehicle_number),
                 )
             except psycopg2.errors.UniqueViolation as exc:
                 raise self._duplicate(exc, payload) from exc
             return self._row(cur.fetchone())
-
-    def update_location(self, user_id: UUID, lat: float, lon: float) -> dict | None:
-        return self.write_one(_UPDATE_LOCATION, (lat, lon, str(user_id)))
 
     def set_availability(self, user_id: UUID, is_available: bool) -> dict | None:
         """Toggle shift status. Returns None if the rider does not exist *or* is mid-order —
@@ -158,8 +115,13 @@ class RiderRepository(Repository):
         answers to the caller."""
         return self.write_one(_UPDATE_AVAILABILITY, (is_available, str(user_id)))
 
-    def dispatch(self, order_id: UUID, lat: float, lon: float, max_km: float) -> dict | None:
-        """Claim the nearest available rider, or return the one already carrying this order.
+    def dispatch(self, order_id: UUID, candidate_user_ids: list[str]) -> dict | None:
+        """Claim the nearest available rider from `candidate_user_ids`, or return the one
+        already carrying this order.
+
+        `candidate_user_ids` comes from `RiderGeoStore.nearby()`, nearest first, already
+        filtered to the dispatch radius — this method only ever decides *availability*
+        among them, never distance or radius.
 
         The prior-claim check is not an optimisation. Temporal retries activities, and a
         retry that skipped it would claim a *second* rider and strand the first — the
@@ -169,10 +131,9 @@ class RiderRepository(Repository):
 
         Both branches share one transaction so nothing can claim the order in between.
 
-        Returns None when no rider is within range, which is a legitimate answer rather
+        Returns None when no candidate is available, which is a legitimate answer rather
         than an error — see DispatchResponse.
         """
-        params = {"order_id": str(order_id), "lat": lat, "lon": lon, "max_km": max_km}
         with self._db.cursor(commit=True) as cur:
             cur.execute(_SELECT_BY_ORDER, {"order_id": str(order_id)})
             held = cur.fetchone()
@@ -184,7 +145,13 @@ class RiderRepository(Repository):
                 )
                 return self._row(held)
 
-            cur.execute(_CLAIM_NEAREST, params)
+            if not candidate_user_ids:
+                return None
+
+            cur.execute(
+                _CLAIM_NEAREST,
+                {"order_id": str(order_id), "candidate_user_ids": candidate_user_ids},
+            )
             return self._row(cur.fetchone())
 
     def release(self, order_id: UUID) -> dict | None:
