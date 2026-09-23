@@ -90,8 +90,9 @@ flowchart TB
     PaymentSvc --> PaymentDB
     RiderSvc --> RiderDB
     AnalyticsSvc --> AnalyticsDB
-    MenuSvc -.->|menu cache| Redis
-    UserSvc -.->|refresh tokens| Redis
+    MenuSvc -.->|menu cache, db 0| Redis
+    UserSvc -.->|refresh tokens, db 1| Redis
+    RiderSvc -.->|location GEO index, db 2 (D49)| Redis
 
     %% -- eventing: outbox relay, consumers, schema registry --
     OrderSvc -->|outbox relay| Kafka

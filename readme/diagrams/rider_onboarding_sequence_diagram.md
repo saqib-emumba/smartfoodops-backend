@@ -15,6 +15,7 @@ sequenceDiagram
     participant RiderSvc as Rider Service
     participant UserSvc as User Service
     participant RiderDB as sfo_rider_core
+    participant RiderGeo as Redis (riders:geo, db 2)
 
     rect rgb(235, 245, 255)
         Note over Rider, RiderDB: Join the fleet
@@ -35,10 +36,16 @@ sequenceDiagram
     end
 
     rect rgb(240, 240, 240)
-        Note over Rider, RiderDB: Go on shift
+        Note over Rider, RiderGeo: Go on shift
         Rider->>Gateway: PATCH /riders/me/location
         Gateway->>RiderSvc: forward
-        RiderSvc->>RiderDB: update current_latitude / current_longitude
+        RiderSvc->>RiderDB: confirm the rider exists (404 check only)
+        RiderSvc->>RiderGeo: GEOADD riders:geo (D49 -- no longer a Postgres column)
+        break Redis unreachable
+            RiderGeo-->>RiderSvc: connection error
+            RiderSvc-->>Rider: 503 Service Unavailable
+            Note right of RiderSvc: no Postgres fallback left for location -- fails loud, not soft
+        end
         RiderSvc-->>Rider: 200 OK
         Rider->>Gateway: PATCH /riders/me/availability
         Gateway->>RiderSvc: forward
