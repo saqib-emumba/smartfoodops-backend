@@ -21,11 +21,15 @@ from common.repository import Repository
 from order.repositories.sql import (
     COUNT_ON_RAIL_FOR_ORDER,
     DECIDE_KITCHEN,
+    INSERT_LINE_ITEM,
+    INSERT_LINE_ITEM_OPTION,
     INSERT_ORDER,
     RECORD_RIDER_REPORT,
     SELECT_BY_ID,
     SELECT_BY_KEY,
     SELECT_KITCHEN_QUEUE,
+    SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
+    SELECT_LINE_ITEMS_FOR_ORDERS,
     TRANSITION_ORDER,
     append_log,
 )
@@ -57,10 +61,63 @@ class OrderRepository(Repository):
         self._service_name = service_name
 
     def find(self, order_id: UUID) -> dict | None:
-        return self.one(SELECT_BY_ID, (str(order_id),))
+        order = self.one(SELECT_BY_ID, (str(order_id),))
+        if order is not None:
+            self._attach_items([order])
+        return order
 
     def find_by_idempotency_key(self, key: str) -> dict | None:
-        return self.one(SELECT_BY_KEY, (key,))
+        order = self.one(SELECT_BY_KEY, (key,))
+        if order is not None:
+            self._attach_items([order])
+        return order
+
+    def _attach_items(self, orders: list[dict]) -> None:
+        """Merge each order's line items (with their chosen options) onto it, in place.
+
+        `items` stopped being a column in D50 — split into order_line_items and
+        order_line_item_options so a price or a selection can be constrained and queried
+        by the engine instead of trusted to Pydantic alone. Batched over every order in
+        `orders` rather than called once per order, so kitchen_queue's N orders cost two
+        queries total, not 2N.
+        """
+        if not orders:
+            return
+        order_ids = [str(order["id"]) for order in orders]
+        line_item_rows = self.all(SELECT_LINE_ITEMS_FOR_ORDERS, {"order_ids": order_ids})
+        line_item_ids = [str(row["id"]) for row in line_item_rows]
+        option_rows = (
+            self.all(SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS, {"line_item_ids": line_item_ids})
+            if line_item_ids
+            else []
+        )
+
+        options_by_line_item: dict[str, list[dict]] = {}
+        for option in option_rows:
+            options_by_line_item.setdefault(str(option["line_item_id"]), []).append(
+                {
+                    "group_id": option["group_key"],
+                    "name": option["name"],
+                    "extra_price": float(option["extra_price"]),
+                }
+            )
+
+        items_by_order: dict[str, list[dict]] = {}
+        for row in line_item_rows:
+            items_by_order.setdefault(str(row["order_id"]), []).append(
+                {
+                    "item_id": row["menu_item_id"],
+                    "name": row["item_name"],
+                    "quantity": row["quantity"],
+                    "customizations": row["customizations"],
+                    "unit_price": float(row["unit_price"]),
+                    "line_total": float(row["line_total"]),
+                    "selected_options": options_by_line_item.get(str(row["id"]), []),
+                }
+            )
+
+        for order in orders:
+            order["items"] = items_by_order.get(str(order["id"]), [])
 
     def create(
         self,
@@ -89,7 +146,6 @@ class OrderRepository(Repository):
                     (
                         str(customer_id),
                         str(payload.restaurant_id),
-                        Json(items_snapshot),
                         total,
                         idempotency_key,
                     ),
@@ -101,6 +157,39 @@ class OrderRepository(Repository):
                     "An order with this idempotency key is already being processed"
                 ) from exc
             order = cur.fetchone()
+
+            # Same transaction as the order itself: an order without its line items cannot
+            # exist, the same guarantee D24/D39 already give the trail row and the outbox
+            # row below. Already have `items_snapshot` in hand, so the row handed back to
+            # the caller is built from it directly rather than re-read from what was just
+            # written.
+            for line_no, item in enumerate(items_snapshot):
+                cur.execute(
+                    INSERT_LINE_ITEM,
+                    {
+                        "order_id": order["id"],
+                        "line_no": line_no,
+                        "menu_item_id": item["item_id"],
+                        "item_name": item.get("name"),
+                        "quantity": item["quantity"],
+                        "unit_price": item["unit_price"],
+                        "line_total": item["line_total"],
+                        "customizations": Json(item.get("customizations")),
+                    },
+                )
+                line_item_id = cur.fetchone()["id"]
+                for option_position, option in enumerate(item.get("selected_options", [])):
+                    cur.execute(
+                        INSERT_LINE_ITEM_OPTION,
+                        {
+                            "line_item_id": line_item_id,
+                            "group_key": option.get("group_id"),
+                            "name": option["name"],
+                            "extra_price": option.get("extra_price", 0.0),
+                            "position": option_position,
+                        },
+                    )
+            order["items"] = items_snapshot
 
             append_log(
                 cur,
@@ -255,7 +344,9 @@ class OrderRepository(Repository):
 
     def kitchen_queue(self, restaurant_id: UUID) -> list[dict]:
         """Orders awaiting this kitchen's decision, oldest first."""
-        return self.all(SELECT_KITCHEN_QUEUE, (str(restaurant_id),))
+        orders = self.all(SELECT_KITCHEN_QUEUE, (str(restaurant_id),))
+        self._attach_items(orders)
+        return orders
 
     def decide_kitchen(self, order_id: UUID, decision: str) -> tuple[dict | None, bool]:
         """Record the kitchen's accept or reject.

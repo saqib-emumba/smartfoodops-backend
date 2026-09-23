@@ -13,7 +13,9 @@ class OrderItemSelection(BaseModel):
 
 
 class OrderItemSnapshot(OrderItemSelection):
-    """Server-side priced line item persisted into the orders.items JSONB column."""
+    """Server-side priced line item, persisted into order_line_items/order_line_item_options
+    (normalized out of a single orders.items JSONB column in D50) and reassembled into this
+    shape on read, so the API contract stays the same as it was on the JSONB column."""
 
     name: Optional[str] = None
     unit_price: Optional[float] = None

@@ -20,6 +20,14 @@ erDiagram
     %% ---- same-database, real foreign key ----
     ORDERS ||--o{ ORDER_TRACKING_LOGS : "traces (real FK, ON DELETE CASCADE)"
 
+    %% ---- Week 3: normalized out of a single JSONB column each in D50 ----
+    MENUS ||--o{ MENU_CATEGORIES : "has (real FK, ON DELETE CASCADE)"
+    MENU_CATEGORIES ||--o{ MENU_ITEMS : "has (real FK, ON DELETE CASCADE)"
+    MENU_ITEMS ||--o{ MENU_ITEM_CUSTOMIZATION_GROUPS : "has (real FK, ON DELETE CASCADE)"
+    MENU_ITEM_CUSTOMIZATION_GROUPS ||--o{ MENU_ITEM_CUSTOMIZATION_OPTIONS : "has (real FK, ON DELETE CASCADE)"
+    ORDERS ||--o{ ORDER_LINE_ITEMS : "has (real FK, ON DELETE CASCADE)"
+    ORDER_LINE_ITEMS ||--o{ ORDER_LINE_ITEM_OPTIONS : "has (real FK, ON DELETE CASCADE)"
+
     %% ---- Week 3: transactional outbox (same-db writes, no FK) ----
     ORDERS ||--o{ ORDER_OUTBOX : "emits (same-db, order_outbox.aggregate_id)"
     ORDERS ||--o{ PAYMENT_OUTBOX : "emits payment events (cross-db aggregate_id = order_id, by design)"
@@ -82,9 +90,54 @@ erDiagram
     MENUS {
         uuid id PK
         uuid restaurant_id "Unique -- References RESTAURANTS.id, cross-db, no engine FK"
-        jsonb categories "Whole category/item/customization tree, one row per restaurant"
         timestamp created_at
         timestamp updated_at
+    }
+    %% categories moved out of this table in D50 -- normalized into the four entities below.
+
+    MENU_CATEGORIES {
+        uuid id PK
+        uuid menu_id FK "References MENUS.id, ON DELETE CASCADE"
+        varchar category_key "Client-supplied category_id, kept as a stable business key"
+        varchar name
+        int display_order "The client's own field; not necessarily unique or gapless"
+        smallint position "Round-trips submission order, independent of display_order"
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    MENU_ITEMS {
+        uuid id PK
+        uuid category_id FK "References MENU_CATEGORIES.id, ON DELETE CASCADE"
+        varchar item_key "Client-supplied item_id"
+        varchar name
+        text description
+        decimal base_price "CHECK (base_price > 0)"
+        boolean is_available
+        text_array dietary_flags "Flat tag list, not a nested entity -- an array column"
+        smallint position
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    MENU_ITEM_CUSTOMIZATION_GROUPS {
+        uuid id PK
+        uuid item_id FK "References MENU_ITEMS.id, ON DELETE CASCADE"
+        varchar group_key "Client-supplied group_id"
+        varchar name
+        int min_selection
+        int max_selection
+        smallint position
+        timestamp created_at
+    }
+
+    MENU_ITEM_CUSTOMIZATION_OPTIONS {
+        uuid id PK
+        uuid group_id FK "References MENU_ITEM_CUSTOMIZATION_GROUPS.id, ON DELETE CASCADE"
+        varchar name
+        decimal extra_price "CHECK (extra_price >= 0)"
+        smallint position
+        timestamp created_at
     }
 
     ORDERS {
@@ -92,7 +145,6 @@ erDiagram
         uuid customer_id "References USERS.id -- cross-db, no engine FK"
         uuid restaurant_id "References RESTAURANTS.id -- cross-db, no engine FK"
         uuid rider_id "Nullable; References RIDERS.id -- cross-db, no engine FK"
-        jsonb items "Historical item & pricing snapshot at checkout"
         decimal total_amount
         order_status status "created/confirmed/assigned/picked_up/delivered/cancelled"
         kitchen_decision kitchen_decision "Nullable enum: accepted/rejected (D32)"
@@ -102,6 +154,29 @@ erDiagram
         varchar idempotency_key "Unique, nullable -- prevents duplicate order creation"
         timestamp created_at
         timestamp updated_at
+    }
+    %% items moved out of this table in D50 -- normalized into the two entities below.
+
+    ORDER_LINE_ITEMS {
+        uuid id PK
+        uuid order_id FK "References ORDERS.id, ON DELETE CASCADE"
+        smallint line_no "Preserves the original submission order"
+        varchar menu_item_id "Cross-db ref into Menu Service, no engine FK -- never re-resolved"
+        varchar item_name "Nullable; snapshot at checkout, immune to later menu edits"
+        int quantity "CHECK (quantity > 0)"
+        decimal unit_price
+        decimal line_total
+        jsonb customizations "Nullable raw customer selection echo -- a passthrough"
+        timestamp created_at
+    }
+
+    ORDER_LINE_ITEM_OPTIONS {
+        uuid id PK
+        uuid line_item_id FK "References ORDER_LINE_ITEMS.id, ON DELETE CASCADE"
+        varchar group_key "Nullable -- the customization group this option was chosen from"
+        varchar name
+        decimal extra_price
+        smallint position
     }
 
     ORDER_TRACKING_LOGS {

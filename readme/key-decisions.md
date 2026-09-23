@@ -38,7 +38,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D19](#d19--secrets-live-only-in-a-gitignored-env) | Secrets live only in a gitignored `.env` | 2026-08-13 | Accepted |
 | [D20](#d20--init_bootstrapsh-regenerates-config-byte-for-byte) | `init_bootstrap.sh` regenerates config byte-for-byte | 2026-08-13 | Accepted |
 | [D21](#d21--blueprint-deviations-are-deliberate-and-recorded) | Blueprint deviations are deliberate and recorded | 2026-08-13 | Accepted |
-| [D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) | MongoDB dropped; menus are JSONB in Postgres | 2026-08-21 | Accepted |
+| [D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) | MongoDB dropped; menus are JSONB in Postgres | 2026-08-21 | Partly superseded by [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) |
 | [D23](#d23--menus-are-read-through-a-redis-cache-aside-layer) | Menus are read through a Redis cache-aside layer | 2026-08-21 | Accepted |
 | [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) | The tracking trail moved into the order database | 2026-08-21 | Accepted |
 | [D25](#d25--temporal-orchestrates-the-order-lifecycle-and-the-workflow-id-is-the-order-id) | Temporal orchestrates; the workflow id is the order id | 2026-08-21 | Accepted |
@@ -65,6 +65,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D47](#d47--services-hold-their-own-temporal-client-and-name-workflows-by-string) | Services hold their own Temporal client and name workflows by string | 2026-09-09 | Accepted |
 | [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Accepted |
 | [D49](#d49--rider-live-location-moves-from-postgres-columns-to-a-redis-geo-index) | Rider live location moves from Postgres to a Redis GEO index | 2026-09-23 | Accepted |
+| [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) | Menu categories and order items move from JSONB to normalized relational tables | 2026-09-23 | Accepted |
 
 ---
 
@@ -429,6 +430,11 @@ the NoSQL box on the Week 1 stack diagram. Splitting them sent each to the servi
 the fact it records, and left nothing for Mongo to hold.
 
 ### D22 — MongoDB was dropped; menus are JSONB in Postgres
+
+> **Partly superseded by [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables)
+> on 2026-09-23.** "Not normalising is the other half of the decision" below is reversed —
+> the tree is now five relational tables. "MongoDB was dropped" is not: that half of this
+> entry, and the reasoning for it, still stands unchanged.
 
 **Decided:** the `menus` collection became a `menus` table in `sfo_menu_core`, one row per
 restaurant, with the whole category/item/customization tree in a single `JSONB` column. The
@@ -1582,6 +1588,58 @@ works — a minimal, targeted change rather than a rearchitecture of dispatch.
 - **The migration is not pure SQL** (cross-system) and needs
   `scripts/migrate_rider_locations_to_redis.sh` plus manual, epsilon-tolerant verification
   before `db/rider/drop_rider_location_columns.sql` is safe to run.
+
+### D50 — Menu categories and order items move from JSONB to normalized relational tables
+
+**Decided:** `menus.categories` becomes four tables — `menu_categories`, `menu_items`,
+`menu_item_customization_groups`, `menu_item_customization_options` — and `orders.items`
+becomes two — `order_line_items`, `order_line_item_options`. Both API contracts
+(`MenuResponse`, `OrderResponse`, `KitchenOrderResponse`) are unchanged: the nested shape a
+caller sees is reassembled from the relational rows on every read, in
+`MenuRepository._load_categories` and `OrderRepository._attach_items`. A `position` column
+at every level (independent of the client-supplied `display_order` field on categories)
+round-trips whatever order a tree was submitted in. Publishing a menu stays a full-tree
+replace — delete every category for that menu (cascading through items/groups/options) and
+reinsert — inside one transaction, same as the single `ON CONFLICT` upsert it replaced.
+Checkout stays one transaction too: the order row, its line items, and their chosen options
+all commit together, the same guarantee `items` as a single JSONB column already gave.
+
+**Instead of:** leaving both as JSONB, which is what
+[D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) already decided for the menu
+side, on grounds this entry does not dispute — see below.
+
+**Why:** reviewer-driven, not usage-driven. Two Explore passes over the codebase before this
+shipped confirmed neither column was ever partially updated or queried inside via SQL
+anywhere — every read and write was whole-document, exactly what D22 predicted. What
+normalizing buys instead: database-enforced integrity (an item can't reference a
+nonexistent category, `base_price`/`extra_price` can't go negative — previously only
+Pydantic checked this) and future per-item queryability — sales-by-item, catalogue search —
+without parsing JSON to get it. That is a real trade, not a correction of D22; D22's own
+reasoning ("a menu is read whole, written whole, by exactly one key") is still true today,
+and is the reason the read path costs more now than it argued for.
+
+**Cost:**
+
+- **A multi-statement transaction on every menu publish and every checkout**, in place of
+  one `ON CONFLICT` upsert or one `INSERT ... Json(items)`. Checkout inserts one row per
+  line item plus one per chosen option; a menu publish deletes and reinserts the whole tree.
+  Neither is a hot-write path, so this is paid rarely, not per-request.
+- **A join (or several grouped queries) to reconstruct the same nested response on every
+  read**, where one column read used to suffice. On the menu side this is largely absorbed
+  by the Redis cache-aside layer ([D23](#d23--menus-are-read-through-a-redis-cache-aside-layer)):
+  only a cache miss pays the reconstruction cost, which is the main reason this plan is
+  cheaper in practice than D22's cost estimate implied. The order side has no such cache and
+  pays it on every read, though an order's own line-item count is small.
+- **Any future change to either tree's shape now needs a schema migration**, where a
+  Pydantic model change alone used to do it. This is the most durable cost, and the
+  strongest argument D22 already made against doing this — it does not go away, it is
+  accepted.
+- **The migration is pure SQL, not cross-system** — unlike
+  [D49](#d49--rider-live-location-moves-from-postgres-columns-to-a-redis-geo-index), moving
+  Postgres JSONB into Postgres tables needs no bash orchestration, just
+  `db/menu/migrate_categories_to_relational.sql` and
+  `db/order/migrate_items_to_relational.sql`, each followed by a gated, manually-run
+  `drop_*_column.sql` once row counts are verified.
 
 ---
 

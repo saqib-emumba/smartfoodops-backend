@@ -1049,9 +1049,15 @@ section "Cross-service integration"
 # database, and `order_tracking_logs` went the other way, into the Order Service's — prove
 # each one landed where it was supposed to, in the database only its owner can reach.
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-menu-db$'; then
+  # Menus normalized out of a single JSONB column into relational tables in D50 — this
+  # grounds the same fact the old jsonb_array_length check did (the first category has 2
+  # items), now via the join publishing actually wrote.
   STORED_ITEMS=$(docker exec sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core -tA \
-    -c "SELECT jsonb_array_length(categories -> 0 -> 'items') FROM menus WHERE restaurant_id = '$REST_ID';" 2>/dev/null | tr -d '\r')
-  assert "  menu stored in sfo_menu_core as a JSONB tree" "$STORED_ITEMS" "2"
+    -c "SELECT count(*) FROM menu_items mi
+          JOIN menu_categories mc ON mi.category_id = mc.id
+          JOIN menus m ON mc.menu_id = m.id
+         WHERE m.restaurant_id = '$REST_ID' AND mc.position = 0;" 2>/dev/null | tr -d '\r')
+  assert "  menu stored in sfo_menu_core as relational rows" "$STORED_ITEMS" "2"
 else
   printf '  %sSKIP%s  menu database check (docker/sfo-menu-db not reachable)\n' "$DIM" "$RESET"
 fi
@@ -1074,6 +1080,12 @@ if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/n
   TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
     -c "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id = '$ORDER_ID';" 2>/dev/null | tr -d '\r')
   assert "  tracking trail stored in sfo_order_core" "$TRAIL" "$EXPECTED_TRAIL"
+  # Items normalized out of a single JSONB column into order_line_items in D50 — cheap
+  # insurance that checkout's write path actually populated the new table, not just that
+  # the HTTP response looked right.
+  LINE_ITEM_COUNT=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \
+    -c "SELECT count(*) FROM order_line_items WHERE order_id = '$ORDER_ID';" 2>/dev/null | tr -d '\r')
+  assert "  order items stored in sfo_order_core as relational rows" "$LINE_ITEM_COUNT" "1"
   # The foreign key the MongoDB collection could not have. Rejected by the engine, not by
   # any check the application makes.
   ORPHAN=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA \

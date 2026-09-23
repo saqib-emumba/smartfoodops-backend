@@ -38,13 +38,12 @@ CREATE TYPE kitchen_decision AS ENUM ('accepted', 'rejected');
 -- `>`, so 'delivered' > 'picked_up' has to be true by declaration, not by convention.
 CREATE TYPE rider_report_stage AS ENUM ('picked_up', 'delivered');
 
--- 1. Orders Table (Primary Registry with JSONB Items and Idempotency Guard)
+-- 1. Orders Table (Primary Registry, Idempotency Guard; Line Items Live Beside It — D50)
 CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     customer_id UUID NOT NULL,   -- users.id       (User Service database)
     restaurant_id UUID NOT NULL, -- restaurants.id (Restaurant Service database)
     rider_id UUID,               -- riders.id      (User Service database)
-    items JSONB NOT NULL, -- Stores snapshot of ordered items, prices, and selected customization options at checkout
     total_amount DECIMAL(10, 2) NOT NULL,
     status order_status NOT NULL DEFAULT 'created',
     -- NULL means the kitchen has not answered yet. Together with status =
@@ -67,6 +66,40 @@ CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
 -- Order-history reads filter by customer, which no longer benefits from a foreign key.
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id);
+
+-- 1a. Order Line Items (Priced Snapshot Of What Was Ordered, Written Once At Checkout — D50)
+-- Normalized out of orders.items (previously a single JSONB column) for database-enforced
+-- integrity and per-item queryability. Write-once: nothing ever UPDATEs these rows after
+-- checkout, same guarantee the JSONB column offered. `menu_item_id` is a plain reference
+-- into the Menu Service's database (cross-db, no engine FK, same convention as
+-- restaurant_id above) and deliberately NOT resolved against the live menu item — this row
+-- must survive that item being edited or deleted later, which is the point of a snapshot.
+CREATE TABLE IF NOT EXISTS order_line_items (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    line_no SMALLINT NOT NULL, -- preserves the original submission order
+    menu_item_id VARCHAR(255) NOT NULL,
+    item_name VARCHAR(255), -- snapshot at checkout; immune to later menu edits
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10, 2) NOT NULL,
+    line_total DECIMAL(10, 2) NOT NULL,
+    customizations JSONB, -- raw customer selection echo; a passthrough, not an entity tree, so left as-is
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_line_items_order ON order_line_items(order_id);
+
+-- 1b. Order Line Item Options (The Priced, Resolved Customizations Chosen For A Line Item)
+CREATE TABLE IF NOT EXISTS order_line_item_options (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    line_item_id UUID NOT NULL REFERENCES order_line_items(id) ON DELETE CASCADE,
+    group_key VARCHAR(255), -- the customization group this option was chosen from
+    name VARCHAR(255) NOT NULL,
+    extra_price DECIMAL(10, 2) NOT NULL DEFAULT 0.0,
+    position SMALLINT NOT NULL DEFAULT 0 -- preserves the original selection order
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_line_item_options_line_item ON order_line_item_options(line_item_id);
 
 -- 2. Order Tracking Logs (Append-Only Audit Trail Of Status Transitions)
 -- One row per transition rather than an array on `orders`: appending to a JSONB column

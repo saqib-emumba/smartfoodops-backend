@@ -7,14 +7,17 @@ sibling's report — three call sites, one INSERT, one place that can drift.
 """
 
 _COLUMNS = (
-    "id, customer_id, restaurant_id, rider_id, items, total_amount, status, "
+    "id, customer_id, restaurant_id, rider_id, total_amount, status, "
     "kitchen_decision, rider_reported_stage, idempotency_key"
 )
 
 # What the kitchen is shown, and deliberately less than _COLUMNS. An admin deciding on an
 # order needs to know what to cook; they have no business seeing what the customer paid or
 # which idempotency key their client chose.
-_KITCHEN_COLUMNS = "id, restaurant_id, items, status, created_at"
+_KITCHEN_COLUMNS = "id, restaurant_id, status, created_at"
+
+# `items` is no longer a column on either row above (D50) — OrderRepository attaches it
+# separately, from order_line_items/order_line_item_options, after these queries run.
 
 # "On the rail" — confirmed, and the kitchen has not answered yet. This one predicate is
 # both the capacity count and the admin's queue, which is why the partial index in
@@ -26,9 +29,40 @@ SELECT_BY_ID = f"SELECT {_COLUMNS} FROM orders WHERE id = %s"
 SELECT_BY_KEY = f"SELECT {_COLUMNS} FROM orders WHERE idempotency_key = %s"
 
 INSERT_ORDER = f"""
-    INSERT INTO orders (customer_id, restaurant_id, items, total_amount, status, idempotency_key)
-    VALUES (%s, %s, %s, %s, 'created', %s)
+    INSERT INTO orders (customer_id, restaurant_id, total_amount, status, idempotency_key)
+    VALUES (%s, %s, %s, 'created', %s)
     RETURNING {_COLUMNS}
+"""
+
+# One row per submitted line item, written once at checkout and never updated again — the
+# same write-once guarantee the JSONB column it replaced (D50) offered.
+INSERT_LINE_ITEM = """
+    INSERT INTO order_line_items
+        (order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total, customizations)
+    VALUES (%(order_id)s, %(line_no)s, %(menu_item_id)s, %(item_name)s,
+            %(quantity)s, %(unit_price)s, %(line_total)s, %(customizations)s)
+    RETURNING id
+"""
+
+INSERT_LINE_ITEM_OPTION = """
+    INSERT INTO order_line_item_options (line_item_id, group_key, name, extra_price, position)
+    VALUES (%(line_item_id)s, %(group_key)s, %(name)s, %(extra_price)s, %(position)s)
+"""
+
+# Batched rather than one-row-at-a-time: kitchen_queue attaches items to many orders at
+# once, and a single find() is just the N=1 case of the same query.
+SELECT_LINE_ITEMS_FOR_ORDERS = """
+    SELECT id, order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total, customizations
+      FROM order_line_items
+     WHERE order_id = ANY(%(order_ids)s::uuid[])
+     ORDER BY order_id, line_no
+"""
+
+SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS = """
+    SELECT line_item_id, group_key, name, extra_price
+      FROM order_line_item_options
+     WHERE line_item_id = ANY(%(line_item_ids)s::uuid[])
+     ORDER BY line_item_id, position
 """
 
 # `old_status` is never accepted from a caller: it is read from the preceding entry so the
