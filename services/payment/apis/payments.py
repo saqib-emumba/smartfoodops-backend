@@ -52,7 +52,7 @@ def process_payment(
         idempotency_key=x_idempotency_key,
         amount=payload.amount,
         # Reads the order as the caller, which is what enforces ownership.
-        fetch_order=partial(deps.order_service.fetch_order, token=current_user.token),
+        fetch_order=partial(deps.order_service.fetch_order, current_user=current_user),
         verify_replay=True,
         payments=deps.payments,
         gateway=deps.gateway,
@@ -80,5 +80,5 @@ def get_payment(
     if row is None:
         raise not_found(f"Payment {payment_id} not found")
 
-    deps.order_service.fetch_order(row["order_id"], current_user.token)
+    deps.order_service.fetch_order(row["order_id"], current_user)
     return ok(PaymentResponse(**row), message="Payment found")

@@ -7,6 +7,10 @@ has an account — see
 available and located, [order_flow_sequence_diagram.md](order_flow_sequence_diagram.md)
 covers dispatch, pickup and delivery.
 
+The gateway verifies the bearer token once per request, via `auth_request` against the User
+Service (D51); `RiderSvc` then asserts the resulting identity back to the User Service
+instead of forwarding a bearer token (D52).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -20,8 +24,11 @@ sequenceDiagram
     rect rgb(235, 245, 255)
         Note over Rider, RiderDB: Join the fleet
         Rider->>Gateway: POST /riders
-        Gateway->>RiderSvc: forward
-        RiderSvc->>UserSvc: verify caller holds rider role
+        Gateway->>UserSvc: auth_request verify (D51)
+        UserSvc-->>Gateway: 200 + X-User-Id/X-User-Roles
+        Note right of Gateway: every Gateway forward below runs this same check first --<br/>omitted after this to avoid repetition
+        Gateway->>RiderSvc: forward [X-User-Id, X-User-Roles]
+        RiderSvc->>UserSvc: verify caller holds rider role [X-User-Id, X-User-Roles] (D52)
         break account missing, or demoted since the token was issued
             UserSvc-->>RiderSvc: not found / wrong role
             RiderSvc-->>Rider: 404 Not Found / 403 Forbidden
@@ -38,7 +45,7 @@ sequenceDiagram
     rect rgb(240, 240, 240)
         Note over Rider, RiderGeo: Go on shift
         Rider->>Gateway: PATCH /riders/me/location
-        Gateway->>RiderSvc: forward
+        Gateway->>RiderSvc: forward [X-User-Id, X-User-Roles]
         RiderSvc->>RiderDB: confirm the rider exists (404 check only)
         RiderSvc->>RiderGeo: GEOADD riders:geo (D49 -- no longer a Postgres column)
         break Redis unreachable
@@ -48,7 +55,7 @@ sequenceDiagram
         end
         RiderSvc-->>Rider: 200 OK
         Rider->>Gateway: PATCH /riders/me/availability
-        Gateway->>RiderSvc: forward
+        Gateway->>RiderSvc: forward [X-User-Id, X-User-Roles]
         RiderSvc->>RiderDB: set is_available = true
         break rider is currently carrying an order
             RiderDB-->>RiderSvc: no row updated -- mid-delivery

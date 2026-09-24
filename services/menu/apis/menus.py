@@ -39,7 +39,7 @@ async def upsert_menu(
     below is blocking and brief, which is the same trade the write path always made.
     """
     restaurant = await deps.restaurant_service.verify_active(
-        payload.restaurant_id, current_user.token
+        payload.restaurant_id, current_user
     )
     if str(restaurant.get("owner_id")) != str(current_user.user_id) and not current_user.is_admin:
         raise forbidden(f"You do not own restaurant {payload.restaurant_id}")

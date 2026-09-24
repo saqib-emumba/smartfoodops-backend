@@ -9,6 +9,12 @@ alongside — the one diagram for the order flow. Verified against
 [readme/order-saga-orchestration-guide.md](../order-saga-orchestration-guide.md) for the
 full reasoning behind each step.
 
+The gateway's `auth_request` verify round trip (D51) is drawn once below, at the only
+gateway-fronted call in this flow — every later `Gateway->>...: forward` in this platform
+runs the same check. `RiderSvc->>OrderSvc: record rider_reported_stage` stays on the
+internal key (D26), unaffected by D51/D52: a rider reporting a pickup or delivery is a fact
+about what it observed, not a call made *as* the customer.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -16,6 +22,7 @@ sequenceDiagram
     actor Owner
     actor Rider
     participant Gateway
+    participant UserSvc as User Service
     participant OrderSvc as Order Service
     participant PaymentSvc as Payment Service
     participant RiderSvc as Rider Service
@@ -29,7 +36,10 @@ sequenceDiagram
     rect rgb(235, 245, 255)
         Note over Customer, Kafka: Order placed
         Customer->>Gateway: POST /orders [X-Idempotency-Key]
-        Gateway->>OrderSvc: forward
+        Gateway->>UserSvc: auth_request verify (D51)
+        UserSvc-->>Gateway: 200 + X-User-Id/X-User-Roles
+        Note right of Gateway: every Gateway forward elsewhere in this platform runs<br/>this same check first -- omitted after this diagram for readability
+        Gateway->>OrderSvc: forward [X-User-Id, X-User-Roles]
         break key already used
             OrderSvc-->>Customer: 200 OK, same order replayed
             Note right of OrderSvc: saga restarted too, if it never began the first time

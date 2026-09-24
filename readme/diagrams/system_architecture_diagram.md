@@ -1,11 +1,20 @@
 # SmartFoodOps — Complete System Architecture
 
-Every container in `docker-compose.yml` as of Week 3, with real host/container ports and
+Every container in `docker-compose.yml` as of Week 4, with real host/container ports and
 the actual dependency graph — not an idealized version. See
 [readme/key-decisions.md](../key-decisions.md) for the D-numbers behind the shape (D01
 database-per-service, D25 orchestration over choreography, D36 the orchestrator split,
 D38 Kafka carries facts / Temporal owns decisions, D39 the transactional outbox, D47
-services hold their own Temporal client).
+services hold their own Temporal client, D51 the gateway's `auth_request` chokepoint, D52
+internal calls asserting identity headers instead of forwarding the bearer token).
+
+Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
+Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
+`UserSvc`, rather than repeated on each application-service edge. A successful verify sets
+`X-User-Id`/`X-User-Roles`, which the gateway attaches to the forwarded request and which
+every `-->|verify ...|` edge between application services below now carries in place of a
+forwarded bearer token (D52) — login, register, refresh and every `/health` route are the
+exceptions, reachable with no token at all.
 
 Nodes are color-coded by subsystem (application services, the Temporal saga,
 Kafka/schema-registry eventing, the notification bridge, databases, observability) so a
@@ -63,10 +72,11 @@ flowchart TB
 
     %% -- request entry --
     Client --> Gateway
+    Gateway -.->|auth_request verify, D51| UserSvc
     Gateway --> UserSvc & RestaurantSvc & MenuSvc & OrderSvc & PaymentSvc & RiderSvc
     Gateway -->|health only| OrchestratorAPI
 
-    %% -- synchronous service-to-service calls --
+    %% -- synchronous service-to-service calls: identity headers, not a forwarded token (D52) --
     OrderSvc -->|verify customer| UserSvc
     OrderSvc -->|verify restaurant| RestaurantSvc
     OrderSvc -->|fetch menu| MenuSvc
@@ -92,7 +102,8 @@ flowchart TB
     AnalyticsSvc --> AnalyticsDB
     MenuSvc -.->|menu cache, db 0| Redis
     UserSvc -.->|refresh tokens, db 1| Redis
-    RiderSvc -.->|location GEO index, db 2 (D49)| Redis
+    %% D49: rider live location moved from a Postgres column to this Redis GEO index.
+    RiderSvc -.->|location GEO index, db 2| Redis
 
     %% -- eventing: outbox relay, consumers, schema registry --
     OrderSvc -->|outbox relay| Kafka

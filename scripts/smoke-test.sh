@@ -368,6 +368,21 @@ expect "malformed token -> 401" 401 GET "/api/v1/users/$OWNER_ID" "" \
 expect "token with a broken signature -> 401" 401 GET "/api/v1/users/$OWNER_ID" "" \
   -H "Authorization: Bearer ${OWNER_TOKEN}tampered"
 
+# D51: nginx now rejects these before the request ever reaches a backend service, via
+# auth_request against the User Service's internal verify endpoint. One check per gated
+# prefix is enough to prove the gateway chokepoint is wired up for that service — the
+# per-route RBAC behind it is asserted throughout the rest of this file, unchanged.
+NOBODY="00000000-0000-0000-0000-000000000000"
+expect "gateway: no token on /restaurants -> 401" 401 GET "/api/v1/restaurants/$NOBODY"
+expect "gateway: no token on /menus -> 401" 401 GET "/api/v1/menus/$NOBODY"
+expect "gateway: no token on /orders -> 401" 401 GET "/api/v1/orders/$NOBODY"
+expect "gateway: no token on /payments -> 401" 401 GET "/api/v1/payments/$NOBODY"
+expect "gateway: no token on /riders -> 401" 401 GET "/api/v1/riders/me"
+expect "gateway: login stays public" 200 POST /api/v1/users/login \
+  "{\"email\":\"$OWNER_EMAIL\",\"password\":\"$PASSWORD\"}"
+expect "gateway: register stays public" 422 POST /api/v1/users/register "{}"
+expect "gateway: /health stays public" 200 GET /health
+
 # ------------------------------------------------------------ happy path
 section "Happy path"
 

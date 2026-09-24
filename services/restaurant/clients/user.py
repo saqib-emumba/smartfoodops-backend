@@ -1,7 +1,7 @@
 """Owner identity and authorisation, verified against the User Service.
 
-The lookup runs as the owner, forwarding their bearer token, so this service can never
-read more than they could (D15).
+The lookup runs as the owner, asserting their identity via identity_headers, so this
+service can never read more than they could (D15).
 
 This service used to relay kitchen decisions into the order saga on the internal key. D32
 removed that: the decision is recorded by the Order Service, which owns both the column and
@@ -11,7 +11,7 @@ credential at all.
 
 from uuid import UUID
 
-from common.auth import assert_account_has_role, bearer
+from common.auth import CurrentUser, assert_account_has_role, identity_headers
 from common.config import DEFAULT_USER_SERVICE_URL
 from common.service_client import ServiceFacade
 
@@ -25,7 +25,7 @@ class UserServiceClient(ServiceFacade):
     env_var = "USER_SERVICE_URL"
     default_url = DEFAULT_USER_SERVICE_URL
 
-    def verify_owner(self, owner_id: UUID, token: str) -> dict:
+    def verify_owner(self, owner_id: UUID, current_user: CurrentUser) -> dict:
         """Confirm the owner exists and may onboard restaurants.
 
         Looks redundant now that the access token carries a role, and is not: that claim
@@ -37,7 +37,7 @@ class UserServiceClient(ServiceFacade):
             missing=f"Owner {owner_id} does not exist",
             unreachable_hint="cannot verify restaurant owner",
             bad_gateway_hint="verifying owner",
-            headers=bearer(token),
+            headers=identity_headers(current_user),
         )
         return assert_account_has_role(
             owner,

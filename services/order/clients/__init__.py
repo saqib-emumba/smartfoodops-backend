@@ -16,10 +16,11 @@ foreign-key violation these checks replace already returned: the request is well
 the order is not the thing that is missing — the entity it points at is.
 
 user.py, restaurant.py and menu.py all run as the customer who placed the order, by
-forwarding their bearer token, so this service can never read more than they could.
+asserting their own identity (identity_headers), so this service can never read more than
+they could.
 
-orchestrator.py is the exception, on the internal key rather than a forwarded bearer token
-— see its own docstring for why, and D26. It replaced payment.py and rider.py here: those
+orchestrator.py is the exception, on the internal key rather than an asserted identity — see
+its own docstring for why, and D26. It replaced payment.py and rider.py here: those
 two clients, and the whole Temporal client this service used to hold directly, moved to
 `services/orchestrator/` when D36 split the saga's worker into its own deployable that
 shares neither this service's image nor its database. What is left in this package is every

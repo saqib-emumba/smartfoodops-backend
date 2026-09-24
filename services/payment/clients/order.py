@@ -12,7 +12,7 @@ missing — the entity it points at is.
 
 from uuid import UUID
 
-from common.auth import bearer, internal_headers
+from common.auth import CurrentUser, identity_headers, internal_headers
 from common.config import DEFAULT_ORDER_SERVICE_URL
 from common.errors import unprocessable
 from common.service_client import ServiceFacade
@@ -23,15 +23,15 @@ class OrderServiceClient(ServiceFacade):
     env_var = "ORDER_SERVICE_URL"
     default_url = DEFAULT_ORDER_SERVICE_URL
 
-    def fetch_order(self, order_id: UUID, token: str) -> dict:
+    def fetch_order(self, order_id: UUID, current_user: CurrentUser) -> dict:
         """Confirm the order exists and return it — the check `order_id` lost with its FK.
 
         The response carries the server-recalculated `total_amount`, which is what the
         requested payment amount is then checked against (see amounts.py).
 
         Doubles as the ownership check for a payment. The Order Service only serves an
-        order to the customer who placed it, so forwarding the caller's token means paying
-        for someone else's order is refused there and reaches us as a 403.
+        order to the customer who placed it, so asserting the caller's own identity means
+        paying for someone else's order is refused there and reaches us as a 403.
         """
         return self._client.get(
             f"/api/v1/orders/{order_id}",
@@ -39,7 +39,7 @@ class OrderServiceClient(ServiceFacade):
             missing_error=unprocessable,
             unreachable_hint="cannot verify the order",
             bad_gateway_hint="verifying the order",
-            headers=bearer(token),
+            headers=identity_headers(current_user),
         )
 
     def fetch_order_internally(self, order_id: UUID) -> dict:

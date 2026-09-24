@@ -50,13 +50,13 @@ async def create_order(
         await deps.orchestrator_service.start_saga(
             existing,
             deps.restaurant_service.verify_restaurant(
-                existing["restaurant_id"], current_user.token
+                existing["restaurant_id"], current_user
             ),
         )
         return ok(OrderResponse(**existing), message="This order has already been placed", status=200)
 
     # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
-    menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user.token)
+    menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user)
     items_snapshot, total = build_order_snapshot(menu, payload)
 
     # (d) Both participants live in other services' databases, so the foreign keys that
@@ -64,13 +64,13 @@ async def create_order(
     # them sit here, immediately before the write, for the same reason. The customer check
     # also outlives the token's role claim: a demoted account fails here even while holding
     # a token minted before the change.
-    deps.user_service.verify_customer(current_user.user_id, current_user.token)
+    deps.user_service.verify_customer(current_user.user_id, current_user)
     # The response is kept, not discarded: `capacity`, `latitude` and `longitude` are on it,
     # and handing them to the saga in its payload is what removed the saga's four HTTP calls
     # to the Restaurant Service (D32). Captured here, at checkout, from a lookup that was
     # already happening.
     restaurant = deps.restaurant_service.verify_restaurant(
-        payload.restaurant_id, current_user.token
+        payload.restaurant_id, current_user
     )
 
     # (e) The order and the opening 'created' entry of its audit trail commit together —
@@ -98,7 +98,7 @@ def get_order(
     payment has to match, so the authoritative amount stays owned by this service.
 
     Readable by the customer who placed it, or an admin. The Payment Service reaches it
-    while forwarding that customer's token, so paying for an order requires being the
+    while asserting that customer's own identity, so paying for an order requires being the
     person who ordered it.
     """
     row = deps.orders.find(order_id)

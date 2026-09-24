@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from common.auth import CurrentUser, bearer, require_self_or_admin
+from common.auth import CurrentUser, identity_headers, require_self_or_admin
 from common.config import DEFAULT_RESTAURANT_SERVICE_URL
 from common.errors import unprocessable
 from common.service_client import ServiceFacade
@@ -25,15 +25,15 @@ class RestaurantServiceClient(ServiceFacade):
         this used to compare `owner_id` directly and never admitted an admin, the one place
         the bypass did not hold.
 
-        Forwards the caller's own bearer token rather than the internal key: the caller *is*
-        a user, so the call should be able to do no more than they could (D15).
+        Asserts the caller's own identity rather than the internal key: the caller *is* a
+        user, so the call should be able to do no more than they could (D15).
         """
         restaurant = self._client.get(
             f"/api/v1/restaurants/{restaurant_id}",
             missing=f"Restaurant {restaurant_id} no longer exists",
             unreachable_hint="cannot verify who owns this restaurant",
             bad_gateway_hint="verifying restaurant ownership",
-            headers=bearer(current_user.token),
+            headers=identity_headers(current_user),
         )
         require_self_or_admin(
             current_user,
@@ -42,7 +42,7 @@ class RestaurantServiceClient(ServiceFacade):
         )
         return restaurant
 
-    def verify_restaurant(self, restaurant_id: UUID, token: str) -> dict:
+    def verify_restaurant(self, restaurant_id: UUID, current_user: CurrentUser) -> dict:
         """Confirm the restaurant exists — the check the `restaurant_id` foreign key made.
 
         Existence only: whether a restaurant may currently take orders is the Menu
@@ -55,5 +55,5 @@ class RestaurantServiceClient(ServiceFacade):
             missing_error=unprocessable,
             unreachable_hint="cannot verify the restaurant",
             bad_gateway_hint="verifying the restaurant",
-            headers=bearer(token),
+            headers=identity_headers(current_user),
         )

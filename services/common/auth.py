@@ -9,11 +9,21 @@ Keys travel base64-encoded in single environment variables because a PEM is mult
 `.env` is not, and they are secrets, so they arrive via `required()` and the service refuses
 to start without them.
 
+D51/D52 moved *where* a token's signature gets checked. `verify_access_token` below is the
+only function anywhere that still decodes a JWT — it backs the API gateway's `auth_request`
+subrequest (services/user/apis/internal.py) and nothing else. Every other route, in every
+service including this one, trusts `X-User-Id`/`X-User-Roles` instead: nginx sets them after
+a successful gateway-level verify, and a service calling a sibling directly (off the
+gateway's path) sets them itself via `identity_headers()`. See D51 and D52 in
+readme/key-decisions.md for the trade-off this accepts — a caller's identity is no longer
+backed by a signature once it is past the gateway, only by which container it came from.
+
 Services also talk to each other. Two mechanisms, deliberately distinct:
 
-    end-user calls    -> the caller's own bearer token, forwarded downstream unchanged, so
-                         a service can never do more than the user who invoked it
-    internal-only     -> X-Internal-Key, for endpoints no end user should reach directly
+    end-user calls    -> the caller's own verified identity, asserted via X-User-Id/
+                         X-User-Roles (see identity_headers), so a service can never claim
+                         to act as anyone other than whoever called it
+    internal-only      -> X-Internal-Key, for endpoints no end user should reach directly
                          (see require_internal)
 """
 
@@ -46,7 +56,10 @@ def _decode_key(encoded: str) -> str:
         ) from exc
 
 
-# Every service verifies, so the public key is mandatory everywhere and fails fast.
+# Every service still loads this, even though only verify_access_token (called solely from
+# the gateway's verify endpoint, in the User Service) uses it post-D52 — keeping the same
+# distribution avoids a docker-compose change for a constant that costs nothing to hold
+# unused elsewhere.
 PUBLIC_KEY = _decode_key(required("JWT_PUBLIC_KEY_B64"))
 
 # Shared by the services that call internal-only endpoints and the ones that expose them.
@@ -64,13 +77,10 @@ def _signing_key() -> str:
 
 
 class CurrentUser(BaseModel):
-    """The verified identity behind a request."""
+    """The identity behind a request, trusted rather than re-verified past the gateway."""
 
     user_id: UUID
     roles: list[str]
-    # The raw bearer, kept so route handlers can forward it to downstream services. See
-    # the module docstring: downstream calls run as the original caller, never as more.
-    token: str
 
     @property
     def is_admin(self) -> bool:
@@ -104,10 +114,16 @@ def issue_access_token(user_id: UUID, roles: list[str]) -> str:
 _scheme = HTTPBearer(auto_error=False)
 
 
-def get_current_user(
+def verify_access_token(
     credentials: HTTPAuthorizationCredentials | None = Depends(_scheme),
 ) -> CurrentUser:
-    """Verify the bearer token and return who is calling. 401 on anything unusable."""
+    """Cryptographically verify a bearer token. 401 on anything unusable.
+
+    The only function left anywhere that checks a JWT signature (D51/D52). Called solely by
+    the gateway's own verify endpoint (services/user/apis/internal.py), reached through
+    nginx's `auth_request` before any other route runs. Every other route in every service,
+    including this one's own public routes, depends on `get_current_user` below instead.
+    """
     if credentials is None:
         raise unauthorized("Authorization header with a Bearer token is required")
 
@@ -127,7 +143,31 @@ def get_current_user(
         # logged nowhere and never returned: it would tell an attacker which part to fix.
         raise unauthorized("Access token is invalid") from exc
 
-    return CurrentUser(user_id=UUID(claims["sub"]), roles=claims["roles"], token=token)
+    return CurrentUser(user_id=UUID(claims["sub"]), roles=claims["roles"])
+
+
+def get_current_user(
+    x_user_id: str | None = Header(None, alias="X-User-Id"),
+    x_user_roles: str | None = Header(None, alias="X-User-Roles"),
+) -> CurrentUser:
+    """The identity behind a request, trusted rather than re-verified (D51/D52).
+
+    A gateway-fronted request has these headers set by nginx, after `auth_request` calls
+    `verify_access_token` and the token checks out. An internal, service-to-service request
+    has them set by the caller via `identity_headers()`, re-asserting the identity it already
+    had verified for its own inbound request. Either way, this dependency does not itself
+    check a signature — something upstream of it already did, or should have.
+    """
+    if not x_user_id or not x_user_roles:
+        raise unauthorized(
+            "Missing verified identity — this route must be reached through the gateway"
+        )
+    try:
+        user_id = UUID(x_user_id)
+    except ValueError as exc:
+        raise unauthorized("Invalid identity header") from exc
+
+    return CurrentUser(user_id=user_id, roles=[r for r in x_user_roles.split(",") if r])
 
 
 def require_role(*allowed: str):
@@ -190,9 +230,10 @@ def assert_account_has_role(account: dict, *, required: str, detail: str) -> dic
 def require_internal(x_internal_key: str | None = Header(None, alias="X-Internal-Key")):
     """Admit only sibling services, never an end user.
 
-    For endpoints that exist purely as a service-to-service contract. Bearer forwarding
-    cannot express this: a forwarded token belongs to the customer who started the request,
-    so it would let that customer call the endpoint directly and forge its writes.
+    For endpoints that exist purely as a service-to-service contract. A caller's own
+    identity headers cannot express this: they belong to the customer who started the
+    request, so honouring them here would let that customer call the endpoint directly and
+    forge its writes.
     """
     if x_internal_key is None or not secrets.compare_digest(
         x_internal_key, INTERNAL_API_KEY
@@ -200,9 +241,19 @@ def require_internal(x_internal_key: str | None = Header(None, alias="X-Internal
         raise unauthorized("This endpoint is internal to SmartFoodOps services")
 
 
-def bearer(token: str) -> dict:
-    """Authorization header forwarding the caller's identity to a sibling service."""
-    return {"Authorization": f"Bearer {token}"}
+def identity_headers(current_user: CurrentUser) -> dict:
+    """Header pair asserting the caller's identity to a sibling service (D15, D51/D52).
+
+    Replaces forwarding the raw bearer token: an internal call never passes through the
+    gateway's `auth_request` check, so the calling service re-asserts the identity it already
+    had verified for its own inbound request — the same thing nginx does for gateway-fronted
+    calls. A service can still never act as anyone other than whoever called it; it can only
+    ever assert the identity it was itself given, never invent one.
+    """
+    return {
+        "X-User-Id": str(current_user.user_id),
+        "X-User-Roles": ",".join(current_user.roles),
+    }
 
 
 def internal_headers() -> dict:

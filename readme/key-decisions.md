@@ -28,10 +28,10 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D09](#d09--audit-logging-is-best-effort-and-goes-through-the-menu-service) | Audit logging is best-effort, through the Menu Service | 2026-08-13 | Superseded by [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) |
 | [D10](#d10--the-card-gateway-is-a-seam-not-a-scattered-stub) | The card gateway is a seam, not a scattered stub | 2026-08-13 | Accepted |
 | [D11](#d11--authentication-is-rs256-with-the-user-service-as-sole-issuer) | RS256, User Service as sole issuer | 2026-08-18 | Accepted |
-| [D12](#d12--tokens-are-verified-in-process-not-at-the-gateway) | Tokens are verified in-process, not at nginx | 2026-08-18 | Accepted |
+| [D12](#d12--tokens-are-verified-in-process-not-at-the-gateway) | Tokens are verified in-process, not at nginx | 2026-08-18 | Partly superseded by [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) |
 | [D13](#d13--identity-comes-from-the-token-never-from-the-request-body) | Identity comes from the token, never the body | 2026-08-18 | Accepted |
 | [D14](#d14--sessions-are-rotating-refresh-tokens-in-redis) | Sessions are rotating refresh tokens in Redis | 2026-08-18 | Accepted |
-| [D15](#d15--two-kinds-of-service-to-service-credential) | Two kinds of service-to-service credential | 2026-08-18 | Accepted |
+| [D15](#d15--two-kinds-of-service-to-service-credential) | Two kinds of service-to-service credential | 2026-08-18 | Partly superseded by [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) |
 | [D16](#d16--each-authorisation-decision-lives-in-exactly-one-place) | Each authorisation decision lives in exactly one place | 2026-08-18 | Accepted |
 | [D17](#d17--an-unknown-user-id-is-403-not-404) | An unknown user id is `403`, not `404` | 2026-08-18 | Accepted |
 | [D18](#d18--role-claims-are-re-checked-over-http-despite-being-in-the-token) | Role claims are re-checked over HTTP | 2026-08-18 | Accepted |
@@ -66,6 +66,8 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Accepted |
 | [D49](#d49--rider-live-location-moves-from-postgres-columns-to-a-redis-geo-index) | Rider live location moves from Postgres to a Redis GEO index | 2026-09-23 | Accepted |
 | [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) | Menu categories and order items move from JSONB to normalized relational tables | 2026-09-23 | Accepted |
+| [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) | nginx gains a fail-closed `auth_request` chokepoint | 2026-09-24 | Accepted |
+| [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) | Internal calls assert identity headers instead of forwarding the bearer token | 2026-09-24 | Accepted |
 
 ---
 
@@ -256,6 +258,15 @@ the keypair invalidates every live token at once (see Open questions).
 
 ### D12 — Tokens are verified in-process, not at the gateway
 
+> **Superseded by [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) and [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token)
+> on 2026-09-24.** "nginx stays a pure router" is reversed by D51 — it now calls a verify
+> endpoint via `auth_request` before proxying. "A FastAPI dependency verifies the token
+> inside each service" is reversed by D52 — `get_current_user()` no longer decodes a JWT at
+> all; only the gateway's own verify endpoint does. Kept for the reasoning, which motivated
+> both: the round-trip and availability cost named below is exactly what D51 and D52 now
+> accept deliberately, having weighed it against the fail-closed chokepoint gained and the
+> duplication removed.
+
 **Decided:** a FastAPI dependency in `common/auth.py` verifies the token inside each
 service. nginx stays a pure router.
 
@@ -302,6 +313,11 @@ sign every user out.
 why that lifetime is short. Redis becomes a hard dependency of the User Service.
 
 ### D15 — Two kinds of service-to-service credential
+
+> **Partly superseded by [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) on 2026-09-24.** "Forward that user's bearer token unchanged" below
+> is reversed — internal calls now assert `X-User-Id`/`X-User-Roles` instead. The rest of
+> this entry — that there are two kinds of credential, and why the audit trail needed the
+> internal-key kind instead of the user kind — is unchanged.
 
 **Decided:** calls made *on behalf of a user* forward that user's bearer token unchanged.
 Endpoints no end user may reach — currently only `POST /api/v1/orders/logs` — take a shared
@@ -359,6 +375,98 @@ apparent duplication is the difference between a claim and a current fact.
 **Costs:** an extra network call on paths that appear to have the answer already, and code
 that looks redundant to anyone who has not read this entry — hence the comments at the call
 sites pointing here.
+
+### D51 — nginx gains a fail-closed `auth_request` chokepoint in front of in-process verification
+
+**Decided:** `api-gateway/nginx.conf` now calls `auth_request` against
+`GET /api/v1/users/internal/verify` (`services/user/apis/internal.py`, `internal;`-only,
+unreachable from outside) before proxying any request under `/api/v1/users`,
+`/restaurants`, `/menus`, `/orders`, `/payments` or `/riders` other than login, register,
+refresh and each service's own `/health`. The verify endpoint is a thin wrapper around the
+existing `get_current_user()` dependency — no JWT logic was duplicated. A missing or invalid
+token now gets `401` from the gateway itself; user-service being unreachable gets a distinct
+`503` from `@gateway_auth_unavailable`, bounded by 2–3s `auth_request` timeouts so a hung
+user-service cannot stall the other five services' traffic indefinitely.
+
+**Instead of:** leaving nginx a pure router, which is what D12 decided, or verifying at the
+edge with njs (`ngx_http_js_module` + `crypto.subtle`) to avoid the network hop entirely. njs
+RS256 verification was prototyped and confirmed to work against the pinned-by-default
+`nginx:alpine` image, but was rejected: it depends on a narrow, recently-added njs capability
+most public references don't cover, the image tag is unpinned so the exact njs build is not
+guaranteed to survive a rebuild, and it introduces async control flow inside nginx's request
+lifecycle with no test coverage, linter or debugger — a new maintenance burden in the one
+layer of an otherwise all-Python stack that would have JavaScript in it.
+
+**Why:** D12 was right about the cost and wrong to treat it as decisive. Its stated
+alternative cost — "no chokepoint that fails closed... a new endpoint added without it is
+silently unprotected" — is a real gap the smoke test only detects after the fact. This closes
+it structurally: a route can still forget `Depends(get_current_user)`, but it can no longer be
+reached without a valid token at all, gateway or backend. The verify endpoint reuses
+`get_current_user()` unchanged rather than re-implementing verification, so this is additive —
+per-service RBAC (`require_role`, `require_self_or_admin`, all 36 call sites) is untouched and
+remains the authority on *what* a valid caller may do; the gateway only answers *is this
+caller valid at all*.
+
+**Costs:** exactly what D12 named, accepted deliberately rather than avoided:
+
+* **A network round-trip on every gated request.** To a container on the same Docker network,
+  not external — but real, and paid by routes that never touched user-service before.
+* **User-service is now a hard dependency for all gateway traffic**, not just login/refresh.
+  Mitigated, not eliminated: `get_current_user()` is a pure in-memory RSA check, so the verify
+  endpoint stays up even if user-service's own database or Redis is degraded — it only fails
+  if the user-service process itself is unreachable, and the tight timeouts turn that into a
+  fast, distinct `503` rather than a hang or a false `401`.
+* **A plain-nginx limitation, not a design choice:** `error_page 500` is scoped to the whole
+  `server` block, so it would also catch a bare `500` nginx generates for an unrelated reason
+  before ever reaching `proxy_pass`. In practice this only fires for the verify subrequest
+  itself, but it is a sharp edge worth knowing before extending this file further.
+* **`scripts/init_bootstrap.sh` must stay byte-for-byte in sync** (D20) — its nginx heredoc
+  was updated alongside `nginx.conf` in the same change; any future edit to one without the
+  other silently reverts on the next bootstrap.
+
+### D52 — Internal calls assert identity headers instead of forwarding the bearer token
+
+**Decided:** every service-to-service call made on behalf of a user (D15's forwarded-token
+case — 8 call sites across `order`, `restaurant`, `rider`, `payment` and `menu`) now sends
+`X-User-Id`/`X-User-Roles` (`common.auth.identity_headers`) instead of the caller's signed
+access token. `get_current_user()`, the dependency almost every route in every service uses,
+no longer decodes or verifies a JWT at all — it trusts those two headers, whether nginx set
+them (gateway-fronted requests, D51) or a sibling service set them when calling directly.
+The only function left anywhere that checks a signature is the new `verify_access_token()`,
+called exclusively by the gateway's own `auth_request` subrequest.
+
+**Instead of:** keeping D15's model, where a service receiving a forwarded token
+cryptographically confirmed the caller actually held a credential the User Service issued.
+
+**Why:** D51 already made nginx the one place a token's signature is checked for a
+gateway-fronted request. Re-checking the same signature again in each of the several
+services one client request might traverse was true duplication with nothing to weigh
+against it — D12 already established the check itself is cheap (in-memory, no I/O), so the
+only thing being removed is doing it repeatedly, not a network cost. This was requested
+directly: gateway does authentication, services keep authorisation (`require_role`,
+`require_self_or_admin` — all 36 call sites, untouched).
+
+**Costs — accepted deliberately, weighed and taken on purpose, not overlooked:**
+
+* **The cryptographic binding D13 and D15 relied on is gone everywhere except the gateway's
+  own check.** A forwarded bearer token proved the caller genuinely held a credential the
+  User Service issued; a plain header only proves *something* set it. Any container that can
+  reach a service's port — which today is every container on `smartfoodops-network`, since
+  nothing restricts which siblings may call which — can set `X-User-Id`/`X-User-Roles` to
+  anything, including `system_admin`, and be believed by any route past the gateway.
+* **A single compromised service can now impersonate any user to any other service it can
+  reach.** Before, it could only replay a token it had actually been handed for a specific,
+  already-verified caller. This is a strictly larger blast radius for the same
+  single-container-compromise scenario, and it is the direct trade this decision makes.
+* **The trust boundary moves from "whoever holds the private key" to "whoever can reach a
+  service's port directly."** Nothing in this compose network currently narrows that — no
+  per-service network policy, no mTLS between containers — so the boundary D51 already
+  accepted at the edge now extends to the whole internal service mesh, not just the gateway
+  hop.
+* **Not yet revisited:** per-service network policy or mTLS between containers would restore
+  most of what this gives up, without reintroducing per-hop JWT verification. Noted here
+  rather than in Open Questions because, unlike those, this one was raised and consciously
+  deferred in the same conversation that made this decision, not discovered afterward.
 
 ---
 

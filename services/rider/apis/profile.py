@@ -31,7 +31,7 @@ def register_rider(
     The rider is the token's subject. There is no way to enrol anybody else — `user_id` is
     not a field a client can send (D13).
     """
-    deps.user_service.verify_rider(current_user.user_id, current_user.token)
+    deps.user_service.verify_rider(current_user.user_id, current_user)
     row = deps.riders.register(payload, current_user.user_id)
     if payload.current_latitude is not None:
         deps.geo.set_location(

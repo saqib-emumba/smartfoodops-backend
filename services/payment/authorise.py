@@ -7,9 +7,9 @@ drift, so there is one here instead.
 
 Exactly two things differed between them, and both are parameters rather than branches:
 
-`fetch_order` — the customer path reads the order as the caller (forwarding their bearer
-token, which is also what enforces ownership); the saga path reads it on the internal key,
-because a workflow has no user behind it (D26).
+`fetch_order` — the customer path reads the order as the caller (asserting their own
+identity, which is also what enforces ownership); the saga path reads it on the internal
+key, because a workflow has no user behind it (D26).
 
 `verify_replay` — on a replay the customer path re-reads the order to confirm the caller
 owns it, since idempotency keys are client-chosen and therefore guessable. The saga path

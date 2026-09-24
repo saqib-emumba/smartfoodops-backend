@@ -148,7 +148,7 @@ class ServiceClient:
         `missing` is the detail shown to our caller when the downstream answers 404, and
         `missing_error` the status it becomes; `unreachable_hint` completes the sentence
         "<Service> is unreachable; ...". `headers` carries the caller's credentials —
-        see common.auth.bearer. `passthrough` — see `_payload`.
+        see common.auth.identity_headers. `passthrough` — see `_payload`.
         """
         url = self._url(path)
         try:

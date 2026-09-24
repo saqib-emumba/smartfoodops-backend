@@ -30,7 +30,7 @@ def onboard_restaurant(
     The owner is the token's subject, so a restaurant can only ever be onboarded under the
     account making the request.
     """
-    deps.user_service.verify_owner(current_user.user_id, current_user.token)
+    deps.user_service.verify_owner(current_user.user_id, current_user)
     row = deps.restaurants.onboard(payload, current_user.user_id)
     return ok(RestaurantResponse(**row), message="Restaurant onboarded", status=201)
 

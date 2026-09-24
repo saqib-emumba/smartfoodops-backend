@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from common.auth import assert_account_has_role, bearer
+from common.auth import CurrentUser, assert_account_has_role, identity_headers
 from common.config import DEFAULT_USER_SERVICE_URL
 from common.service_client import ServiceFacade
 
@@ -15,7 +15,7 @@ class UserServiceClient(ServiceFacade):
     env_var = "USER_SERVICE_URL"
     default_url = DEFAULT_USER_SERVICE_URL
 
-    def verify_rider(self, user_id: UUID, token: str) -> dict:
+    def verify_rider(self, user_id: UUID, current_user: CurrentUser) -> dict:
         """Confirm the account exists and may currently ride.
 
         Looks redundant now that the token carries a role, and is not: that claim was true
@@ -27,7 +27,7 @@ class UserServiceClient(ServiceFacade):
             missing=f"Account {user_id} does not exist",
             unreachable_hint="cannot verify the rider account",
             bad_gateway_hint="verifying the rider account",
-            headers=bearer(token),
+            headers=identity_headers(current_user),
         )
         return assert_account_has_role(
             account,
