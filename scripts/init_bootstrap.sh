@@ -1630,6 +1630,77 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         }
 
+        # --- Internal-key-only routes: no end user ever holds this credential (D15), so
+        # these carry no bearer token at all and would fail auth_request even legitimately.
+        # They bypass the gateway's bearer check here but remain guarded by their own
+        # X-Internal-Key dependency (require_internal) inside the service — this is not a
+        # public route, it is a different credential than the one auth_request checks.
+        # Regex locations take precedence over the plain-prefix gated locations below
+        # regardless of file order, which is what makes this bypass work. ---
+
+        location = /api/v1/orders/logs {
+            proxy_pass http://order-service:8004;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location ~ ^/api/v1/orders/[^/]+/internal$ {
+            proxy_pass http://order-service:8004;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location ~ ^/api/v1/orders/[^/]+/rider-report$ {
+            proxy_pass http://order-service:8004;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location ~ ^/api/v1/orders/[^/]+/transitions$ {
+            proxy_pass http://order-service:8004;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /api/v1/riders/dispatch {
+            proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /api/v1/riders/release {
+            proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /api/v1/payments/authorize {
+            proxy_pass http://payment-service:8005;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /api/v1/payments/refund {
+            proxy_pass http://payment-service:8005;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location ~ ^/api/v1/users/[^/]+/internal$ {
+            proxy_pass http://user-service:8001;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
         # 👤 Route User service requests — gated: every other /api/v1/users/* path requires
         # a valid bearer token, verified at the gateway via auth_request before the request
         # ever reaches the backend (D51).
