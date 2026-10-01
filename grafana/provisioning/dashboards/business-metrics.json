@@ -32,7 +32,8 @@
           "datasource": "Prometheus",
           "expr": "sfo_business_orders_placed_total",
           "refId": "A",
-          "instant": true
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
@@ -67,7 +68,8 @@
           "datasource": "Prometheus",
           "expr": "sfo_business_orders_delivered_total",
           "refId": "A",
-          "instant": true
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
@@ -102,7 +104,8 @@
           "datasource": "Prometheus",
           "expr": "sfo_business_orders_cancelled_total",
           "refId": "A",
-          "instant": true
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
@@ -137,19 +140,25 @@
           "datasource": "Prometheus",
           "expr": "sum(rate(sfo_business_orders_placed_total[5m]))",
           "refId": "A",
-          "legendFormat": "placed"
+          "legendFormat": "placed",
+          "range": true,
+          "instant": false
         },
         {
           "datasource": "Prometheus",
           "expr": "sum(rate(sfo_business_orders_delivered_total[5m]))",
           "refId": "B",
-          "legendFormat": "delivered"
+          "legendFormat": "delivered",
+          "range": true,
+          "instant": false
         },
         {
           "datasource": "Prometheus",
           "expr": "sum(rate(sfo_business_orders_cancelled_total[5m]))",
           "refId": "C",
-          "legendFormat": "cancelled"
+          "legendFormat": "cancelled",
+          "range": true,
+          "instant": false
         }
       ],
       "fieldConfig": {
@@ -180,7 +189,9 @@
           "datasource": "Prometheus",
           "expr": "100 * sfo_business_orders_cancelled_total / sfo_business_orders_placed_total",
           "refId": "A",
-          "legendFormat": "cancelled / placed"
+          "legendFormat": "cancelled / placed",
+          "range": true,
+          "instant": false
         }
       ],
       "fieldConfig": {
