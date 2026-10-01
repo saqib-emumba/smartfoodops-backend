@@ -1,12 +1,15 @@
 # SmartFoodOps — Complete System Architecture
 
-Every container in `docker-compose.yml` as of Week 4, with real host/container ports and
-the actual dependency graph — not an idealized version. See
+Every container in `docker-compose.yml`, with real host/container ports and the actual
+dependency graph — not an idealized version. See
 [readme/key-decisions.md](../key-decisions.md) for the D-numbers behind the shape (D01
-database-per-service, D25 orchestration over choreography, D36 the orchestrator split,
-D38 Kafka carries facts / Temporal owns decisions, D39 the transactional outbox, D47
-services hold their own Temporal client, D51 the gateway's `auth_request` chokepoint, D52
-internal calls asserting identity headers instead of forwarding the bearer token).
+database-per-service, D25/D54 orchestration over choreography — order creation itself now
+happens inside the saga via a Temporal Update, D36 the orchestrator split, D38 Kafka
+carries facts / Temporal owns decisions, D47 services hold their own Temporal client, D51
+the gateway's `auth_request` chokepoint, D52 internal calls asserting identity headers
+instead of forwarding the bearer token, D53 the transactional outbox tables are removed in
+favour of a Temporal-activity publish, D55 payment/rider/compensation become child
+workflows of `OrderWorkflow`).
 
 Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
 Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
@@ -39,7 +42,7 @@ flowchart TB
 
     subgraph Saga ["Orchestration (Temporal)"]
         TemporalServer["Temporal Server (dev, embedded SQLite)<br/>7233 / 8233 / 9233"]
-        OrchestratorWorker["Orchestrator Worker<br/>metrics 9108"]
+        OrchestratorWorker["Orchestrator Worker<br/>OrderWorkflow + child workflows<br/>(PaymentWorkflow, RiderWorkflow,<br/>CompensationWorkflow -- D55)<br/>metrics 9108"]
     end
 
     subgraph Eventing ["Eventing"]
@@ -84,12 +87,13 @@ flowchart TB
     RiderSvc -->|record pickup / delivery stage| OrderSvc
 
     %% -- saga: services hold their own Temporal client (D47) --
-    OrderSvc -->|start saga, signal kitchen decision| TemporalServer
-    RiderSvc -->|signal pickup / delivery| TemporalServer
+    OrderSvc -->|create_order / kitchen_decision Update, D53/D54| TemporalServer
+    PaymentSvc -->|start PaymentWorkflow, manual mode, D55| TemporalServer
+    RiderSvc -->|signal RiderWorkflow: pickup / delivery, D55| TemporalServer
     OrchestratorAPI -.->|health probe only| TemporalServer
     TemporalServer -->|dispatch workflow task| OrchestratorWorker
-    OrchestratorWorker -->|authorize / refund| PaymentSvc
-    OrchestratorWorker -->|transitions, internal reads| OrderSvc
+    OrchestratorWorker -->|authorize / refund / create manual| PaymentSvc
+    OrchestratorWorker -->|create, transitions, kitchen decision,<br/>internal reads, publish| OrderSvc
     OrchestratorWorker -->|dispatch / release| RiderSvc
 
     %% -- each service owns one database --
@@ -105,9 +109,10 @@ flowchart TB
     %% D49: rider live location moved from a Postgres column to this Redis GEO index.
     RiderSvc -.->|location GEO index, db 2| Redis
 
-    %% -- eventing: outbox relay, consumers, schema registry --
-    OrderSvc -->|outbox relay| Kafka
-    PaymentSvc -->|outbox relay| Kafka
+    %% -- eventing: D53 replaced the outbox relay with a KafkaGateway each service holds,
+    %% called synchronously from an internal endpoint a Temporal activity invokes --
+    OrderSvc -->|publish, via KafkaGateway, D53| Kafka
+    PaymentSvc -->|publish, via KafkaGateway, D53| Kafka
     Kafka -->|consume| AnalyticsSvc
     Kafka -->|consume| NotifConsumer
     OrderSvc -.->|schema| SchemaRegistry

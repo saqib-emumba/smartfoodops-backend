@@ -1,14 +1,10 @@
-"""Outbound calls the order saga's activities make, one module per sibling called —
-moved here verbatim from `orchestrator/clients/{order,payment,rider}.py` when clients/
-was entity-scoped so a future second entity's calls (which will not be shaped like an
-order's — see the module docstrings below) get their own `clients/<entity>/` instead of
-crowding into this one.
+"""Outbound calls `OrderWorkflow` and its own activities make — the `order` entity's own
+client, since D55 moved payment and rider calls out into `clients/payment/` and
+`clients/rider/` alongside their own workflows.
 
-order_service.py   the two calls back into the Order Service — recording a transition and
-                    reading the kitchen's decision, both of them direct database access
-                    before D36 moved this worker out of the Order Service's own image
-payment.py         authorise and refund
-rider.py           dispatch and release
+order_service.py   creating an order, recording a transition, the kitchen's decision, and
+                    reading the order back — all of them direct database access before D36
+                    moved this worker out of the Order Service's own image
 
 Every call here carries the internal key rather than a forwarded bearer token, for the
 reason D26 gives: an activity has no user behind it, and a token in a workflow argument

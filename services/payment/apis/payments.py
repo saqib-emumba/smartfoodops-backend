@@ -3,9 +3,15 @@
 The health probe lives in health.py instead. Two routes here charge on the customer's own
 bearer token; the saga's routes, on the internal key, live in saga.py — same split
 rider/apis/ makes between its own audiences.
+
+D53/outbox-removal-temporal-design.md ss4b: `process_payment` no longer writes directly. It
+starts `PaymentWorkflow` (manual mode, unified with the saga's own payment step by D55) and
+waits for it to finish — the write and the publish both happen inside Temporal now, since
+removing `payment_outbox` left this route's write with no activity to chain a publish step
+off of otherwise. The route's own contract (status codes, body shape, 200-on-replay) is
+unchanged.
 """
 
-from functools import partial
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response, status
@@ -14,7 +20,6 @@ from common.auth import CurrentUser, require_role
 from common.errors import bad_request, not_found
 from common.responses import Envelope, REPLAY_RESPONSE, ok
 from payment import deps
-from payment.authorise import authorise
 from payment.schemas.payments import PaymentCreateRequest, PaymentResponse
 
 router = APIRouter(prefix="/api/v1/payments")
@@ -26,7 +31,7 @@ router = APIRouter(prefix="/api/v1/payments")
     status_code=status.HTTP_201_CREATED,
     responses=REPLAY_RESPONSE,
 )
-def process_payment(
+async def process_payment(
     payload: PaymentCreateRequest,
     response: Response,
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
@@ -34,8 +39,10 @@ def process_payment(
 ) -> Envelope[PaymentResponse]:
     """Authorise a payment for an order, at most once per idempotency key.
 
-    Ownership is not checked here: the Order Service lookup runs as the caller and refuses
-    an order that is not theirs, so there is one place that decides it.
+    Ownership is not checked here directly any more — it happens inside `PaymentWorkflow`'s
+    own write, as the caller, exactly as it always has (D52's model: `current_user` travels
+    into the workflow as plain data, not a credential, and the write re-asserts the identity
+    this request already verified).
     """
     # The header is what a retrying client resends; the body repeats the value so the key
     # that gets persisted is explicit in the contract. A disagreement between the two means
@@ -47,22 +54,13 @@ def process_payment(
             "X-Idempotency-Key header does not match idempotency_key in the body"
         )
 
-    payment, replayed = authorise(
-        payload,
-        idempotency_key=x_idempotency_key,
-        amount=payload.amount,
-        # Reads the order as the caller, which is what enforces ownership.
-        fetch_order=partial(deps.order_service.fetch_order, current_user=current_user),
-        verify_replay=True,
-        payments=deps.payments,
-        gateway=deps.gateway,
-        logger=deps.logger,
-        replay_log="Idempotent replay for key %s",
+    result = await deps.payment_saga.create_manual_payment(
+        payload, idempotency_key=x_idempotency_key, current_user=current_user
     )
-    if replayed:
+    if not result["created"]:
         response.status_code = status.HTTP_200_OK
-        return ok(PaymentResponse(**payment), message="Replayed", status=200)
-    return ok(PaymentResponse(**payment), message="Payment authorised", status=201)
+        return ok(PaymentResponse(**result["payment"]), message="Replayed", status=200)
+    return ok(PaymentResponse(**result["payment"]), message="Payment authorised", status=201)
 
 
 @router.get("/{payment_id}", response_model=Envelope[PaymentResponse])

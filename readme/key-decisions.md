@@ -41,7 +41,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D22](#d22--mongodb-was-dropped-menus-are-jsonb-in-postgres) | MongoDB dropped; menus are JSONB in Postgres | 2026-08-21 | Partly superseded by [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) |
 | [D23](#d23--menus-are-read-through-a-redis-cache-aside-layer) | Menus are read through a Redis cache-aside layer | 2026-08-21 | Accepted |
 | [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) | The tracking trail moved into the order database | 2026-08-21 | Accepted |
-| [D25](#d25--temporal-orchestrates-the-order-lifecycle-and-the-workflow-id-is-the-order-id) | Temporal orchestrates; the workflow id is the order id | 2026-08-21 | Accepted |
+| [D25](#d25--temporal-orchestrates-the-order-lifecycle-and-the-workflow-id-is-the-order-id) | Temporal orchestrates; the workflow id is the order id | 2026-08-21 | Superseded by [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) |
 | [D26](#d26--the-worker-authenticates-with-the-internal-key-never-a-forwarded-bearer) | The worker uses the internal key, never a bearer token | 2026-08-21 | Accepted |
 | [D27](#d27--restaurant-acceptance-is-a-signal-and-a-timer-not-a-synchronous-call) | Restaurant acceptance is a signal and a timer | 2026-08-21 | Partly superseded by [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) |
 | [D28](#d28--riders-got-their-own-service-and-database) | Riders got their own service and database | 2026-08-21 | Accepted |
@@ -55,7 +55,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D36](#d36--the-order-sagas-workflow-and-worker-split-into-their-own-deployable) | The order saga's workflow and worker split into their own deployable | 2026-08-27 | Accepted |
 | [D37](#d37--the-orchestrator-services-subdirectories-are-entity-scoped) | The Orchestrator Service's subdirectories are entity-scoped | 2026-08-27 | Accepted |
 | [D38](#d38--kafka-carries-facts-temporal-still-owns-decisions) | Kafka carries facts, Temporal still owns decisions | 2026-09-08 | Accepted |
-| [D39](#d39--a-transactional-outbox-not-a-post-commit-publish) | A transactional outbox, not a post-commit publish | 2026-09-08 | Accepted |
+| [D39](#d39--a-transactional-outbox-not-a-post-commit-publish) | A transactional outbox, not a post-commit publish | 2026-09-08 | Superseded by [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger) |
 | [D40](#d40--one-topic-keyed-by-order_id-versioned-in-the-envelope) | One topic, keyed by `order_id`, versioned in the envelope | 2026-09-08 | Accepted |
 | [D41](#d41--metrics-is-the-documented-exception-to-d35) | `/metrics` is the documented exception to D35 | 2026-09-08 | Accepted |
 | [D42](#d42--observability-and-eventing-config-joins-d20s-byte-for-byte-set) | Observability and eventing config joins D20's byte-for-byte set | 2026-09-08 | Accepted |
@@ -68,6 +68,9 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) | Menu categories and order items move from JSONB to normalized relational tables | 2026-09-23 | Accepted |
 | [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) | nginx gains a fail-closed `auth_request` chokepoint | 2026-09-24 | Accepted |
 | [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) | Internal calls assert identity headers instead of forwarding the bearer token | 2026-09-24 | Accepted |
+| [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger) | The outbox tables are removed; workflow history becomes the publish ledger | 2026-09-29 | Accepted |
+| [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) | Order creation moves inside Temporal, via Update-with-Start | 2026-09-30 | Accepted |
+| [D55](#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow) | Payment, rider and compensation become child workflows of `OrderWorkflow` | 2026-10-01 | Accepted |
 
 ---
 
@@ -647,6 +650,12 @@ code, and `restaurants.capacity` had never been read.
 
 ### D25 — Temporal orchestrates the order lifecycle, and the workflow id *is* the order id
 
+> **Superseded by [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start):**
+> the atomicity gap this entry accepts as a cost — "the order exists" and "its saga started"
+> are not one atomic fact — is closed by moving the insert itself inside the workflow, via
+> Update-with-Start. The workflow-id-is-the-order-id design below is unchanged; only *when*
+> the order is created relative to the workflow starting changes.
+
 **Decided:** `POST /api/v1/orders` keeps every step it had — idempotency, server-side
 re-pricing, both HTTP verifications, the transactional insert of the order with the opening
 entry of its trail — and then starts an `OrderWorkflow` whose id is `order-{order_id}`,
@@ -671,6 +680,111 @@ a failure.
 
 Also: `create_order` became `async def`, so its repository calls now run on the event loop
 rather than in FastAPI's threadpool.
+
+### D54 — Order creation moves inside Temporal, via Update-with-Start
+
+**Decided:** `POST /api/v1/orders` derives `order_id = uuid5(NAMESPACE, "{customer_id}:
+{idempotency_key}")` before touching Temporal or Postgres, then calls
+`client.execute_update_with_start_workflow` — atomically starting `OrderWorkflow` under
+`order-{order_id}` if it is not already running (`USE_EXISTING`), delivering a `create_order`
+Update, and blocking for its result. The Update handler calls the re-pricing/verification/
+insert logic (moved to `POST /orders/internal/create`, `apis/internal_orders.py`) as an
+activity, then a second activity to publish `order.created` (D53). `OrderWorkflow.run()` no
+longer takes the order as a start argument; it opens with
+`await workflow.wait_condition(lambda: self._order is not None)` and reads from `self._order`
+once the Update has populated it. Full design:
+[readme/order-creation-temporal-update-design.md](order-creation-temporal-update-design.md).
+
+**Instead of:** D25's insert-then-fire-and-forget-start.
+
+**Why:** D25 named its own gap honestly — "Temporal cannot enlist in a Postgres transaction,
+so 'the order exists' and 'its saga started' are not one atomic fact" — and accepted a failed
+start being repaired only by a client retry. Update-with-Start closes that for real: from the
+caller's perspective, "the order exists" and "the saga is running" become one round trip,
+because there is no longer a window between them for a crash to land in.
+
+Two decisions the design made along the way: `order_id` is keyed on `(customer_id,
+idempotency_key)`, not the key alone, so two different customers reusing the same literal key
+string never address the same workflow — the database's unique constraint on
+`idempotency_key` still independently raises a genuine `409` for that case, exactly as
+before. And two concurrent same-customer requests racing on the same key converge silently
+(re-select by `idempotency_key` on the insert's `UniqueViolation`, return the existing row)
+rather than erroring, preserving D08's `201`-first/`200`-after semantics end to end.
+
+**Costs:** Temporal being unreachable now means no order can be created at all — a `503`,
+where D25's version degraded gracefully (the order still committed, only the saga start was
+swallowed). Accepted deliberately, the same shape D51's gateway-to-user-service dependency
+already uses elsewhere in this platform: a named, retriable availability coupling rather than
+a hidden regression. `OrderWorkflow.run()`'s signature change is also a **breaking
+contract change**: `order-service` and `orchestrator-worker` must deploy together.
+
+### D55 — Payment, rider and compensation become child workflows of `OrderWorkflow`
+
+**Decided:** `OrderWorkflow` stops calling payment, dispatch and compensation activities
+directly and instead starts three child workflows, awaiting each for its result —
+`PaymentWorkflow` (authorise, whether for the saga or the direct/manual endpoint — see
+below), `RiderWorkflow` (dispatch, pickup, delivery, and its own retry/recovery logic), and
+`CompensationWorkflow` (refund, then cancel). Each gets a deterministic id off the order id
+(`common.temporal.payment_workflow_id_for`/`rider_workflow_id_for`/
+`compensation_workflow_id_for`), the same pattern `workflow_id_for` already established for
+`OrderWorkflow` itself. `OrderActivities` shrinks to what is genuinely about the order
+entity (creation, transitions, kitchen decisions, publishing); payment and rider activities
+move to their own `PaymentActivities`/`RiderActivities`, each paired with its own
+entity-scoped client (`clients/payment/`, `clients/rider/` — `clients/order/payment.py` and
+`clients/order/rider.py` are retired).
+
+`RiderWorkflow` owns its rider's whole lifecycle, including releasing it on *every* exit
+path — delivered, or a pickup/delivery timeout with nothing recovered — so `OrderWorkflow`'s
+compensation path never needs to know whether a rider was ever assigned at all.
+`CompensationWorkflow` is correspondingly simple: refund, then cancel, with no fleet
+awareness. The Rider Service now signals `rider-<order_id>` directly
+(`services/rider/fleet.py`), not `OrderWorkflow`, which no longer holds
+`rider_pickup`/`rider_delivery` signal handlers at all.
+
+**Instead of:** one `OrderWorkflow` holding every activity call for every concern inline —
+the shape D25 through D54 all built on.
+
+**Why:** the mentor's direction, after the narrower order-creation-only scope (D54) and the
+outbox removal (D53) both landed: payment, rider and compensation each have enough of their
+own state and retry policy to earn a workflow of their own, not just a function inside
+`OrderWorkflow`. Splitting by entity is the same boundary `clients/<entity>/` and
+`activities/<entity>.py` already drew for HTTP clients (D34/D37) — this extends it to the
+workflow layer itself.
+
+`PaymentWorkflow` unifies what would otherwise be two near-identical workflow types: the
+saga's own authorisation step and D53's `ManualPaymentWorkflow` (the direct/manual endpoint)
+differ only in which activity does the write (`payload["mode"]` selects it) — both publish
+through the same activity afterward, since `PaymentEventData`'s shape never differed between
+authorize/refund/manual. Refunding stays out of `PaymentWorkflow` entirely and lives only in
+`CompensationWorkflow`, so a payment's workflow is either "authorise and done" — never "stay
+open waiting for a possible refund signal."
+
+**Costs:**
+
+- **Two different workflow ids for the same workflow type.** The saga's payment step and
+  the manual endpoint were first given the *same* id (`payment-<order_id>`) on the theory
+  that one payment per order means one id regardless of which path authorised it. That
+  broke: once the saga's `PaymentWorkflow` execution completed, a later manual attempt
+  against that same id came back as *that* execution's result — the saga's own authorised
+  amount — rather than genuinely starting fresh, observed directly by a smoke-test case
+  that submitted a deliberately wrong amount to the manual endpoint for an order the saga
+  had already paid, and got back `201` with the saga's original (correct) amount instead of
+  the expected `422`. Fixed by giving the manual path its own id
+  (`manual_payment_workflow_id_for`, `payment-manual-<order_id>`) — see that function's own
+  docstring. D30's actual protection against double-paying one order was always the
+  database's `UNIQUE(order_id)` constraint, never the workflow id, so this costs nothing
+  real.
+- **A breaking replay change, again.** `OrderWorkflow.run()` now issues
+  `StartChildWorkflowExecutionInitiated` events where it used to issue
+  `ActivityTaskScheduled` ones at the same points in its history — a workflow already
+  in flight when this deploys will fail to replay against the new code. The same class of
+  risk D37/D43 already named for a smaller change, closed the same way: drain in-flight
+  workflows (or, in this project's own dev/test environment, reset Temporal's persisted
+  history along with the database) before deploying.
+- **More workflow executions to operate.** Every order now starts up to three additional
+  child executions beyond `OrderWorkflow` itself (payment, rider, and — only on failure —
+  compensation), each visible and independently queryable in Temporal Web, which is the
+  explicit point of the split, not an accident of it.
 
 ### D26 — The worker authenticates with the internal key, never a forwarded bearer
 
@@ -1267,6 +1381,13 @@ channel that could disagree with what Temporal itself records.
 
 ### D39 — A transactional outbox, not a post-commit publish
 
+> **Partly superseded by [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger):**
+> the mentor's direction was to remove `order_outbox`/`payment_outbox` and their relays
+> altogether, using Temporal's own execution history as the durability ledger instead of a
+> Postgres table. This entry's reasoning for *why a ledger is needed at all* — a Kafka publish
+> and a Postgres commit are two systems with no shared transaction — still holds and is not
+> revisited; only the choice of *which* durable ledger records the obligation changes.
+
 **Decided:** `order_outbox` and `payment_outbox` tables, written inside the same
 `cursor(commit=True)` block as the business write and the trail row. A background relay, composed
 into each service's own lifespan, publishes unpublished rows to Kafka and marks them published.
@@ -1583,6 +1704,44 @@ report. There is no D46; the record is
 [D43](#d43--the-riders-report-becomes-a-durable-column-on-orders). Code written for this
 decision cites D43 and says so inline; the pre-existing citations are left alone rather than
 swept into an unrelated change.
+
+### D53 — The outbox tables are removed; workflow history becomes the publish ledger
+
+**Decided:** `order_outbox`, `payment_outbox`, and `services/common/outbox.py`'s
+`append_outbox()`/`OutboxRelay` are removed entirely. Every write that produces a Kafka event
+becomes two sequential Temporal activities in the owning workflow — one for the DB write, one
+that crosses back over HTTP into the owning service to perform the Kafka `send` — instead of one
+DB write plus an outbox row read later by a background relay. The two writes that had no
+workflow to attach an activity to are pulled into Temporal first: `order.kitchen.decided`
+becomes a Temporal Update against the already-running order workflow, and the direct/manual
+`POST /api/v1/payments` path ([D30](#d30--the-saga-owns-payment-authorisation-so-post-apiv1payments-now-answers-409))
+gets its own minimal single-activity workflow. Full design:
+[readme/outbox-removal-temporal-design.md](outbox-removal-temporal-design.md).
+
+**Instead of:** D39's Postgres-table-plus-relay ledger.
+
+**Why:** the mentor's direction — event delivery should be handled by Temporal, not a
+second, parallel durability mechanism the platform has to operate itself. D39's underlying
+argument (a Kafka publish and a Postgres commit are two systems with no shared transaction, so
+*something* durable has to record the obligation to publish) still holds; what changes is which
+system provides that durability. A Temporal workflow's history is already exactly that: an
+append-only, replay-safe record of what completed, with retry-until-success built in for
+whatever hasn't. Using it removes a bespoke poller this platform would otherwise keep
+maintaining side-by-side with the mechanism ([D38](#d38--kafka-carries-facts-temporal-still-owns-decisions))
+already doing the same job for the saga itself.
+
+**Costs:** two call sites that previously had no Temporal dependency at all gain one —
+`order.kitchen.decided` (a restaurant accept/reject no longer commits if Temporal is
+unreachable, only the notification was best-effort before) and the manual payment endpoint
+(previously zero Temporal involvement, now blocked end-to-end if Temporal is down). The
+DB-queryable backlog table is gone, replaced by Temporal Web's pending-activity view and
+Temporal's own metrics (port 9233) — the same observability channel D38 already argued for over
+a second one that could disagree with what Temporal itself records. Workflow volume increases:
+every kitchen decision and every manual payment is now a workflow execution, which needs
+Temporal namespace retention sized for that in addition to the long-running order sagas it was
+previously sized for alone. At-least-once delivery and the resulting `event_id` dedup
+requirement on every consumer are unchanged — this relocates the durability mechanism, it does
+not strengthen or weaken the guarantee itself.
 
 ---
 

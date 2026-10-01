@@ -2,8 +2,15 @@
 
 `_decide_kitchen` is a plain function here rather than in clients/orchestrator.py: it is
 called by exactly the two routes below and nowhere else, so it stays next to its only
-callers. The signal hand-off itself is one line into that client, unchanged in shape since
-before D36 — only which process answers it changed.
+callers.
+
+D53/outbox-removal-temporal-design.md ss4a: accepting or rejecting now goes through a
+Temporal Update rather than a direct database write followed by a best-effort signal.
+Removing the outbox left this write with no activity to chain a publish step off unless the
+write itself moved inside Temporal — the same reasoning that moved order creation there, on
+a smaller write. Temporal being unreachable now means a restaurant cannot record a decision
+at all, where before the decision always committed and only the saga's awareness of it was
+best-effort.
 """
 
 from uuid import UUID
@@ -44,62 +51,48 @@ def kitchen_queue(
 async def _decide_kitchen(
     order_id: UUID, current_user: CurrentUser, decision: str
 ) -> Envelope[KitchenDecisionResponse]:
-    """Record a kitchen decision and tell the saga about it, exactly once.
+    """Verify ownership here, on the bearer token; record the decision through Temporal.
 
-    Two properties this ordering buys, and both matter:
+    Ownership stays checked exactly where it always was — the Restaurant Service's fact,
+    resolved as the caller (D16) — before anything reaches the workflow. What changed is
+    only what happens after: a Temporal Update now does the write and the saga hand-off in
+    one round trip (D53), rather than a direct write followed by a signal the saga might
+    never see.
 
-    The decision is committed *before* the signal, so a signal that fails to send leaves a
-    decision on record rather than losing it — and the saga reads that record back when its
-    timer expires, which is what makes a lost signal self-correcting.
-
-    The signal is sent only when the update actually changed something. A second accept must
-    not tell the workflow twice, and a click on an order the saga already timed out and
-    cancelled must not signal at all.
-
-    Since D32 this service owns both halves: the decision is a column in its own database
-    and the workflow is its own, so there is no cross-service relay left to lose.
+    An already-decided order is answered from this database read alone, *before* touching
+    Temporal. This isn't an optimisation — it's load-bearing: by the time a second accept or
+    reject on an already-decided order arrives, the saga itself may already have finished
+    (an outright reject completes `OrderWorkflow.run()` via `_compensate`), and Temporal
+    refuses to deliver an Update to a workflow that no longer exists. The database's own
+    `kitchen_decision` column, unlike the workflow, outlives the saga — the same durability
+    gap D32 already closed for reading a decision back after a timeout, applied here to
+    reading it back after completion instead.
     """
     order = deps.orders.find(order_id)
     if order is None:
         raise not_found(f"Order {order_id} not found")
     deps.restaurant_service.verify_owner(order["restaurant_id"], current_user)
 
-    decided, changed = deps.orders.decide_kitchen(order_id, decision)
-    if decided is None:
-        # The order was found above but is gone by the time `decide_kitchen` re-reads it —
-        # a race this narrow has no test covering it and, before the envelope pass gave
-        # every route a matching exception handler to fall through to, crashed with a bare
-        # `TypeError` on `None["status"]` instead of a clean 404. See payment/apis/saga.py's
-        # `refund_for_saga` for the same shape of fix.
-        raise not_found(f"Order {order_id} no longer exists")
-    if not changed:
-        deps.logger.info(
-            "Order %s is already '%s'/%s; not signalling the saga again",
-            order_id,
-            decided["status"],
-            decided["kitchen_decision"],
-        )
+    if order["kitchen_decision"] is not None:
         return ok(
             KitchenDecisionResponse(
                 order_id=order_id,
-                decision=decided["kitchen_decision"],
-                status=decided["status"],
+                decision=order["kitchen_decision"],
+                status=order["status"],
                 changed=False,
             ),
             message="Decision unchanged",
         )
 
-    await deps.orchestrator_service.signal_saga_best_effort(
-        order_id, "restaurant_decision", {"decision": decision}
-    )
+    result = await deps.orchestrator_service.decide_kitchen(order_id, decision)
     return ok(
         KitchenDecisionResponse(
             order_id=order_id,
-            decision=decided["kitchen_decision"],
-            status=decided["status"],
-            changed=True,
+            decision=result["decision"],
+            status=result["status"],
+            changed=result["changed"],
         ),
-        message="Decision recorded",
+        message="Decision recorded" if result["changed"] else "Decision unchanged",
     )
 
 

@@ -6,15 +6,23 @@ UI-visible history. Both facts are D26's, restated here because they are why thi
 routes carry no `Depends(require_role(...))` at all — see common/auth.py's `require_internal`.
 """
 
+from functools import partial
+
 from fastapi import APIRouter, Depends, Response, status
 
-from common.auth import require_internal
+from common.auth import CurrentUser, require_internal
 from common.errors import internal_error, unprocessable
 from common.responses import Envelope, REPLAY_RESPONSE, ok
 from payment import deps
 from payment.amounts import to_cents
 from payment.authorise import authorise
-from payment.schemas.payments import PaymentAuthorizeRequest, PaymentRefundRequest, PaymentResponse
+from payment.schemas.payments import (
+    ManualPaymentRequest,
+    ManualPaymentResult,
+    PaymentAuthorizeRequest,
+    PaymentRefundRequest,
+    PaymentResponse,
+)
 
 router = APIRouter(prefix="/api/v1/payments", dependencies=[Depends(require_internal)])
 
@@ -119,3 +127,31 @@ def refund_for_saga(payload: PaymentRefundRequest) -> Envelope[PaymentResponse]:
         payload.reason or "no reason given",
     )
     return ok(PaymentResponse(**refunded), message="Refunded")
+
+
+@router.post("/manual", response_model=Envelope[ManualPaymentResult], status_code=status.HTTP_201_CREATED)
+def create_manual_payment(payload: ManualPaymentRequest) -> Envelope[ManualPaymentResult]:
+    """The write behind `PaymentWorkflow`'s manual mode (D53/outbox-removal-temporal-design.md
+    ss4b) — the direct/manual payment endpoint's authorisation, now reached through a
+    workflow instead of directly by `process_payment`'s own HTTP handler.
+
+    `verify_replay=True`, unlike `authorize_for_saga` above: this key is client-chosen and
+    therefore guessable, exactly like the original `process_payment` path it replaces, so a
+    replay still re-confirms ownership before handing back an existing payment.
+    """
+    current_user = CurrentUser(user_id=payload.customer_id, roles=payload.customer_roles)
+    payment, replayed = authorise(
+        payload,
+        idempotency_key=payload.idempotency_key,
+        amount=payload.amount,
+        fetch_order=partial(deps.order_service.fetch_order, current_user=current_user),
+        verify_replay=True,
+        payments=deps.payments,
+        gateway=deps.gateway,
+        logger=deps.logger,
+        replay_log="Idempotent manual-payment replay for key %s",
+    )
+    return ok(
+        ManualPaymentResult(payment=PaymentResponse(**payment), created=not replayed),
+        message="Payment authorised" if not replayed else "Replayed",
+    )

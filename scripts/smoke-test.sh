@@ -1197,21 +1197,6 @@ fi
 # ---------------------------------------------------------------- eventing
 section "Eventing (Week 3)"
 
-if have_container sfo-order-db; then
-  # The relay drains on a ~1s cadence; poll briefly rather than assume it has already run
-  # in the instant since the happy-path section above committed its last outbox row.
-  UNPUB=""
-  for _ in $(seq 1 10); do
-    UNPUB=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
-      "SELECT count(*) FROM order_outbox WHERE published_at IS NULL;" 2>/dev/null | tr -d '[:space:]')
-    [[ "$UNPUB" == "0" ]] && break
-    sleep 1
-  done
-  assert "the order outbox drains" "$UNPUB" "0"
-else
-  printf '  %sSKIP%s  outbox drain check (docker/sfo-order-db not reachable)\n' "$DIM" "$RESET"
-fi
-
 if have_container sfo-kafka; then
   PARTITIONS=$(docker exec sfo-kafka kafka-topics --bootstrap-server localhost:9092 \
     --describe --topic sfo.order.events.v1 2>/dev/null \

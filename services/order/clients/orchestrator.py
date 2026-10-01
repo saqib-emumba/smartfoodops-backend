@@ -9,86 +9,77 @@ Orchestrator Service's REST facade in front of Temporal and making this an HTTP 
 
 D47 removes the facade instead. `SagaClient` names the workflow by *string*
 (`"OrderWorkflow"`), so this service holds a Temporal client again while importing nothing
-from `orchestrator` — the property D36 actually needed, obtained without the extra hop. The
-smoke check for it is in the plan: `sys.modules` inside the running container must list no
-`orchestrator.*` module.
+from `orchestrator` — the property D36 actually needed, obtained without the extra hop.
 
-Both methods here swallow every failure, and that is deliberate rather than lazy. The order
-or the decision is already committed by the time either runs, and D09's argument holds
-regardless of which process is doing the committing: a write that already succeeded must not
-be reported to the client as a failure. The relay that used to raise honestly —
-`signal(order_id, ...)`, called by the rider report route — is gone with that route; the
-Rider Service now signals Temporal itself, so it is the one that learns whether its signal
-landed.
+D53/order-creation-temporal-update-design.md replaces both methods this class used to hold.
+Starting a saga is no longer a separate, best-effort step after the order already exists —
+`create_order` below *is* how the order comes to exist, via Update-with-Start, so a failure
+here is no longer swallowed: the order genuinely was not created and the caller sees a `503`.
+Signalling the kitchen's decision is no longer best-effort either, for the same reason —
+`decide_kitchen` is a Temporal Update now, not a write followed by a signal the saga might
+never see.
 """
 
 from uuid import UUID
 
 from common.config import ORDER_TASK_QUEUE
 from common.temporal import SagaClient, workflow_id_for
+from order.schemas.orders import OrderCreateRequest
 
 ORDER_WORKFLOW = "OrderWorkflow"
 
 
 class OrchestratorClient:
-    """This service's view of the order saga: start it, and signal the kitchen's answer."""
+    """This service's view of the order saga: create an order through it, and tell it the
+    kitchen's answer — both now synchronous, both now genuinely fail when Temporal cannot
+    be reached, rather than degrading gracefully the way D25's fire-and-forget start did."""
 
     def __init__(self, saga: SagaClient, *, logger):
         self._saga = saga
         self._logger = logger
 
-    async def start_saga(self, order: dict, restaurant: dict) -> None:
-        """Hand a committed order to the saga. Deliberately after the commit, and
-        deliberately not fatal — see the module docstring and D09.
+    async def create_order(
+        self,
+        order_id: UUID,
+        payload: OrderCreateRequest,
+        *,
+        current_user,
+        idempotency_key: str,
+    ) -> dict:
+        """Create an order via Update-with-Start: one round trip for "the order exists and
+        its saga is running", closing the gap D25 accepted as a named cost.
 
-        `capacity`, `latitude` and `longitude` are snapshots taken at checkout (D32), so
-        this call carries everything the saga needs and the orchestrator never has to ask
-        the Restaurant Service anything.
-
-        `amount` is stringified rather than passed as a `Decimal`: it has to survive JSON
-        into workflow history exactly (D07), and a float would not. That used to be enforced
-        by `OrderSagaStartRequest.amount: str` on the facade's Pydantic model; with the
-        facade gone there is no validator left to catch it, so it rests on this line.
+        `amount` (here, `total_amount`) is a plain float rather than stringified: unlike the
+        old `start_saga` payload, this one is validated by `OrderInternalCreateRequest` on
+        arrival and never has to survive an intermediate JSON hop as the authoritative
+        figure — it exists only to be checked against the server's own recalculation
+        (D06), never persisted from this value directly.
         """
-        order_id = order["id"]
-        try:
-            await self._saga.start(
-                ORDER_WORKFLOW,
-                task_queue=ORDER_TASK_QUEUE,
-                wf_id=workflow_id_for(order_id),
-                payload={
-                    "order_id": str(order_id),
-                    "restaurant_id": str(order["restaurant_id"]),
-                    "amount": str(order["total_amount"]),
-                    "capacity": restaurant["capacity"],
-                    "restaurant_latitude": restaurant["latitude"],
-                    "restaurant_longitude": restaurant["longitude"],
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 - the order is committed; never fail on this
-            # Error rather than warning: an order with no saga stays at `created` forever
-            # until something retries it, which is worth an alert even though it is not
-            # worth a 500 to a client whose order was in fact created.
-            self._logger.error("Could not start the saga for order %s: %s", order_id, exc)
+        return await self._saga.start_with_update(
+            ORDER_WORKFLOW,
+            task_queue=ORDER_TASK_QUEUE,
+            wf_id=workflow_id_for(order_id),
+            update="create_order",
+            update_payload={
+                "order_id": str(order_id),
+                "customer_id": str(current_user.user_id),
+                "customer_roles": current_user.roles,
+                "restaurant_id": str(payload.restaurant_id),
+                "items": [item.model_dump() for item in payload.items],
+                "total_amount": payload.total_amount,
+                "idempotency_key": idempotency_key,
+            },
+        )
 
-    async def signal_saga_best_effort(self, order_id: UUID, signal: str, body: dict) -> None:
-        """Tell the saga about something already committed, without being able to undo it.
+    async def decide_kitchen(self, order_id: UUID, decision: str) -> dict:
+        """Record the kitchen's decision via a Temporal Update.
 
-        Best-effort on purpose. The kitchen's decision is in the database by the time this
-        runs, and the admin must not see an error for something that worked — so a signal
-        that cannot be delivered is logged, not raised.
-
-        Losing it is survivable precisely because of the read-back: when the saga's timer
-        expires it asks the Order Service for `orders.kitchen_decision` and finds the
-        decision anyway (D32, D36). This is the one place where those two mechanisms are
-        designed as a pair.
+        Replaces D53's removed write-then-best-effort-signal: a lost signal used to be
+        recovered later by the saga's own timeout read-back (D32); now there is nothing to
+        lose; the write and the saga's awareness of it are the same round trip.
         """
-        try:
-            await self._saga.signal(workflow_id_for(order_id), signal, body)
-        except Exception as exc:  # noqa: BLE001 - the decision is committed; do not undo it
-            self._logger.error(
-                "Recorded the decision for order %s but could not signal the saga; "
-                "its timeout will read the decision back instead: %s",
-                order_id,
-                exc,
-            )
+        return await self._saga.update(
+            workflow_id_for(order_id),
+            "kitchen_decision",
+            {"order_id": str(order_id), "decision": decision},
+        )

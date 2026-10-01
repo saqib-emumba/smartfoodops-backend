@@ -1,19 +1,25 @@
 """Temporal activities for the `order` entity's saga.
 
-The non-deterministic half of the workflow: HTTP calls to sibling services — every one of
-them, since D36 moved this worker out of the Order Service's image and database. Before
-that, `transition_order_activity` and `read_kitchen_decision_activity` were the two
-exceptions, writing and reading `sfo_order_core` directly through a shared
-`OrderRepository`; now all seven activities reach every service they touch, including the
-Order Service itself, over HTTP on the internal key. See
+The non-deterministic half of `OrderWorkflow`: HTTP calls to the Order Service, since D36
+moved this worker out of its image and database. See
 orchestrator/clients/order/order_service.py for what replaced the direct access.
+
+D55 (mentor's child-workflow split) moved payment and rider activities out of this class
+entirely — `activities/payment.py` and `activities/rider.py` now back `PaymentWorkflow` and
+`RiderWorkflow`, each a child of `OrderWorkflow`. What remains here is what is genuinely
+about the `order` entity's own state: creating it, transitioning it, and publishing its
+events. `read_rider_report_activity` stays here rather than moving to `activities/rider.py`
+because it reads `orders.rider_reported_stage` through `OrderServiceClient`, not anything the
+Rider Service owns — a fact about the order, read back by `RiderWorkflow`'s own recovery
+logic across the entity boundary, the same way `read_kitchen_decision_activity` always has
+been read across it by `OrderWorkflow` itself.
 
 This module — like `clients/order/` and `workflows/order.py` — is scoped to the `order`
 entity specifically, so a future second entity this service orchestrates gets its own
 `activities/<entity>.py` beside this one rather than a second class crammed in here, and
 declares it in `registry.py`.
 
-Two rules decide the shape of every function below, unchanged by the move.
+Two rules decide the shape of every function below, unchanged by any of the moves above.
 
 **Every activity is idempotent.** Temporal guarantees at-least-once execution, not
 exactly-once: a worker that dies after calling a service but before recording the result
@@ -34,22 +40,17 @@ argument is durable, UI-visible history, so a bearer token must never be one; an
 
 from logging import Logger
 
+from fastapi import HTTPException
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from orchestrator.clients.order.order_service import AtCapacity, OrderGone, OrderServiceClient
-from orchestrator.clients.order.payment import SagaPaymentClient
-from orchestrator.clients.order.rider import SagaRiderClient
-
-
-def payment_key(order_id: str) -> str:
-    """The idempotency key for this order's authorisation.
-
-    Derived, never generated. A retried activity must present the key of the attempt it is
-    replacing, or the unique index that prevents double charging never sees a collision and
-    the customer pays twice.
-    """
-    return f"wf-pay-{order_id}"
+from orchestrator.clients.order.order_service import (
+    AtCapacity,
+    OrderCreateConflict,
+    OrderCreateRejected,
+    OrderGone,
+    OrderServiceClient,
+)
 
 
 class OrderActivities:
@@ -58,10 +59,7 @@ class OrderActivities:
     A class rather than module functions so the worker can build the clients once at
     startup instead of per activity execution, and so `activity.defn`'s default name
     derivation — `ClassName.method_name` never appears; Temporal names an activity by its
-    *method*, and `OrderActivities` supplies the shared state each method needs. Before
-    D36 this took an injected `OrderRepository`; now it takes `OrderServiceClient`, the
-    HTTP client that replaced it — the constructor's shape changed, the seven method names
-    Temporal has recorded in every workflow's history did not.
+    *method*, and `OrderActivities` supplies the shared state each method needs.
 
     Constructed in `registry.py`, which is where the method list Temporal registers lives.
     """
@@ -69,8 +67,98 @@ class OrderActivities:
     def __init__(self, *, orders: OrderServiceClient, logger: Logger):
         self._orders = orders
         self._logger = logger
-        self._payments = SagaPaymentClient(logger)
-        self._riders = SagaRiderClient(logger)
+
+    # --- creation (D54/order-creation-temporal-update-design.md) -------------------------
+
+    @activity.defn
+    def create_order_activity(self, payload: dict) -> dict:
+        """The write behind `OrderWorkflow.create_order`'s Update handler.
+
+        `OrderInternalCreateRequest` on the wire does the re-pricing, verification and
+        insert `checkout.py` used to do directly — see
+        order/apis/internal_orders.py. A rejection (unavailable item, price mismatch,
+        unknown restaurant) or a genuine cross-customer idempotency-key collision are both
+        business answers, not transport failures, so both are non-retryable: asking again
+        cannot change either.
+        """
+        try:
+            return self._orders.create(payload)
+        except OrderCreateRejected as exc:
+            # `type=` is what the client-side unwrap in `common.temporal` uses to pick the
+            # right HTTP status back out from underneath Temporal's ActivityError/
+            # WorkflowUpdateFailedError wrapping — see `common.temporal._raise_mapped`.
+            raise ApplicationError(str(exc), type="OrderCreateRejected", non_retryable=True) from exc
+        except OrderCreateConflict as exc:
+            raise ApplicationError(str(exc), type="OrderCreateConflict", non_retryable=True) from exc
+        except HTTPException as exc:
+            # Anything `ServiceClient` answered with a real status this method has no more
+            # specific exception for — a 403 from a sibling's ownership check, a 404 for "no
+            # menu published yet". Still a business answer, not a transport failure, so still
+            # non-retryable — tagged generically by status rather than needing a named
+            # exception type per code every downstream call could plausibly return.
+            raise ApplicationError(
+                str(exc.detail), type=f"http_{exc.status_code}", non_retryable=True
+            ) from exc
+
+    @activity.defn
+    def decide_kitchen_activity(self, details: dict) -> dict:
+        """The write behind `OrderWorkflow.kitchen_decision`'s Update handler — see
+        order/apis/internal_kitchen.py. Returns `{order_id, decision, status, changed}`;
+        `changed` is what lets the Update handler decide whether to publish."""
+        order_id = details["order_id"]
+        try:
+            return self._orders.decide_kitchen(order_id, details["decision"])
+        except OrderGone as exc:
+            raise ApplicationError(str(exc), non_retryable=True) from exc
+        except HTTPException as exc:
+            raise ApplicationError(
+                str(exc.detail), type=f"http_{exc.status_code}", non_retryable=True
+            ) from exc
+
+    # --- publishing (D53: replaces order_outbox and its relay) --------------------------
+
+    @activity.defn
+    def publish_order_event_activity(self, details: dict) -> None:
+        """Tell Kafka about a fact this saga's writes already committed.
+
+        Reads the order fresh rather than trusting a caller-supplied snapshot: by the time
+        this runs, the write activity chained before it (or the Update handler this shares a
+        caller with) has already committed whatever this event describes, so a fresh read
+        is simpler than threading the same fields through two activities' worth of
+        arguments. `event_id` is derived from `(order_id, event_type)`
+        (`common.kafka.deterministic_event_id`), so retrying this activity after it already
+        reached Kafka once republishes the identical event rather than a new one — every
+        consumer already dedups on it (D39's contract, unchanged by D53).
+        """
+        order_id = details["order_id"]
+        event_type = details["event_type"]
+        order = self._orders.read(order_id)
+        if event_type == "order.created":
+            data = {
+                "order_id": order_id,
+                "customer_id": order["customer_id"],
+                "restaurant_id": order["restaurant_id"],
+                "total_amount": order["total_amount"],
+                "status": order["status"],
+                "items_count": len(order.get("items", [])),
+            }
+        elif event_type == "order.kitchen.decided":
+            data = {
+                "order_id": order_id,
+                "decision": order["kitchen_decision"],
+                "restaurant_id": order["restaurant_id"],
+            }
+        else:
+            data = {
+                "order_id": order_id,
+                "new_status": order["status"],
+                "customer_id": order["customer_id"],
+                "restaurant_id": order["restaurant_id"],
+                "rider_id": order.get("rider_id"),
+                "total_amount": order["total_amount"],
+                "metadata": details.get("metadata") or {},
+            }
+        self._orders.publish_event(order_id, event_type=event_type, data=data)
 
     # --- state ---------------------------------------------------------------------------
 
@@ -107,48 +195,6 @@ class OrderActivities:
             # so fail it outright rather than looping until the retry policy gives up.
             raise ApplicationError(str(exc), non_retryable=True) from exc
 
-    # --- payment ------------------------------------------------------------------------
-
-    @activity.defn
-    def authorize_payment_activity(self, details: dict) -> dict:
-        """Charge the card.
-
-        A declined card is final; an unreachable Payment Service is not. The Payment
-        Service answers `422` for an amount that does not settle the order and `409` for an
-        order already paid — both arrive here as a `bad_gateway`/`unprocessable` HTTPException
-        from ServiceClient, which is a *retryable* exception by default. That is wrong for a
-        decline, so the status of the returned payment is what this checks: anything other
-        than `authorized` is a non-retryable failure.
-        """
-        order_id = details["order_id"]
-        payment = self._payments.authorize(
-            order_id, details["amount"], payment_key(order_id)
-        )
-
-        if payment.get("status") != "authorized":
-            raise ApplicationError(
-                f"Payment for order {order_id} came back '{payment.get('status')}' "
-                "rather than authorized",
-                non_retryable=True,
-            )
-        self._logger.info("Authorised payment for order %s", order_id)
-        return payment
-
-    @activity.defn
-    def refund_payment_activity(self, details: dict) -> dict:
-        """Compensating action: release a hold the saga can no longer honour.
-
-        Carries no idempotency key of its own because the Payment Service makes this
-        idempotent by *status* — a payment already `refunded` is returned untouched. That is
-        the safer guarantee for money: a key can be lost, but the row's state cannot.
-        """
-        order_id = details["order_id"]
-        refunded = self._payments.refund(order_id, details.get("reason", "saga_failure"))
-        self._logger.info(
-            "Refund for order %s resolved as '%s'", order_id, refunded.get("status")
-        )
-        return refunded
-
     # --- kitchen ---------------------------------------------------------------------
 
     @activity.defn
@@ -156,8 +202,9 @@ class OrderActivities:
         """Read the kitchen's answer straight off the order.
 
         Called when the saga's wait for a decision times out. That wait can expire for two
-        very different reasons — the kitchen ignored the order, or it answered and the signal
-        never landed — and refunding the second case is a real customer-visible failure.
+        very different reasons — the kitchen ignored the order, or it answered and the
+        Update never arrived — and refunding the second case is a real customer-visible
+        failure.
 
         Since D32 this is a read of `orders.kitchen_decision`, and since D36 that read
         crosses an HTTP boundary it did not used to: the worker no longer shares a database
@@ -183,8 +230,8 @@ class OrderActivities:
         The same recovery `read_kitchen_decision_activity` already gives the kitchen's
         answer, for the other signal a lost relay can strand: a pickup or delivery report
         committed to `orders.rider_reported_stage` before the signal that carries it into
-        the workflow, so a timeout can tell "the rider genuinely never reported" apart from
-        "they reported and the signal never landed."
+        `RiderWorkflow` (D55), so a timeout can tell "the rider genuinely never reported"
+        apart from "they reported and the signal never landed."
         """
         order_id = details["order_id"]
         try:
@@ -196,48 +243,3 @@ class OrderActivities:
             "Rider report for order %s reads '%s'", order_id, stage
         )
         return {"stage": stage}
-
-    # --- fleet --------------------------------------------------------------------------
-
-    @activity.defn
-    def dispatch_rider_activity(self, details: dict) -> dict:
-        """One attempt at claiming the nearest rider.
-
-        The coordinates arrive in `details` rather than being fetched. `create_order`
-        already reads the restaurant to verify it exists, so the latitude and longitude are
-        in hand at checkout and ride in the workflow payload — which is what took the saga's
-        HTTP calls to the Restaurant Service from four to zero (D32).
-
-        An empty fleet returns `{"assigned": false}` rather than raising. Whether to wait
-        and try again is a scheduling decision, and scheduling belongs to the workflow,
-        which can sleep on a durable timer; an activity can only fail.
-        """
-        order_id = details["order_id"]
-        result = self._riders.dispatch(
-            order_id,
-            float(details["restaurant_latitude"]),
-            float(details["restaurant_longitude"]),
-        )
-        if not result.get("assigned"):
-            self._logger.info(
-                "No rider available for order %s (%s)",
-                order_id,
-                result.get("reason", "unknown"),
-            )
-        return result
-
-    @activity.defn
-    def release_rider_activity(self, details: dict) -> dict:
-        """Return a claimed rider to the pool.
-
-        Called on delivery *and* on every compensation path. The first revision of this
-        blueprint had no such activity, so a rider claimed by a saga that later failed
-        stayed `is_available = FALSE` permanently — the fleet drained one failed order at a
-        time. Idempotent: releasing an order nobody holds is success.
-        """
-        order_id = details["order_id"]
-        released = self._riders.release(order_id)
-        self._logger.info(
-            "Release for order %s: %s", order_id, released.get("released")
-        )
-        return released

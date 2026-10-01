@@ -55,3 +55,42 @@ class OrderResponse(BaseModel):
     idempotency_key: Optional[str]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OrderInternalCreateRequest(BaseModel):
+    """What the order-creation Temporal Update carries into `POST
+    /orders/internal/create` (D53/order-creation-temporal-update-design.md) — everything
+    `checkout.py` used to hold directly, now travelling through a workflow instead.
+
+    `order_id` is derived app-side, deterministically, before this is ever called — see
+    `common.temporal.ORDER_ID_NAMESPACE`. `customer_id`/`customer_roles` reconstruct the
+    `CurrentUser` this endpoint needs to re-run the same ownership and verification calls
+    `checkout.py` used to make directly as the caller (D52's "a sibling service asserting an
+    identity it already holds" model, applied to a Temporal activity instead of an HTTP
+    client). `total_amount` is deliberately absent: re-pricing against the live menu happens
+    here, same as it always has (D06) — a client-declared total is never trusted either way.
+    """
+
+    order_id: UUID
+    customer_id: UUID
+    customer_roles: List[str]
+    restaurant_id: UUID
+    items: List[OrderItemSelection] = Field(..., min_length=1)
+    # The client's own claimed total, carried through unchanged from the original request —
+    # still never trusted as the authoritative amount (D06), but still needed to reject a
+    # stale or wrong client-side total the same way `build_order_snapshot` always has.
+    total_amount: float = Field(..., gt=0.0)
+    idempotency_key: str
+
+
+class OrderInternalCreateResponse(BaseModel):
+    """Everything the saga needs to proceed, in one response — `capacity` and the
+    restaurant's coordinates are what let `OrderWorkflow` dispatch a rider without a fourth
+    HTTP call back to the Restaurant Service (the reason D32 already snapshots them at
+    checkout; this only moves where the snapshot happens)."""
+
+    order: OrderResponse
+    created: bool
+    capacity: int
+    restaurant_latitude: float
+    restaurant_longitude: float

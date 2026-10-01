@@ -8,7 +8,7 @@ from uuid import UUID
 
 from common.auth import CurrentUser
 from common.errors import forbidden, not_found
-from common.temporal import workflow_id_for
+from common.temporal import rider_workflow_id_for
 
 
 def own_profile(riders, current_user: CurrentUser) -> dict:
@@ -69,10 +69,13 @@ async def report_event(
     `order_service.signal(...)` and let the Order Service both record and relay. This
     service now holds its own Temporal client, so the two halves are visible here, in the
     order that matters.
+
+    Signals `RiderWorkflow` directly (D55), not `OrderWorkflow` — the child workflow
+    `OrderWorkflow` starts for dispatch/pickup/delivery now owns these signals itself.
     """
     held = rider.get("current_order_id")
     if held is None or str(held) != str(order_id):
         raise forbidden(f"You are not carrying order {order_id}")
 
     await order_service.record_rider_report(order_id, stage)
-    await saga.signal(workflow_id_for(order_id), signal, {"rider_id": str(rider["id"])})
+    await saga.signal(rider_workflow_id_for(order_id), signal, {"rider_id": str(rider["id"])})

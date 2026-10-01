@@ -1,14 +1,20 @@
-"""Checkout: place an order, then read it back — bearer and internal variants."""
+"""Checkout: place an order, then read it back — bearer and internal variants.
 
-from uuid import UUID
+`create_order` is a thin wrapper as of D53/order-creation-temporal-update-design.md: it
+derives the order's id, hands the raw cart to Temporal via Update-with-Start, and maps the
+result onto 201/200. Re-pricing, verification and the insert itself moved to
+apis/internal_orders.py, reached only through the workflow now.
+"""
+
+from uuid import UUID, uuid5
 
 from fastapi import APIRouter, Depends, Header, Response, status
 
 from common.auth import CurrentUser, get_current_user, require_internal, require_role, require_self_or_admin
 from common.errors import not_found
 from common.responses import Envelope, REPLAY_RESPONSE, ok
+from common.temporal import ORDER_ID_NAMESPACE
 from order import deps
-from order.pricing import build_order_snapshot
 from order.schemas.orders import OrderCreateRequest, OrderResponse
 
 router = APIRouter(prefix="/api/v1/orders")
@@ -26,64 +32,34 @@ async def create_order(
     x_idempotency_key: str = Header(..., alias="X-Idempotency-Key"),
     current_user: CurrentUser = Depends(require_role("customer")),
 ) -> Envelope[OrderResponse]:
-    """Create an order idempotently after re-pricing it against the live menu.
+    """Place an order idempotently, via a Temporal Update-with-Start.
 
-    The order is placed for the token's subject. There is no way to place one for anybody
-    else — `customer_id` is not a field a client can send.
+    `order_id` is derived deterministically from `(customer_id, idempotency_key)` — never
+    the idempotency key alone, so two different customers reusing the same literal key
+    string never address the same workflow (the database's own unique constraint on
+    `idempotency_key` still independently catches that as a genuine `409`, raised by
+    apis/internal_orders.py). This is what lets the workflow be addressed before Postgres
+    has ever heard of the order.
 
-    Since Week 2 this also hands the committed order to the saga, which is what carries it
-    from `created` to `delivered`. Everything before that step is unchanged.
+    Temporal being unreachable now means no order can be created at all — see
+    `common.temporal.SagaClient.start_with_update`, which raises `503` rather than
+    degrading gracefully the way D25's fire-and-forget saga start used to.
     """
-    # (b) Replay protection — an already-seen key returns the stored order untouched.
-    # Scoped to the caller: idempotency keys are client-chosen, so without this check a
-    # guessed key would hand back somebody else's order.
-    existing = deps.orders.find_by_idempotency_key(x_idempotency_key)
-    if existing is not None:
-        require_self_or_admin(current_user, existing["customer_id"])
+    order_id = uuid5(ORDER_ID_NAMESPACE, f"{current_user.user_id}:{x_idempotency_key}")
+
+    result = await deps.orchestrator_service.create_order(
+        order_id,
+        payload,
+        current_user=current_user,
+        idempotency_key=x_idempotency_key,
+    )
+    if not result["created"]:
+        require_self_or_admin(current_user, result["order"]["customer_id"])
         response.status_code = status.HTTP_200_OK
-        deps.logger.info("Idempotent replay for key %s", x_idempotency_key)
-        # A replay also re-attempts the saga. This is what repairs an order whose workflow
-        # failed to start the first time: the workflow id is derived from the order id, so
-        # a saga that is already running is left alone, and one that never began now does.
-        # The restaurant is re-read because a replay has none in hand — the cost of making
-        # this path self-healing, paid only on an actual retry.
-        await deps.orchestrator_service.start_saga(
-            existing,
-            deps.restaurant_service.verify_restaurant(
-                existing["restaurant_id"], current_user
-            ),
+        return ok(
+            OrderResponse(**result["order"]), message="This order has already been placed", status=200
         )
-        return ok(OrderResponse(**existing), message="This order has already been placed", status=200)
-
-    # (c) Re-price from the Menu Service; unavailable items or a total mismatch abort here.
-    menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user)
-    items_snapshot, total = build_order_snapshot(menu, payload)
-
-    # (d) Both participants live in other services' databases, so the foreign keys that
-    # used to reject an unknown id at insert time are gone. The HTTP checks that replace
-    # them sit here, immediately before the write, for the same reason. The customer check
-    # also outlives the token's role claim: a demoted account fails here even while holding
-    # a token minted before the change.
-    deps.user_service.verify_customer(current_user.user_id, current_user)
-    # The response is kept, not discarded: `capacity`, `latitude` and `longitude` are on it,
-    # and handing them to the saga in its payload is what removed the saga's four HTTP calls
-    # to the Restaurant Service (D32). Captured here, at checkout, from a lookup that was
-    # already happening.
-    restaurant = deps.restaurant_service.verify_restaurant(
-        payload.restaurant_id, current_user
-    )
-
-    # (e) The order and the opening 'created' entry of its audit trail commit together —
-    # same database, one transaction. There is no window in which one exists without the
-    # other, which is what the cross-service HTTP log call could never promise.
-    order = deps.orders.create(
-        payload, current_user.user_id, items_snapshot, total, x_idempotency_key
-    )
-
-    # (f) The order exists; the saga runs it from here.
-    await deps.orchestrator_service.start_saga(order, restaurant)
-
-    return ok(OrderResponse(**order), message="Order placed", status=201)
+    return ok(OrderResponse(**result["order"]), message="Order placed", status=201)
 
 
 @router.get("/{order_id}", response_model=Envelope[OrderResponse])

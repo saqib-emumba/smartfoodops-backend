@@ -16,7 +16,6 @@ import psycopg2
 from fastapi import HTTPException
 
 from common.errors import conflict
-from common.outbox import append_outbox
 from common.postgres import constraint_of
 from common.repository import Repository
 from payment.schemas.payments import PaymentAuthorizeRequest, PaymentCreateRequest
@@ -96,63 +95,34 @@ class PaymentRepository(Repository):
     def mark_authorized(self, payment_id: UUID, reference: str) -> dict:
         """Record the gateway's verdict against the row that claimed the key.
 
-        Was a single-statement `write_one`; now an explicit transaction so the
-        `payment.authorized` outbox row commits atomically with the status change (D39) —
-        the same argument D24 made for order_tracking_logs, applied to this table's first
-        outbox write. `authorise()` only reaches this method on the non-replay path (it
-        returns early on a replay before ever calling here), so "emit once per real
-        authorisation" falls out of the existing call structure rather than needing a
-        second guard here.
+        No outbox row here any more (D53): `payment.authorized` reaches Kafka via a
+        `publish_payment_event_activity` the order saga's workflow calls right after this
+        write — an independently-retried Temporal activity, not a second write in this same
+        transaction. See readme/outbox-removal-temporal-design.md.
         """
         with self._db.cursor(commit=True) as cur:
             cur.execute(_MARK_AUTHORIZED, (reference, str(payment_id)))
-            payment = self._row(cur.fetchone())
-            append_outbox(
-                cur,
-                table="payment_outbox",
-                aggregate_type="payment",
-                aggregate_id=payment["order_id"],
-                event_type="payment.authorized",
-                payload={
-                    "payment_id": str(payment["id"]),
-                    "order_id": str(payment["order_id"]),
-                    "amount": payment["amount"],
-                    "transaction_reference": payment["transaction_reference"],
-                },
-            )
-            return payment
+            return self._row(cur.fetchone())
 
     def mark_refunded(self, order_id: UUID, reference: str) -> dict | None:
         """Move an order's payment to `refunded`, if it is in a state that can be.
 
         Returns None when nothing was refundable — either there is no payment, or it is
         already `refunded`. The caller distinguishes those, because the second is success
-        for a compensating action and the first is worth saying out loud. The outbox row
-        is written only in the branch that actually changed something — a payment already
-        `refunded` reaches this method's *caller*'s "no-op" path, never this one, so a
-        second refund attempt (Temporal retries the compensating activity) cannot double-
-        emit.
+        for a compensating action and the first is worth saying out loud.
+
+        No outbox row here either (D53): `payment.refunded` reaches Kafka via a
+        `publish_payment_event_activity` call chained after `OrderWorkflow._compensate`'s
+        refund activity, guarded the same way the outbox row used to be — a payment already
+        `refunded` returns `None` here and reaches this method's *caller*'s no-op path,
+        never generating a second publish.
         """
         with self._db.cursor(commit=True) as cur:
             cur.execute(_MARK_REFUNDED, (reference, str(order_id)))
             row = cur.fetchone()
             if row is None:
                 return None
-            payment = self._row(row)
-            append_outbox(
-                cur,
-                table="payment_outbox",
-                aggregate_type="payment",
-                aggregate_id=order_id,
-                event_type="payment.refunded",
-                payload={
-                    "payment_id": str(payment["id"]),
-                    "order_id": str(payment["order_id"]),
-                    "amount": payment["amount"],
-                    "transaction_reference": payment["transaction_reference"],
-                },
-            )
-            return payment
+            return self._row(row)
 
     def _duplicate(
         self,

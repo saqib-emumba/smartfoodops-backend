@@ -15,7 +15,6 @@ import psycopg2
 from psycopg2.extras import Json
 
 from common.errors import conflict
-from common.outbox import append_outbox
 from common.postgres import PostgresPool
 from common.repository import Repository
 from order.repositories.sql import (
@@ -121,16 +120,34 @@ class OrderRepository(Repository):
 
     def create(
         self,
+        order_id: UUID,
         payload: OrderCreateRequest,
         customer_id: UUID,
         items_snapshot: list[dict],
         total: Decimal,
         idempotency_key: str,
-    ) -> dict:
+    ) -> tuple[dict, bool]:
         """Insert an order and open its audit trail in one transaction.
 
-        `customer_id` is passed separately because it comes from the access token rather
-        than the request body — see api/checkout.py.
+        `order_id` arrives from the caller rather than the column's own default
+        (order-creation-temporal-update-design.md ss3): it is derived deterministically from
+        `(customer_id, idempotency_key)` before this is ever called, so the Temporal Update
+        that runs this can be addressed by an id nobody has generated yet. `customer_id` is
+        passed separately because it comes from the access token rather than the request
+        body — see apis/internal_orders.py.
+
+        Returns `(order, created)`. `created` is False when two concurrent requests for the
+        same `(customer_id, idempotency_key)` both reached this method before either
+        committed (D53 ss4, possible now that creation runs inside a workflow Update instead
+        of one synchronous call): both derive the same `order_id`, so the loser's insert
+        collides on the primary key rather than `idempotency_key`, and re-selecting the row
+        the winner just committed is the correct answer, not an error — the same
+        `201`-first/`200`-after semantics ([D08](../../readme/key-decisions.md#d08--idempotency-keys-are-mandatory-and-a-replay-answers-200))
+        this endpoint already gives an ordinary replay. A genuine cross-customer collision on
+        `idempotency_key` alone (two different customers, same literal key string) still
+        cannot happen here: two different customers never derive the same `order_id` to begin
+        with, so this method never even sees that race — the database's own unique
+        constraint on `idempotency_key` is what would catch that, at the caller.
 
         The `created` entry used to be an HTTP call to the Menu Service made after the
         commit, which could only ever be best-effort: the order already existed, so a
@@ -144,6 +161,7 @@ class OrderRepository(Repository):
                 cur.execute(
                     INSERT_ORDER,
                     (
+                        str(order_id),
                         str(customer_id),
                         str(payload.restaurant_id),
                         total,
@@ -151,7 +169,15 @@ class OrderRepository(Repository):
                     ),
                 )
             except psycopg2.errors.UniqueViolation as exc:
-                # Concurrent submission won the race for this key.
+                # Same order_id (a same-customer race, converged below) or the same literal
+                # idempotency_key chosen by a different customer (a genuine collision, since
+                # two different customers never derive the same order_id to race on).
+                cur.execute(SELECT_BY_ID, (str(order_id),))
+                existing = cur.fetchone()
+                if existing is not None and str(existing["customer_id"]) == str(customer_id):
+                    self._logger.info("Concurrent replay for order %s", order_id)
+                    self._attach_items([existing])
+                    return existing, False
                 self._logger.info("Concurrent replay for key %s", idempotency_key)
                 raise conflict(
                     "An order with this idempotency key is already being processed"
@@ -159,10 +185,9 @@ class OrderRepository(Repository):
             order = cur.fetchone()
 
             # Same transaction as the order itself: an order without its line items cannot
-            # exist, the same guarantee D24/D39 already give the trail row and the outbox
-            # row below. Already have `items_snapshot` in hand, so the row handed back to
-            # the caller is built from it directly rather than re-read from what was just
-            # written.
+            # exist, the same guarantee D24 already gives the trail row below. Already have
+            # `items_snapshot` in hand, so the row handed back to the caller is built from
+            # it directly rather than re-read from what was just written.
             for line_no, item in enumerate(items_snapshot):
                 cur.execute(
                     INSERT_LINE_ITEM,
@@ -210,28 +235,11 @@ class OrderRepository(Repository):
                 },
             )
 
-            # Same transaction as the insert and the trail row above (D39) — an order
-            # without an `order.created` outbox row cannot exist, the same guarantee D24
-            # already gives order_tracking_logs. Items are left out of the payload
-            # deliberately: they can be large, and a consumer that needs them can read
-            # GET /api/v1/orders/{id} — the outbox carries the facts a consumer reacts to,
-            # not a full copy of the row.
-            append_outbox(
-                cur,
-                table="order_outbox",
-                aggregate_type="order",
-                aggregate_id=order["id"],
-                event_type="order.created",
-                payload={
-                    "order_id": str(order["id"]),
-                    "customer_id": str(order["customer_id"]),
-                    "restaurant_id": str(order["restaurant_id"]),
-                    "total_amount": order["total_amount"],
-                    "status": order["status"],
-                    "items_count": len(order["items"]),
-                },
-            )
-            return order
+            # No outbox row here any more (D53): `order.created` reaches Kafka via a
+            # `publish_order_event_activity` the workflow's `create_order` Update handler
+            # calls right after this method returns, which re-reads the row fresh over
+            # `GET /orders/{id}/internal` — see orchestrator/activities/order.py.
+            return order, True
 
     def transition(
         self,
@@ -315,31 +323,12 @@ class OrderRepository(Repository):
                 },
             )
 
-            # Gated on the exact same branch as the trail row above — the CAS above this
-            # block already guarantees `changed` (this branch) fires once per logical
-            # transition regardless of how many times Temporal retries the activity, so
-            # this inherits that guarantee for free rather than re-deriving it (D39).
-            # `new_status` names the event type directly: order.confirmed, order.assigned,
-            # order.picked_up, order.delivered, order.cancelled (D40) — the last of those
-            # carries the saga's compensation reason via `metadata`, which is how a reason
-            # code recorded nowhere the orchestrator can write (it holds no outbox of its
-            # own, D38) still reaches Kafka.
-            append_outbox(
-                cur,
-                table="order_outbox",
-                aggregate_type="order",
-                aggregate_id=order_id,
-                event_type=f"order.{new_status}",
-                payload={
-                    "order_id": str(order_id),
-                    "new_status": new_status,
-                    "customer_id": str(updated["customer_id"]),
-                    "restaurant_id": str(updated["restaurant_id"]),
-                    "rider_id": str(updated["rider_id"]) if updated["rider_id"] else None,
-                    "total_amount": updated["total_amount"],
-                    "metadata": metadata or {},
-                },
-            )
+            # No outbox row here any more (D53): `order.<new_status>` reaches Kafka via a
+            # `publish_order_event_activity` the workflow calls right after this activity
+            # returns — chained as a second, independently-retried Temporal activity rather
+            # than a second write in this same transaction. `metadata` (the saga's
+            # compensation reason on `order.cancelled`, say — D38: the orchestrator holds no
+            # outbox of its own) travels with that second call instead of being written here.
             return updated, True
 
     def kitchen_queue(self, restaurant_id: UUID) -> list[dict]:
@@ -362,24 +351,12 @@ class OrderRepository(Repository):
             )
             decided = cur.fetchone()
             if decided is not None:
-                # No order_tracking_logs row exists for this write (DECIDE_KITCHEN never
-                # called append_log — see this method's own docstring), so the outbox is
-                # the only record of a kitchen decision anywhere outside `orders` itself.
-                # Guarded on `decided is not None` exactly like the trail row would be if
-                # one existed, for the same reason: a second accept on an already-decided
-                # order must not emit twice.
-                append_outbox(
-                    cur,
-                    table="order_outbox",
-                    aggregate_type="order",
-                    aggregate_id=order_id,
-                    event_type="order.kitchen.decided",
-                    payload={
-                        "order_id": str(order_id),
-                        "decision": decision,
-                        "restaurant_id": str(decided["restaurant_id"]),
-                    },
-                )
+                # No outbox row here any more (D53): `order.kitchen.decided` reaches Kafka
+                # via a `publish_order_event_activity` call the workflow's `kitchen_decision`
+                # Update handler makes right after this write — see
+                # orchestrator/workflows/order.py. `decided is not None` is still the guard
+                # that keeps a second accept on an already-decided order from publishing
+                # twice, the same role it played when the outbox write lived here directly.
                 return decided, True
             cur.execute(SELECT_BY_ID, (str(order_id),))
             return cur.fetchone(), False

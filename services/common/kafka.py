@@ -9,17 +9,37 @@ Kafka never imports this module and pays nothing for it.
 """
 
 import asyncio
+import json
 import logging
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 import httpx
 from aiokafka import AIOKafkaProducer
+from aiokafka.errors import KafkaError
 from opentelemetry import context as otel_context
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
+from common.errors import service_unavailable
 from common.events.envelope import EventEnvelope
 from common.events.order import EVENT_DATA_MODELS as ORDER_EVENT_MODELS
 from common.events.payment import EVENT_DATA_MODELS as PAYMENT_EVENT_MODELS
+
+# D53: every event this platform emits is keyed on `(aggregate_id, event_type)`, not
+# generated fresh per publish. Every write here fires its event type at most once per
+# aggregate (a status only visits `orders.status` once, D31's forward-only CAS), so this is
+# stable across Temporal's at-least-once activity retries — a `publish_..._activity` retried
+# after its first attempt already reached Kafka produces the exact same `event_id`, and
+# every consumer already dedups on it (D39's contract, unchanged by D53). Without this, a
+# retried publish activity would mint a fresh random id and a consumer would double-count it.
+EVENT_ID_NAMESPACE = uuid.UUID("7e2f8c3d-4a5b-4c6d-9e0f-1a2b3c4d5e6f")
+
+
+def deterministic_event_id(aggregate_id: str, event_type: str) -> uuid.UUID:
+    return uuid.uuid5(EVENT_ID_NAMESPACE, f"{aggregate_id}:{event_type}")
 
 _ALL_EVENT_MODELS: dict[str, tuple[type, int]] = {**ORDER_EVENT_MODELS, **PAYMENT_EVENT_MODELS}
 
@@ -169,9 +189,127 @@ class SchemaRegistryValidator:
 
 
 def _dump_schema(schema: dict) -> str:
-    import json
-
     return json.dumps(schema)
+
+
+def _json_default(value: Any) -> Any:
+    """`Decimal` shows up in every event payload here (D07) and the stdlib encoder has no
+    idea what to do with one — moved from the now-deleted `common/outbox.py` verbatim."""
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _encode(envelope: dict) -> bytes:
+    return json.dumps(envelope, default=_json_default).encode("utf-8")
+
+
+class KafkaGateway:
+    """A lazily-connected Kafka producer with a lifespan — D53's replacement for the
+    transactional outbox and its relay (`common/outbox.py`, deleted).
+
+    Where `OutboxRelay` polled a table for rows a request had already committed and kept
+    retrying each batch until Kafka accepted it, this publishes synchronously, on demand,
+    from an internal HTTP endpoint a Temporal activity calls after its own write activity
+    has already committed. The durability contract does not change — at-least-once, callers
+    dedup on `event_id` — only *where* the "this must reach Kafka" obligation is recorded:
+    Temporal's own workflow history now, not a database row. See
+    readme/outbox-removal-temporal-design.md.
+
+    One instance per service, constructed in `deps.py` exactly where `OutboxRelay` used to
+    be. `publish` raising is not a bug to catch here: the caller is always, transitively, a
+    Temporal activity with its own retry policy, and a `service_unavailable` propagating out
+    of this call is retried by Temporal until it succeeds — the whole point.
+    """
+
+    def __init__(
+        self,
+        *,
+        bootstrap_servers: str,
+        producer_name: str,
+        logger: logging.Logger,
+        schema_registry_url: str = "http://schema-registry:8081",
+    ):
+        self._bootstrap_servers = bootstrap_servers
+        self._producer_name = producer_name
+        self._logger = logger
+        self._producer: AIOKafkaProducer | None = None
+        self._schema_validator = SchemaRegistryValidator(schema_registry_url)
+        self._registration_task: asyncio.Task | None = None
+
+    @asynccontextmanager
+    async def lifespan(self, _=None):
+        """Compose alongside `PostgresPool.lifespan`, same shape `OutboxRelay.lifespan` had.
+
+        Registration is fired as a background task rather than awaited, for the exact reason
+        `OutboxRelay.lifespan` already documented: a slow or absent schema-registry at
+        startup must not add its own latency to this service coming up.
+        """
+        self._registration_task = asyncio.create_task(
+            self._schema_validator.register_all(), name=f"kafka-schema-registration-{self._producer_name}"
+        )
+        try:
+            yield
+        finally:
+            self._registration_task.cancel()
+            try:
+                await self._registration_task
+            except asyncio.CancelledError:
+                pass
+            if self._producer is not None:
+                await self._producer.stop()
+
+    async def _ensure_producer(self) -> AIOKafkaProducer:
+        if self._producer is not None:
+            return self._producer
+        producer = build_producer(self._bootstrap_servers)
+        await producer.start()
+        self._producer = producer
+        self._logger.info("Kafka producer connected (%s)", self._producer_name)
+        return producer
+
+    async def publish(
+        self,
+        topic: str,
+        *,
+        aggregate_type: str,
+        aggregate_id: str,
+        event_type: str,
+        payload: dict,
+        event_version: int = 1,
+    ) -> None:
+        """Validate and produce one event, blocking until the broker acks it.
+
+        `event_id` is derived, never generated — see `deterministic_event_id` above — so a
+        Temporal retry of the activity that calls this produces the identical event a
+        consumer may have already seen, rather than a new one it double-counts.
+        """
+        self._schema_validator.validate(event_type, event_version, payload)
+        envelope = {
+            "event_id": str(deterministic_event_id(aggregate_id, event_type)),
+            "event_type": event_type,
+            "event_version": event_version,
+            "aggregate_type": aggregate_type,
+            "aggregate_id": aggregate_id,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "producer": self._producer_name,
+            "data": payload,
+        }
+        try:
+            producer = await self._ensure_producer()
+            await producer.send_and_wait(
+                topic, key=aggregate_id.encode("utf-8"), value=_encode(envelope)
+            )
+        except KafkaError as exc:
+            # Same reasoning `OutboxRelay` already applied: a broker-side failure invalidates
+            # the producer's internal state under idempotence, so the next call rebuilds it
+            # rather than reusing one that may be in an unknown state.
+            if self._producer is not None:
+                await self._producer.stop()
+            self._producer = None
+            raise service_unavailable(
+                f"Kafka is unreachable; {event_type} was not published"
+            ) from exc
 
 
 __all__ = [
@@ -180,4 +318,6 @@ __all__ = [
     "extract_trace_context",
     "SchemaRegistryValidator",
     "EventEnvelope",
+    "KafkaGateway",
+    "deterministic_event_id",
 ]

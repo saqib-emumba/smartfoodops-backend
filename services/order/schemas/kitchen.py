@@ -27,6 +27,14 @@ class KitchenOrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class KitchenDecisionRequest(BaseModel):
+    """What `POST /orders/{id}/internal/kitchen-decision` takes (D53) — the write
+    `decide_kitchen_activity` performs after the `kitchen_decision` Temporal Update it backs
+    has already replaced `kitchen.py`'s old direct write-then-best-effort-signal."""
+
+    decision: str
+
+
 class KitchenDecisionResponse(BaseModel):
     """The outcome of an accept or reject.
 

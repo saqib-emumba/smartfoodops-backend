@@ -531,11 +531,17 @@ services:
     environment:
       <<: [*payment-db-env, *jwt-env]
       ORDER_SERVICE_URL: http://order-service:8004
+      # D53: the direct/manual payment endpoint now runs behind ManualPaymentWorkflow, so
+      # this service holds a Temporal client for the first time — same pattern order-service
+      # and rider-service already use (D47).
+      TEMPORAL_ADDRESS: temporal-server:7233
       # See order-service's own comment: no depends_on for kafka on purpose (Week 3, D39).
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-payment-postgres:
+        condition: service_healthy
+      temporal-server:
         condition: service_healthy
     networks:
       - smartfoodops-network

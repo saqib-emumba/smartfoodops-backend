@@ -13,15 +13,16 @@ it; `common.temporal.SagaClient` names workflows by string instead, so the clien
 without the imports that made it a problem. `orchestrator_service` below is now a thin
 wrapper over that rather than an HTTP client — same name, same methods, same callers.
 
-`outbox_relay` is Week 3's addition (D39): it publishes `order_outbox` rows to Kafka in the
-background. Its own lifespan is composed alongside `db.lifespan` in main.py — see that
-file's comment on why one relay per table, in-process, was chosen over a sidecar.
+`kafka` replaces Week 3's `outbox_relay` (D39 -> D53): rather than a background relay polling
+`order_outbox` for rows a request already committed, this is a lazily-connected producer that
+`apis/internal_events.py` calls synchronously, on demand, from a Temporal activity. Its own
+lifespan is composed alongside `db.lifespan` in main.py, same shape `outbox_relay.lifespan`
+had — see `common.kafka.KafkaGateway` for why there is no table or polling loop left at all.
 """
 
 from common.bootstrap import bootstrap
 from common.config import DEFAULT_TEMPORAL_ADDRESS, service_url
-from common.events.topics import ORDER_EVENTS_TOPIC
-from common.outbox import OutboxRelay
+from common.kafka import KafkaGateway
 from common.temporal import SagaClient, TemporalGateway
 from order.clients.menu import MenuServiceClient
 from order.clients.orchestrator import OrchestratorClient
@@ -50,10 +51,7 @@ restaurant_service = RestaurantServiceClient(logger)
 temporal = TemporalGateway(TEMPORAL_ADDRESS, logger=logger)
 orchestrator_service = OrchestratorClient(SagaClient(temporal, logger=logger), logger=logger)
 
-outbox_relay = OutboxRelay(
-    db,
-    table="order_outbox",
-    topic=ORDER_EVENTS_TOPIC,
+kafka = KafkaGateway(
     bootstrap_servers=service_url("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092"),
     schema_registry_url=service_url("SCHEMA_REGISTRY_URL", "http://schema-registry:8081"),
     producer_name=SERVICE_NAME,

@@ -4,6 +4,12 @@
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
 
-# common.kafka + common.outbox (Week 3, D39) — same reasoning as order/requirements.txt.
+# common.kafka (D53, was common.outbox pre-D39-supersession) — same reasoning as
+# order/requirements.txt.
 aiokafka==0.14.0
 fastjsonschema==2.22.2
+
+# temporalio for ManualPaymentWorkflow (D53): the direct/manual payment endpoint now runs
+# behind Temporal, so this service needs a client for the first time — same pin every other
+# Temporal-holding service uses (D47).
+temporalio==1.31.0

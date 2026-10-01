@@ -50,3 +50,24 @@ class PaymentResponse(BaseModel):
     idempotency_key: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ManualPaymentRequest(BaseModel):
+    """`PaymentWorkflow`'s manual-mode payload (D53/outbox-removal-temporal-design.md ss4b).
+
+    `customer_id`/`customer_roles` reconstruct the `CurrentUser` this write needs to run the
+    same ownership check `process_payment` always ran as the caller — D52's "a sibling
+    asserting an identity it already holds" model, applied to a workflow argument instead of
+    an HTTP header, the same way `OrderInternalCreateRequest` already does on the order side.
+    """
+
+    order_id: UUID
+    amount: float = Field(..., gt=0.0)
+    idempotency_key: str = Field(..., min_length=1)
+    customer_id: UUID
+    customer_roles: list[str]
+
+
+class ManualPaymentResult(BaseModel):
+    payment: PaymentResponse
+    created: bool

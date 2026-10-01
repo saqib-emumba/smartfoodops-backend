@@ -4,8 +4,8 @@ the Prometheus metrics `/metrics` serves in sync (Week 3, D40).
 Runs as a lifespan-managed background task with its own reconnect loop — not the
 blueprint's fire-and-forget daemon thread, which died silently on the first connection
 error and left the service reporting healthy with a permanently dead consumer. A
-`KafkaConnectionError` here is caught, logged, and retried on the same cadence as the
-outbox relay's own reconnect loop in `common/outbox.py`.
+`KafkaConnectionError` here is caught, logged, and retried on the same cadence
+`common.kafka.KafkaGateway` (D53) uses on the producing side.
 """
 
 import asyncio

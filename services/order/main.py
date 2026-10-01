@@ -9,16 +9,17 @@ Menu Service's published menu.
 The customer and restaurant an order names live in other services' databases, so they are
 verified over HTTP before the insert — see clients/.
 
-This module is the composition root: it builds the app and mounts the six routers.
-Singletons live in deps.py, the saga hand-off in clients/orchestrator.py, and the routes
-are grouped by domain area in apis/.
+This module is the composition root: it builds the app and mounts the routers. Singletons
+live in deps.py, the saga hand-off in clients/orchestrator.py, and the routes are grouped by
+domain area in apis/.
 
-Three lifespans now. D36 took this down to one; Week 3's outbox relay made it two; D47
-brings the Temporal client back as the third. `db.lifespan` holds the connection pool,
-`deps.outbox_relay.lifespan` (D39) publishes `order_outbox` rows to Kafka in the background,
-and `deps.temporal.lifespan` connects the client this service starts and signals sagas with
-— log-and-swallow on failure, because orders must stay creatable and readable when Temporal
-is down.
+Three lifespans. D36 took this down to one; Week 3's outbox relay made it two; D47 brought
+the Temporal client back as the third. D53 keeps it at three but swaps what the second one
+is: `db.lifespan` holds the connection pool, `deps.kafka.lifespan` connects the producer
+`apis/internal_events.py` publishes through (replacing `outbox_relay.lifespan`), and
+`deps.temporal.lifespan` connects the client this service creates orders and records kitchen
+decisions through — log-and-swallow on failure, because reads must stay up when Temporal is
+down even though, since D53, writes cannot.
 """
 
 from fastapi import FastAPI
@@ -27,13 +28,21 @@ from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from order import deps
-from order.apis import checkout, health, kitchen, rider_reports, tracking, transitions
+from order.apis import (
+    checkout,
+    health,
+    internal_events,
+    internal_kitchen,
+    internal_orders,
+    kitchen,
+    rider_reports,
+    tracking,
+    transitions,
+)
 
 app = FastAPI(
     title="SmartFoodOps Order Service",
-    lifespan=compose_lifespan(
-        deps.db.lifespan, deps.outbox_relay.lifespan, deps.temporal.lifespan
-    ),
+    lifespan=compose_lifespan(deps.db.lifespan, deps.kafka.lifespan, deps.temporal.lifespan),
 )
 install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)
@@ -47,6 +56,9 @@ app.include_router(kitchen.router)
 app.include_router(rider_reports.router)
 app.include_router(tracking.router)
 app.include_router(transitions.router)
+app.include_router(internal_orders.router)
+app.include_router(internal_events.router)
+app.include_router(internal_kitchen.router)
 
 
 if __name__ == "__main__":

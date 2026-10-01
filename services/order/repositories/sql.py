@@ -28,9 +28,14 @@ SELECT_BY_ID = f"SELECT {_COLUMNS} FROM orders WHERE id = %s"
 
 SELECT_BY_KEY = f"SELECT {_COLUMNS} FROM orders WHERE idempotency_key = %s"
 
+# `id` is supplied explicitly rather than left to the column's own `DEFAULT
+# uuid_generate_v4()` (D53/order-creation-temporal-update-design.md ss3): the caller derives
+# it deterministically, before Temporal or Postgres has heard of the order, so the workflow
+# it starts can be addressed by an id nothing has generated yet. The default stays declared
+# on the column as a harmless fallback for any caller that does not supply one.
 INSERT_ORDER = f"""
-    INSERT INTO orders (customer_id, restaurant_id, total_amount, status, idempotency_key)
-    VALUES (%s, %s, %s, 'created', %s)
+    INSERT INTO orders (id, customer_id, restaurant_id, total_amount, status, idempotency_key)
+    VALUES (%s, %s, %s, %s, 'created', %s)
     RETURNING {_COLUMNS}
 """
 

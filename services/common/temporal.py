@@ -15,18 +15,110 @@ thing this module owns. That is what makes starting a saga idempotent: two attem
 order compute the same id, and Temporal is then the thing that refuses the duplicate.
 """
 
+import uuid
 from contextlib import asynccontextmanager
 from logging import Logger
 from uuid import UUID
 
-from temporalio.client import Client
+from temporalio.client import (
+    Client,
+    WithStartWorkflowOperation,
+    WorkflowFailureError,
+    WorkflowUpdateFailedError,
+)
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
+from temporalio.exceptions import ApplicationError
 from temporalio.service import RPCError, RPCStatusCode
 
-from common.errors import conflict, not_found, service_unavailable
+from common.errors import (
+    bad_gateway,
+    bad_request,
+    conflict,
+    forbidden,
+    internal_error,
+    not_found,
+    service_unavailable,
+    unauthorized,
+    unprocessable,
+)
+
+# D53/D54: an activity that fails non-retryably tags its `ApplicationError` with one of these
+# `type=` strings (see orchestrator/activities/order.py and activities/payment.py) so the
+# client-side unwrap below can recover the actual business status instead of the generic
+# "Activity task failed" every wrapping layer (ActivityError, then
+# WorkflowUpdateFailedError/WorkflowFailureError) would otherwise report if just stringified.
+_ERROR_TYPE_STATUS = {
+    "OrderCreateRejected": unprocessable,
+    "OrderCreateConflict": conflict,
+    "ManualPaymentRejected": unprocessable,
+    "ManualPaymentConflict": conflict,
+}
+
+# The generic fallback: an activity that catches a plain `HTTPException` it has no
+# more specific type for tags it `http_<status>` (see e.g.
+# orchestrator/activities/order.py::create_order_activity's final `except HTTPException`)
+# rather than dropping the status code on the floor. Covers cases a `passthrough` dict
+# wasn't written for — a 403 from an ownership check three services away from the one
+# that started this Update, a 404 for "no menu published yet" — without needing a new named
+# exception type for every status a downstream call could plausibly answer with.
+_HTTP_STATUS_FACTORIES = {
+    400: bad_request,
+    401: unauthorized,
+    403: forbidden,
+    404: not_found,
+    409: conflict,
+    422: unprocessable,
+    500: internal_error,
+    502: bad_gateway,
+    503: service_unavailable,
+}
+
+
+def _status_factory(error_type: str | None):
+    if error_type in _ERROR_TYPE_STATUS:
+        return _ERROR_TYPE_STATUS[error_type]
+    if error_type and error_type.startswith("http_"):
+        try:
+            return _HTTP_STATUS_FACTORIES.get(int(error_type[len("http_") :]))
+        except ValueError:
+            return None
+    return None
+
+
+def _find_application_error(exc: BaseException) -> ApplicationError | None:
+    """Walk an exception's `.cause` chain for the `ApplicationError` an activity actually
+    raised. Temporal wraps it in at least one layer (an `ActivityError` inside the workflow,
+    then a `WorkflowUpdateFailedError`/`WorkflowFailureError` on the client) by the time it
+    reaches here, and `str()` on those wrapper types says only "Activity task failed"."""
+    seen: BaseException | None = exc
+    for _ in range(6):
+        if isinstance(seen, ApplicationError):
+            return seen
+        seen = getattr(seen, "cause", None)
+        if seen is None:
+            return None
+    return None
+
+
+def _raise_mapped(exc: BaseException, *, default) -> None:
+    """Re-raise `exc` as the HTTP exception its underlying `ApplicationError.type` maps to,
+    falling back to `default(str(exc))` when there's no recognised type — an unexpected
+    failure shape, still worth reporting as *something* rather than a raw 500."""
+    found = _find_application_error(exc)
+    if found is not None:
+        factory = _status_factory(found.type) or default
+        raise factory(found.message or str(found)) from exc
+    raise default(str(exc)) from exc
 
 WORKFLOW_ID_PREFIX = "order-"
+
+# D53: the order-creation Update handler derives `order_id` from `(customer_id,
+# idempotency_key)` before Postgres or Temporal has ever heard of the order — see
+# readme/order-creation-temporal-update-design.md ss3. A fixed namespace UUID (arbitrary,
+# generated once) is what makes uuid5 deterministic across processes and restarts; changing
+# it would silently re-derive every future order id.
+ORDER_ID_NAMESPACE = uuid.UUID("5b1f5a3a-6b7b-4b3e-8a7a-3a2b6b6e2f1a")
 
 
 def workflow_id(entity: str, entity_id: UUID | str) -> str:
@@ -53,6 +145,47 @@ def workflow_id_for(order_id: UUID | str) -> str:
     here orphans every workflow already in flight.
     """
     return workflow_id(WORKFLOW_ID_PREFIX.rstrip("-"), order_id)
+
+
+# D55 (mentor's child-workflow split): OrderWorkflow's payment, rider and compensation
+# steps each moved into their own workflow type, started as a child of the order saga. Each
+# gets its own deterministic id, addressed the same way `workflow_id_for` already addresses
+# OrderWorkflow itself — one entity, one prefix, one function, so the service that starts a
+# child and (for `rider`) the sibling that signals it later can never disagree about its
+# name.
+def payment_workflow_id_for(order_id: UUID | str) -> str:
+    """`PaymentWorkflow`'s id for the order saga's own authorisation step."""
+    return workflow_id("payment", order_id)
+
+
+def manual_payment_workflow_id_for(order_id: UUID | str) -> str:
+    """`PaymentWorkflow`'s id for the direct/manual endpoint (`process_payment`, D30) —
+    deliberately a *different* id than `payment_workflow_id_for` addresses, even though both
+    start the same workflow type.
+
+    Tried sharing one id across both paths first: once the saga's `PaymentWorkflow`
+    execution under `payment-<id>` had completed, a later manual attempt against that same
+    id came back as that *original* execution's result — the saga's authorised amount, not
+    whatever the manual request actually asked to charge — rather than genuinely starting
+    a fresh run. Whatever policy would make "start under a completed id" behave like a true
+    restart is not the default here, so two entity-distinct ids sidestep the question
+    entirely: each path only ever addresses an execution it started itself. D30's real
+    protection against double-paying one order was always the database's own
+    `UNIQUE(order_id)` constraint, never the workflow id — that still holds unchanged."""
+    return workflow_id("payment-manual", order_id)
+
+
+def rider_workflow_id_for(order_id: UUID | str) -> str:
+    """`RiderWorkflow`'s id. The Rider Service signals pickup/delivery directly into this
+    workflow now — see `services/rider/fleet.py::report_event` — not into `OrderWorkflow`,
+    which no longer holds `rider_pickup`/`rider_delivery` signal handlers at all."""
+    return workflow_id("rider", order_id)
+
+
+def compensation_workflow_id_for(order_id: UUID | str) -> str:
+    """`CompensationWorkflow`'s id — started at most once per order, by `OrderWorkflow`
+    itself, whenever the saga cannot proceed."""
+    return workflow_id("compensation", order_id)
 
 
 class TemporalGateway:
@@ -178,6 +311,28 @@ class SagaClient:
         self._logger.info("Saga %s running (%s)", handle.id, workflow)
         return handle.id
 
+    async def run(self, workflow: str, *, task_queue: str, wf_id: str, payload: dict) -> dict:
+        """Start a workflow and wait for it to finish, returning its result.
+
+        For a short, self-contained workflow with no saga to keep running after the request
+        returns (`PaymentWorkflow`'s manual mode, D53/D55) — unlike `start`, which only
+        hands back a workflow id because the order saga is meant to outlive the request
+        that started it.
+        """
+        if not self._gateway.connected:
+            raise service_unavailable("Temporal is unreachable; the payment was not processed")
+
+        try:
+            return await self._gateway.client.execute_workflow(
+                workflow,
+                payload,
+                id=wf_id,
+                task_queue=task_queue,
+                id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+            )
+        except WorkflowFailureError as exc:
+            _raise_mapped(exc, default=conflict)
+
     async def signal(self, wf_id: str, signal: str, payload: dict | None = None) -> None:
         """Relay one event into a running workflow.
 
@@ -215,3 +370,64 @@ class SagaClient:
             if exc.status is RPCStatusCode.NOT_FOUND:
                 raise not_found(f"Saga {wf_id} is not running") from exc
             raise conflict(f"The saga {wf_id} would not answer query '{query}'") from exc
+
+    async def update(self, wf_id: str, update: str, payload: dict) -> dict:
+        """Send a Temporal Update into an already-running workflow and wait for its result.
+
+        Unlike `signal`, this is not best-effort: an Update is a synchronous RPC with a
+        return value, so a caller that needs to know the outcome (D53's kitchen-decision
+        Update, replacing a write-then-best-effort-signal) uses this instead of `signal`.
+        """
+        if not self._gateway.connected:
+            raise service_unavailable(f"Temporal is unreachable; '{update}' was not recorded")
+
+        handle = self._gateway.client.get_workflow_handle(wf_id)
+        try:
+            return await handle.execute_update(update, payload)
+        except WorkflowUpdateFailedError as exc:
+            _raise_mapped(exc, default=conflict)
+        except RPCError as exc:
+            if exc.status is RPCStatusCode.NOT_FOUND:
+                raise not_found(
+                    f"Saga {wf_id} is not running; it may have already finished or been "
+                    "cancelled"
+                ) from exc
+            self._logger.error("Could not send update '%s' to saga %s: %s", update, wf_id, exc)
+            raise conflict(f"The saga {wf_id} would not accept update '{update}'") from exc
+
+    async def start_with_update(
+        self,
+        workflow: str,
+        *,
+        task_queue: str,
+        wf_id: str,
+        update: str,
+        update_payload: dict,
+    ) -> dict:
+        """Update-with-Start (D53/the order-creation design): atomically start a workflow if
+        it is not already running, deliver an Update to it, and block for the Update's
+        result — one round trip for "the order exists and the saga is running", instead of
+        an insert followed by a separate, best-effort saga start (D25).
+
+        `USE_EXISTING` is what makes a retried request safe: it routes the Update to the
+        workflow already running under this id rather than starting a duplicate, exactly as
+        `start()` already relies on for a retried checkout.
+        """
+        if not self._gateway.connected:
+            raise service_unavailable("Temporal is unreachable; the order was not created")
+
+        start_operation = WithStartWorkflowOperation(
+            workflow,
+            args=[],
+            id=wf_id,
+            task_queue=task_queue,
+            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        )
+        try:
+            return await self._gateway.client.execute_update_with_start_workflow(
+                update,
+                args=[update_payload],
+                start_workflow_operation=start_operation,
+            )
+        except WorkflowUpdateFailedError as exc:
+            _raise_mapped(exc, default=conflict)

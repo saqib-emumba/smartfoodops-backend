@@ -1,7 +1,17 @@
 # SmartFoodOps — Entity Relationship Diagram
 
-Reflects the actual schema across all 7 physical databases (`db/*/init.sql`) as of Week 3 —
-see [readme/key-decisions.md](../key-decisions.md) for the D-numbers cited inline below.
+Reflects the actual schema across all 7 physical databases (`db/*/init.sql`), including D53
+(the transactional outbox tables are removed) — see
+[readme/key-decisions.md](../key-decisions.md) for the D-numbers cited inline below.
+
+> **`order_outbox`/`payment_outbox` are gone (D53).** Publishing moved to a Temporal
+> activity each write chains itself to, with workflow history as the durability ledger
+> instead of a `published_at IS NULL` row — see
+> [readme/outbox-removal-temporal-design.md](../outbox-removal-temporal-design.md). The
+> dedup key `PROCESSED_EVENTS` keys on is no longer an outbox row's own `id`; it is now
+> derived deterministically from `(aggregate_id, event_type)`
+> (`common.kafka.deterministic_event_id`), which is why that relationship below reads
+> straight off `ORDERS`/`PAYMENTS` rather than through an intermediate outbox entity.
 
 ```mermaid
 erDiagram
@@ -28,13 +38,11 @@ erDiagram
     ORDERS ||--o{ ORDER_LINE_ITEMS : "has (real FK, ON DELETE CASCADE)"
     ORDER_LINE_ITEMS ||--o{ ORDER_LINE_ITEM_OPTIONS : "has (real FK, ON DELETE CASCADE)"
 
-    %% ---- Week 3: transactional outbox (same-db writes, no FK) ----
-    ORDERS ||--o{ ORDER_OUTBOX : "emits (same-db, order_outbox.aggregate_id)"
-    ORDERS ||--o{ PAYMENT_OUTBOX : "emits payment events (cross-db aggregate_id = order_id, by design)"
-
-    %% ---- Week 3: Kafka is the only thing connecting these -- no SQL relation exists ----
-    ORDER_OUTBOX ||--o{ PROCESSED_EVENTS : "deduped by consumer (via Kafka, logical)"
-    PAYMENT_OUTBOX ||--o{ PROCESSED_EVENTS : "deduped by consumer (via Kafka, logical)"
+    %% ---- D53: no outbox tables any more -- Kafka is the only thing connecting these,
+    %% no SQL relation exists. event_id is derived from (aggregate_id, event_type), not
+    %% read from a row, so the logical relation is drawn straight off the aggregate.
+    ORDERS ||--o{ PROCESSED_EVENTS : "deduped by consumer (via Kafka, logical, event_id derived)"
+    PAYMENTS ||--o{ PROCESSED_EVENTS : "deduped by consumer (via Kafka, logical, event_id derived)"
     ORDERS ||--o| ORDER_PROJECTIONS : "projected (via Kafka, logical, cross-db)"
 
     ROLES {
@@ -203,41 +211,9 @@ erDiagram
         timestamp updated_at
     }
 
-    ORDER_OUTBOX {
-        uuid id PK "Also the event's dedup key downstream"
-        bigserial seq "Claim order for the relay; NOT a resumable high-water cursor"
-        varchar aggregate_type "Default 'order'"
-        uuid aggregate_id "= orders.id = the Kafka partition key"
-        varchar event_type
-        smallint event_version
-        jsonb payload
-        text traceparent "Nullable -- W3C trace context captured at insert time"
-        text tracestate "Nullable"
-        timestamptz occurred_at
-        timestamptz published_at "Nullable -- NULL means unpublished; the relay's only WHERE clause"
-        int attempts
-        text last_error "Nullable"
-    }
-
-    PAYMENT_OUTBOX {
-        uuid id PK
-        bigserial seq
-        varchar aggregate_type "Default 'payment'"
-        uuid aggregate_id "= orders.id, NOT payments.id -- deliberate, so payment events share order_outbox's partition key"
-        varchar event_type
-        smallint event_version
-        jsonb payload
-        text traceparent "Nullable"
-        text tracestate "Nullable"
-        timestamptz occurred_at
-        timestamptz published_at "Nullable"
-        int attempts
-        text last_error "Nullable"
-    }
-
     PROCESSED_EVENTS {
         varchar consumer_group PK "Composite PK with event_id"
-        uuid event_id PK "= the outbox row's own id, stable across at-least-once redelivery"
+        uuid event_id PK "D53: deterministic from (aggregate_id, event_type), not an outbox row's id -- stable across at-least-once redelivery the same way, just derived instead of stored"
         varchar event_type
         timestamptz processed_at
     }

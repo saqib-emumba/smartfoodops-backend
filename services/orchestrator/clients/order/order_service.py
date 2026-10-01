@@ -40,6 +40,15 @@ class OrderGone(Exception):
     """The order no longer exists — the endpoint answered `404`."""
 
 
+class OrderCreateRejected(Exception):
+    """Item unavailable, a price mismatch, or an unknown restaurant — `422` (D53's
+    `create_order_activity`, backing `OrderWorkflow.create_order`)."""
+
+
+class OrderCreateConflict(Exception):
+    """The same idempotency key, claimed by a different customer — `409`."""
+
+
 class OrderServiceClient(ServiceFacade):
     display_name = "Order Service"
     env_var = "ORDER_SERVICE_URL"
@@ -86,5 +95,42 @@ class OrderServiceClient(ServiceFacade):
             missing=f"Order {order_id} no longer exists",
             missing_error=OrderGone,
             unreachable_hint="cannot read the order",
+            headers=internal_headers(),
+        )
+
+    def create(self, payload: dict) -> dict:
+        """D53: the write `OrderWorkflow.create_order`'s Update handler performs, via
+        `create_order_activity`. Returns `{order, created, capacity, restaurant_latitude,
+        restaurant_longitude}` — everything the rest of the saga needs, in one response."""
+        return self._client.post(
+            "/api/v1/orders/internal/create",
+            json=payload,
+            missing="Order creation endpoint not found",
+            unreachable_hint="cannot create the order",
+            headers=internal_headers(),
+            passthrough={409: OrderCreateConflict, 422: OrderCreateRejected},
+        )
+
+    def decide_kitchen(self, order_id: UUID | str, decision: str) -> dict:
+        """D53: the write behind `OrderWorkflow.kitchen_decision`'s Update handler.
+        Returns `{order_id, decision, status, changed}`."""
+        return self._client.post(
+            f"/api/v1/orders/{order_id}/internal/kitchen-decision",
+            json={"decision": decision},
+            missing=f"Order {order_id} no longer exists",
+            missing_error=OrderGone,
+            unreachable_hint="cannot record the kitchen's decision",
+            headers=internal_headers(),
+        )
+
+    def publish_event(self, order_id: UUID | str, *, event_type: str, data: dict) -> None:
+        """D53's replacement for an `order_outbox` insert: tell Kafka about a fact this
+        service has already committed. See `services/order/apis/internal_events.py`."""
+        self._client.post(
+            f"/api/v1/orders/{order_id}/internal/events",
+            json={"event_type": event_type, "data": data},
+            missing=f"Order {order_id} no longer exists",
+            missing_error=OrderGone,
+            unreachable_hint="cannot publish the event",
             headers=internal_headers(),
         )

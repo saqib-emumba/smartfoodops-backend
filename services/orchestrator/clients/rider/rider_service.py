@@ -1,7 +1,7 @@
-"""The order saga's fleet calls: dispatch and release, on the internal key.
+"""`RiderWorkflow`'s fleet calls: dispatch and release, on the internal key.
 
-Used only by activities/order.py — see clients/order/__init__.py for why the internal key
-rather than a forwarded bearer token.
+Moved verbatim from `clients/order/rider.py` (D55): the calls did not change, only which
+workflow's activities make them — see `activities/rider.py`.
 """
 
 from uuid import UUID

@@ -137,47 +137,11 @@ CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
     WHERE status = 'confirmed' AND kitchen_decision IS NULL;
 
 -- ============================================================================
--- Transactional outbox (Week 3, D39) — the relay's queue, not a second audit trail.
+-- No transactional outbox table here any more (D53, superseding Week 3's D39).
 --
--- order_tracking_logs already records every transition for a human reading the timeline;
--- this table exists only so a background relay (services/common/outbox.py) can publish
--- the same facts to Kafka without a second write after the commit. Written inside the
--- exact same `cursor(commit=True)` blocks that already write orders and
--- order_tracking_logs — see OrderRepository.create/transition/decide_kitchen — so an event
--- can never exist for a write that didn't happen, and vice versa (the D09/D24 argument,
--- applied again).
+-- order_outbox and its relay (services/common/outbox.py, deleted) were replaced by a
+-- publish activity every write below chains after itself: Temporal's own workflow history
+-- is the durability ledger now — a completed write activity followed by a retried-until-
+-- successful publish activity — not a `published_at IS NULL` row in this database. See
+-- readme/outbox-removal-temporal-design.md.
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS order_outbox (
-    -- Doubles as the event's dedup key on the consumer side (Kafka delivery here is
-    -- at-least-once: a relay crash between the broker ack and marking a row published
-    -- republishes it).
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    -- Claim order for the relay. NOT a resumable "last seq processed" cursor: BIGSERIAL
-    -- hands out values before commit, so a lower seq can commit after a higher one and be
-    -- skipped forever if the relay tracked a high-water mark instead of querying
-    -- published_at IS NULL directly.
-    seq BIGSERIAL NOT NULL,
-    aggregate_type VARCHAR(32) NOT NULL DEFAULT 'order',
-    aggregate_id UUID NOT NULL, -- == the Kafka partition key, so per-order ordering holds
-    event_type VARCHAR(64) NOT NULL,
-    event_version SMALLINT NOT NULL DEFAULT 1,
-    payload JSONB NOT NULL,
-    -- W3C trace context, captured from the request's own span at the moment this row is
-    -- inserted — not by the relay, which runs minutes later and would otherwise start an
-    -- orphan trace disconnected from the request that caused the write.
-    traceparent TEXT,
-    tracestate TEXT,
-    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    published_at TIMESTAMPTZ, -- NULL == unpublished; the relay's only WHERE clause
-    attempts INT NOT NULL DEFAULT 0,
-    last_error TEXT
-);
-
--- The relay's only query. Stays the size of the backlog rather than the size of history,
--- because nearly every row ends up published.
-CREATE INDEX IF NOT EXISTS idx_order_outbox_unpublished
-    ON order_outbox (seq) WHERE published_at IS NULL;
-
--- Lets a future admin/debug read ask "what has this order emitted so far?" without a scan.
-CREATE INDEX IF NOT EXISTS idx_order_outbox_aggregate
-    ON order_outbox (aggregate_id, seq);
