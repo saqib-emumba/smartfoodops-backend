@@ -16,7 +16,8 @@ Reflects the actual schema across all 7 physical databases (`db/*/init.sql`), in
 ```mermaid
 erDiagram
     %% ---- sfo_user_core ----
-    ROLES }o--o{ USERS : "grants_role_to (via USER_ROLES)"
+    USERS ||--o{ USER_ROLES : "has (real FK, ON DELETE CASCADE)"
+    ROLES ||--o{ USER_ROLES : "granted_via (real FK, ON DELETE RESTRICT)"
 
     %% ---- cross-database references, verified over HTTP, no engine FK ----
     USERS ||--o{ RESTAURANTS : "onboards / owns"
@@ -63,8 +64,8 @@ erDiagram
     }
 
     USER_ROLES {
-        uuid user_id FK "References USERS.id, ON DELETE CASCADE"
-        int role_id FK "References ROLES.id, ON DELETE RESTRICT"
+        uuid user_id PK, FK "Composite PK with role_id -- References USERS.id, ON DELETE CASCADE"
+        int role_id PK, FK "Composite PK with user_id -- References ROLES.id, ON DELETE RESTRICT"
         timestamp granted_at
     }
 
