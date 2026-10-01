@@ -182,7 +182,6 @@ erDiagram
     ORDER_LINE_ITEM_OPTIONS {
         uuid id PK
         uuid line_item_id FK "References ORDER_LINE_ITEMS.id, ON DELETE CASCADE"
-        varchar group_key "Nullable -- the customization group this option was chosen from"
         varchar name
         decimal extra_price
         smallint position

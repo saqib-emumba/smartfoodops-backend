@@ -50,8 +50,8 @@ INSERT_LINE_ITEM = """
 """
 
 INSERT_LINE_ITEM_OPTION = """
-    INSERT INTO order_line_item_options (line_item_id, group_key, name, extra_price, position)
-    VALUES (%(line_item_id)s, %(group_key)s, %(name)s, %(extra_price)s, %(position)s)
+    INSERT INTO order_line_item_options (line_item_id, name, extra_price, position)
+    VALUES (%(line_item_id)s, %(name)s, %(extra_price)s, %(position)s)
 """
 
 # Batched rather than one-row-at-a-time: kitchen_queue attaches items to many orders at
@@ -64,7 +64,7 @@ SELECT_LINE_ITEMS_FOR_ORDERS = """
 """
 
 SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS = """
-    SELECT line_item_id, group_key, name, extra_price
+    SELECT line_item_id, name, extra_price
       FROM order_line_item_options
      WHERE line_item_id = ANY(%(line_item_ids)s::uuid[])
      ORDER BY line_item_id, position

@@ -93,7 +93,6 @@ CREATE INDEX IF NOT EXISTS idx_order_line_items_order ON order_line_items(order_
 CREATE TABLE IF NOT EXISTS order_line_item_options (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     line_item_id UUID NOT NULL REFERENCES order_line_items(id) ON DELETE CASCADE,
-    group_key VARCHAR(255), -- the customization group this option was chosen from
     name VARCHAR(255) NOT NULL,
     extra_price DECIMAL(10, 2) NOT NULL DEFAULT 0.0,
     position SMALLINT NOT NULL DEFAULT 0 -- preserves the original selection order

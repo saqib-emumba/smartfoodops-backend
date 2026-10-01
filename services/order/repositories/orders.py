@@ -95,7 +95,6 @@ class OrderRepository(Repository):
         for option in option_rows:
             options_by_line_item.setdefault(str(option["line_item_id"]), []).append(
                 {
-                    "group_id": option["group_key"],
                     "name": option["name"],
                     "extra_price": float(option["extra_price"]),
                 }
@@ -208,7 +207,6 @@ class OrderRepository(Repository):
                         INSERT_LINE_ITEM_OPTION,
                         {
                             "line_item_id": line_item_id,
-                            "group_key": option.get("group_id"),
                             "name": option["name"],
                             "extra_price": option.get("extra_price", 0.0),
                             "position": option_position,

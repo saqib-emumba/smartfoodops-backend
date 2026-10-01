@@ -84,9 +84,7 @@ def _apply_customizations(
                 )
             extra = Decimal(str(option.get("extra_price", 0)))
             surcharge += extra
-            chosen_options.append(
-                {"group_id": group_id, "name": name, "extra_price": float(extra)}
-            )
+            chosen_options.append({"name": name, "extra_price": float(extra)})
 
     # A required group the client omitted entirely is just as invalid as an empty one.
     for group_id, group in groups.items():
