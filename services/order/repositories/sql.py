@@ -43,9 +43,9 @@ INSERT_ORDER = f"""
 # same write-once guarantee the JSONB column it replaced (D50) offered.
 INSERT_LINE_ITEM = """
     INSERT INTO order_line_items
-        (order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total, customizations)
+        (order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total)
     VALUES (%(order_id)s, %(line_no)s, %(menu_item_id)s, %(item_name)s,
-            %(quantity)s, %(unit_price)s, %(line_total)s, %(customizations)s)
+            %(quantity)s, %(unit_price)s, %(line_total)s)
     RETURNING id
 """
 
@@ -57,7 +57,7 @@ INSERT_LINE_ITEM_OPTION = """
 # Batched rather than one-row-at-a-time: kitchen_queue attaches items to many orders at
 # once, and a single find() is just the N=1 case of the same query.
 SELECT_LINE_ITEMS_FOR_ORDERS = """
-    SELECT id, order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total, customizations
+    SELECT id, order_id, line_no, menu_item_id, item_name, quantity, unit_price, line_total
       FROM order_line_items
      WHERE order_id = ANY(%(order_ids)s::uuid[])
      ORDER BY order_id, line_no

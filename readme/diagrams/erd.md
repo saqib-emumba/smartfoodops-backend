@@ -175,7 +175,6 @@ erDiagram
         int quantity "CHECK (quantity > 0)"
         decimal unit_price
         decimal line_total
-        jsonb customizations "Nullable raw customer selection echo -- a passthrough"
         timestamp created_at
     }
 

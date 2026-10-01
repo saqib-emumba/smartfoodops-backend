@@ -107,7 +107,6 @@ class OrderRepository(Repository):
                     "item_id": row["menu_item_id"],
                     "name": row["item_name"],
                     "quantity": row["quantity"],
-                    "customizations": row["customizations"],
                     "unit_price": float(row["unit_price"]),
                     "line_total": float(row["line_total"]),
                     "selected_options": options_by_line_item.get(str(row["id"]), []),
@@ -198,7 +197,6 @@ class OrderRepository(Repository):
                         "quantity": item["quantity"],
                         "unit_price": item["unit_price"],
                         "line_total": item["line_total"],
-                        "customizations": Json(item.get("customizations")),
                     },
                 )
                 line_item_id = cur.fetchone()["id"]

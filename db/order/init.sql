@@ -83,7 +83,6 @@ CREATE TABLE IF NOT EXISTS order_line_items (
     quantity INT NOT NULL CHECK (quantity > 0),
     unit_price DECIMAL(10, 2) NOT NULL,
     line_total DECIMAL(10, 2) NOT NULL,
-    customizations JSONB, -- raw customer selection echo; a passthrough, not an entity tree, so left as-is
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

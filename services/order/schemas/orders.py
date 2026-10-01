@@ -12,11 +12,22 @@ class OrderItemSelection(BaseModel):
     customizations: Optional[dict] = None  # To capture dynamic modifications
 
 
-class OrderItemSnapshot(OrderItemSelection):
+class OrderItemSnapshot(BaseModel):
     """Server-side priced line item, persisted into order_line_items/order_line_item_options
     (normalized out of a single orders.items JSONB column in D50) and reassembled into this
-    shape on read, so the API contract stays the same as it was on the JSONB column."""
+    shape on read, so the API contract stays the same as it was on the JSONB column.
 
+    Deliberately does not inherit `OrderItemSelection.customizations` — the raw customer-
+    submitted dict was persisted as a passthrough echo (`order_line_items.customizations`)
+    and returned alongside the resolved `selected_options` breakdown, but the two mostly
+    duplicated each other and the raw echo was removed at the mentor's direction. Its one
+    non-overlapping job — telling apart two identically-named options chosen from different
+    customization groups on the same item — went with it; `selected_options` already lost
+    the matching ability on the storage side when `order_line_item_options.group_key` was
+    removed, so this is an accepted, compounding narrowing of the same edge case."""
+
+    item_id: str
+    quantity: int
     name: Optional[str] = None
     unit_price: Optional[float] = None
     line_total: Optional[float] = None

@@ -110,7 +110,6 @@ def price_line(item: dict, selection: OrderItemSelection) -> tuple[dict, Decimal
         "item_id": selection.item_id,
         "name": item.get("name"),
         "quantity": selection.quantity,
-        "customizations": selection.customizations,
         "unit_price": float(unit_price),
         "line_total": float(line_total),
         "selected_options": chosen_options,
