@@ -1065,13 +1065,16 @@ section "Cross-service integration"
 # each one landed where it was supposed to, in the database only its owner can reach.
 if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^sfo-menu-db$'; then
   # Menus normalized out of a single JSONB column into relational tables in D50 — this
-  # grounds the same fact the old jsonb_array_length check did (the first category has 2
-  # items), now via the join publishing actually wrote.
+  # grounds the same fact the old jsonb_array_length check did (the "c1" category has 2
+  # items), now via the join publishing actually wrote. Matched by category_key, not an
+  # ordinal position column (removed at the mentor's direction) -- "c1" is the one and
+  # only category ever successfully published for $REST_ID (the one other publish attempt
+  # against it, above, is a deliberate 422 and never commits).
   STORED_ITEMS=$(docker exec sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core -tA \
     -c "SELECT count(*) FROM menu_items mi
           JOIN menu_categories mc ON mi.category_id = mc.id
           JOIN menus m ON mc.menu_id = m.id
-         WHERE m.restaurant_id = '$REST_ID' AND mc.position = 0;" 2>/dev/null | tr -d '\r')
+         WHERE m.restaurant_id = '$REST_ID' AND mc.category_key = 'c1';" 2>/dev/null | tr -d '\r')
   assert "  menu stored in sfo_menu_core as relational rows" "$STORED_ITEMS" "2"
 else
   printf '  %sSKIP%s  menu database check (docker/sfo-menu-db not reachable)\n' "$DIM" "$RESET"

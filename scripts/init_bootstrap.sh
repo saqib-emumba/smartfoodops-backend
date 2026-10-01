@@ -290,8 +290,7 @@ CREATE TABLE IF NOT EXISTS order_line_item_options (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     line_item_id UUID NOT NULL REFERENCES order_line_items(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
-    extra_price DECIMAL(10, 2) NOT NULL DEFAULT 0.0,
-    position SMALLINT NOT NULL DEFAULT 0 -- preserves the original selection order
+    extra_price DECIMAL(10, 2) NOT NULL DEFAULT 0.0
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_line_item_options_line_item ON order_line_item_options(line_item_id);
@@ -428,10 +427,6 @@ CREATE TABLE IF NOT EXISTS menu_categories (
     category_key VARCHAR(255) NOT NULL, -- client-supplied category_id, kept as a stable business key
     name VARCHAR(255) NOT NULL,
     display_order INT NOT NULL DEFAULT 1, -- the client's own field; not necessarily unique or gapless
-    -- Round-trips the exact order the tree was submitted in, independent of display_order
-    -- above (a data field the client controls, not a physical ordinal) — set from each
-    -- item/group/option's index in its parent array at publish time.
-    position SMALLINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -447,10 +442,6 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description TEXT,
     base_price DECIMAL(10, 2) NOT NULL CHECK (base_price > 0),
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
-    -- Flat scalar tag list, not a nested entity of its own (no attributes beyond the tag
-    -- name, never joined or aggregated across items) — an array column, not a sixth table.
-    dietary_flags TEXT[] NOT NULL DEFAULT '{}',
-    position SMALLINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -466,7 +457,6 @@ CREATE TABLE IF NOT EXISTS menu_item_customization_groups (
     min_selection INT NOT NULL DEFAULT 1 CHECK (min_selection >= 0),
     max_selection INT NOT NULL DEFAULT 1 CHECK (max_selection >= 1),
     CHECK (min_selection <= max_selection),
-    position SMALLINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -478,7 +468,6 @@ CREATE TABLE IF NOT EXISTS menu_item_customization_options (
     group_id UUID NOT NULL REFERENCES menu_item_customization_groups(id) ON DELETE CASCADE,
     name VARCHAR(255) NOT NULL,
     extra_price DECIMAL(10, 2) NOT NULL DEFAULT 0.0 CHECK (extra_price >= 0),
-    position SMALLINT NOT NULL DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 

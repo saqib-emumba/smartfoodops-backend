@@ -35,7 +35,6 @@ class MenuItem(BaseModel):
     description: str
     base_price: float = Field(..., gt=0.0)
     is_available: bool = True
-    dietary_flags: List[str] = []
     customization_groups: List[CustomizationGroup] = []
 
 

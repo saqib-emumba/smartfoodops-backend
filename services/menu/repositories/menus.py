@@ -30,57 +30,53 @@ _SELECT_MENU_BY_RESTAURANT = "SELECT id FROM menus WHERE restaurant_id = %s"
 _DELETE_CATEGORIES_FOR_MENU = "DELETE FROM menu_categories WHERE menu_id = %(menu_id)s"
 
 _INSERT_CATEGORY = """
-    INSERT INTO menu_categories (menu_id, category_key, name, display_order, position)
-    VALUES (%(menu_id)s, %(category_key)s, %(name)s, %(display_order)s, %(position)s)
+    INSERT INTO menu_categories (menu_id, category_key, name, display_order)
+    VALUES (%(menu_id)s, %(category_key)s, %(name)s, %(display_order)s)
     RETURNING id
 """
 
 _INSERT_ITEM = """
     INSERT INTO menu_items
-        (category_id, item_key, name, description, base_price, is_available, dietary_flags, position)
+        (category_id, item_key, name, description, base_price, is_available)
     VALUES (%(category_id)s, %(item_key)s, %(name)s, %(description)s, %(base_price)s,
-            %(is_available)s, %(dietary_flags)s, %(position)s)
+            %(is_available)s)
     RETURNING id
 """
 
 _INSERT_CUSTOMIZATION_GROUP = """
     INSERT INTO menu_item_customization_groups
-        (item_id, group_key, name, min_selection, max_selection, position)
-    VALUES (%(item_id)s, %(group_key)s, %(name)s, %(min_selection)s, %(max_selection)s, %(position)s)
+        (item_id, group_key, name, min_selection, max_selection)
+    VALUES (%(item_id)s, %(group_key)s, %(name)s, %(min_selection)s, %(max_selection)s)
     RETURNING id
 """
 
 _INSERT_CUSTOMIZATION_OPTION = """
-    INSERT INTO menu_item_customization_options (group_id, name, extra_price, position)
-    VALUES (%(group_id)s, %(name)s, %(extra_price)s, %(position)s)
+    INSERT INTO menu_item_customization_options (group_id, name, extra_price)
+    VALUES (%(group_id)s, %(name)s, %(extra_price)s)
 """
 
 _SELECT_CATEGORIES_FOR_MENU = """
     SELECT id, category_key, name, display_order
       FROM menu_categories
      WHERE menu_id = %s
-     ORDER BY position
 """
 
 _SELECT_ITEMS_FOR_CATEGORIES = """
-    SELECT id, category_id, item_key, name, description, base_price, is_available, dietary_flags
+    SELECT id, category_id, item_key, name, description, base_price, is_available
       FROM menu_items
      WHERE category_id = ANY(%(category_ids)s::uuid[])
-     ORDER BY position
 """
 
 _SELECT_GROUPS_FOR_ITEMS = """
     SELECT id, item_id, group_key, name, min_selection, max_selection
       FROM menu_item_customization_groups
      WHERE item_id = ANY(%(item_ids)s::uuid[])
-     ORDER BY position
 """
 
 _SELECT_OPTIONS_FOR_GROUPS = """
     SELECT group_id, name, extra_price
       FROM menu_item_customization_options
      WHERE group_id = ANY(%(group_ids)s::uuid[])
-     ORDER BY position
 """
 
 
@@ -99,9 +95,11 @@ class MenuRepository(Repository):
 
         Four queries, one per level, each batched over every id its parent level
         produced — not one query per row, which would cost a query per item on top of
-        one per category. `position` (set at publish time, see `upsert`) is what makes
-        this reconstruction order-faithful to whatever order the tree was submitted in,
-        independent of the client's own `display_order` field.
+        one per category. No ordering guarantee across categories/items/groups/options
+        any more: the `position` column that made this reconstruction order-faithful to
+        however the tree was originally submitted was removed, so a read may come back in
+        a different order than the one the tree was published in, and is not guaranteed
+        stable between two reads of the same unchanged data either.
         """
         category_rows = self.all(_SELECT_CATEGORIES_FOR_MENU, (menu_id,))
         category_ids = [row["id"] for row in category_rows]
@@ -148,7 +146,6 @@ class MenuRepository(Repository):
                     "description": row["description"],
                     "base_price": float(row["base_price"]),
                     "is_available": row["is_available"],
-                    "dietary_flags": list(row["dietary_flags"]),
                     "customization_groups": groups_by_item.get(str(row["id"]), []),
                 }
             )
@@ -181,7 +178,7 @@ class MenuRepository(Repository):
 
             cur.execute(_DELETE_CATEGORIES_FOR_MENU, {"menu_id": menu_id})
 
-            for category_position, category in enumerate(categories):
+            for category in categories:
                 cur.execute(
                     _INSERT_CATEGORY,
                     {
@@ -189,12 +186,11 @@ class MenuRepository(Repository):
                         "category_key": category["category_id"],
                         "name": category["category_name"],
                         "display_order": category["display_order"],
-                        "position": category_position,
                     },
                 )
                 category_id = cur.fetchone()["id"]
 
-                for item_position, item in enumerate(category["items"]):
+                for item in category["items"]:
                     cur.execute(
                         _INSERT_ITEM,
                         {
@@ -204,13 +200,11 @@ class MenuRepository(Repository):
                             "description": item["description"],
                             "base_price": item["base_price"],
                             "is_available": item["is_available"],
-                            "dietary_flags": item["dietary_flags"],
-                            "position": item_position,
                         },
                     )
                     item_id = cur.fetchone()["id"]
 
-                    for group_position, group in enumerate(item["customization_groups"]):
+                    for group in item["customization_groups"]:
                         cur.execute(
                             _INSERT_CUSTOMIZATION_GROUP,
                             {
@@ -219,19 +213,17 @@ class MenuRepository(Repository):
                                 "name": group["group_name"],
                                 "min_selection": group["min_selection"],
                                 "max_selection": group["max_selection"],
-                                "position": group_position,
                             },
                         )
                         group_id = cur.fetchone()["id"]
 
-                        for option_position, option in enumerate(group["options"]):
+                        for option in group["options"]:
                             cur.execute(
                                 _INSERT_CUSTOMIZATION_OPTION,
                                 {
                                     "group_id": group_id,
                                     "name": option["name"],
                                     "extra_price": option["extra_price"],
-                                    "position": option_position,
                                 },
                             )
 

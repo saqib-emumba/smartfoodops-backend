@@ -200,14 +200,13 @@ class OrderRepository(Repository):
                     },
                 )
                 line_item_id = cur.fetchone()["id"]
-                for option_position, option in enumerate(item.get("selected_options", [])):
+                for option in item.get("selected_options", []):
                     cur.execute(
                         INSERT_LINE_ITEM_OPTION,
                         {
                             "line_item_id": line_item_id,
                             "name": option["name"],
                             "extra_price": option.get("extra_price", 0.0),
-                            "position": option_position,
                         },
                     )
             order["items"] = items_snapshot

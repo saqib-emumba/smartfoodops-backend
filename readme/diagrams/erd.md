@@ -110,7 +110,6 @@ erDiagram
         varchar category_key "Client-supplied category_id, kept as a stable business key"
         varchar name
         int display_order "The client's own field; not necessarily unique or gapless"
-        smallint position "Round-trips submission order, independent of display_order"
         timestamp created_at
         timestamp updated_at
     }
@@ -123,8 +122,6 @@ erDiagram
         text description
         decimal base_price "CHECK (base_price > 0)"
         boolean is_available
-        text_array dietary_flags "Flat tag list, not a nested entity -- an array column"
-        smallint position
         timestamp created_at
         timestamp updated_at
     }
@@ -136,7 +133,6 @@ erDiagram
         varchar name
         int min_selection
         int max_selection
-        smallint position
         timestamp created_at
     }
 
@@ -145,7 +141,6 @@ erDiagram
         uuid group_id FK "References MENU_ITEM_CUSTOMIZATION_GROUPS.id, ON DELETE CASCADE"
         varchar name
         decimal extra_price "CHECK (extra_price >= 0)"
-        smallint position
         timestamp created_at
     }
 
@@ -183,7 +178,6 @@ erDiagram
         uuid line_item_id FK "References ORDER_LINE_ITEMS.id, ON DELETE CASCADE"
         varchar name
         decimal extra_price
-        smallint position
     }
 
     ORDER_TRACKING_LOGS {

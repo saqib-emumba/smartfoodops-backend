@@ -332,7 +332,6 @@ curl -s -X POST "$BASE/api/v1/menus" \
           \"description\": \"Char-grilled patty\",
           \"base_price\": 10.00,
           \"is_available\": true,
-          \"dietary_flags\": [\"halal\"],
           \"customization_groups\": [
             {
               \"group_id\": \"cheese\",

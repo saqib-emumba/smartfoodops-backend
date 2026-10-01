@@ -50,8 +50,8 @@ INSERT_LINE_ITEM = """
 """
 
 INSERT_LINE_ITEM_OPTION = """
-    INSERT INTO order_line_item_options (line_item_id, name, extra_price, position)
-    VALUES (%(line_item_id)s, %(name)s, %(extra_price)s, %(position)s)
+    INSERT INTO order_line_item_options (line_item_id, name, extra_price)
+    VALUES (%(line_item_id)s, %(name)s, %(extra_price)s)
 """
 
 # Batched rather than one-row-at-a-time: kitchen_queue attaches items to many orders at
@@ -67,7 +67,7 @@ SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS = """
     SELECT line_item_id, name, extra_price
       FROM order_line_item_options
      WHERE line_item_id = ANY(%(line_item_ids)s::uuid[])
-     ORDER BY line_item_id, position
+     ORDER BY line_item_id
 """
 
 # `old_status` is never accepted from a caller: it is read from the preceding entry so the
