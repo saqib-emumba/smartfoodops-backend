@@ -33,9 +33,6 @@ _DLQ_SUFFIX = ".dlq"
 ORDERS_PLACED_TOTAL = Counter("sfo_business_orders_placed_total", "Orders placed")
 ORDERS_DELIVERED_TOTAL = Counter("sfo_business_orders_delivered_total", "Orders delivered")
 ORDERS_CANCELLED_TOTAL = Counter("sfo_business_orders_cancelled_total", "Orders cancelled")
-AVERAGE_DELIVERY_SECONDS = Gauge(
-    "sfo_business_average_delivery_seconds", "Average time from placed to delivered"
-)
 CONSUMER_LAST_MESSAGE_SECONDS = Gauge(
     "sfo_consumer_last_message_timestamp_seconds",
     "Unix time of the last message this consumer processed — a flat line means a wedged consumer",
@@ -102,9 +99,6 @@ class AnalyticsConsumer:
         ORDERS_PLACED_TOTAL._value.set(placed)
         ORDERS_DELIVERED_TOTAL._value.set(counts.get("delivered", 0))
         ORDERS_CANCELLED_TOTAL._value.set(counts.get("cancelled", 0))
-        avg = self._projections.average_delivery_seconds()
-        if avg is not None:
-            AVERAGE_DELIVERY_SECONDS.set(avg)
         self._logger.info(
             "Analytics consumer seeded from %d existing projection rows", placed
         )
@@ -224,9 +218,6 @@ class AnalyticsConsumer:
             ORDERS_PLACED_TOTAL.inc()
         elif event_type == "order.delivered":
             ORDERS_DELIVERED_TOTAL.inc()
-            avg = self._projections.average_delivery_seconds()
-            if avg is not None:
-                AVERAGE_DELIVERY_SECONDS.set(avg)
         elif event_type == "order.cancelled":
             ORDERS_CANCELLED_TOTAL.inc()
 

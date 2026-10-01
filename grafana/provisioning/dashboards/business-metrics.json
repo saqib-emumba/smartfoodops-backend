@@ -24,7 +24,7 @@
       "gridPos": {
         "x": 0,
         "y": 0,
-        "w": 6,
+        "w": 8,
         "h": 6
       },
       "targets": [
@@ -57,9 +57,9 @@
       "type": "stat",
       "datasource": "Prometheus",
       "gridPos": {
-        "x": 6,
+        "x": 8,
         "y": 0,
-        "w": 6,
+        "w": 8,
         "h": 6
       },
       "targets": [
@@ -92,9 +92,9 @@
       "type": "stat",
       "datasource": "Prometheus",
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 0,
-        "w": 6,
+        "w": 8,
         "h": 6
       },
       "targets": [
@@ -111,43 +111,6 @@
         },
         "overrides": []
       },
-      "options": {
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ]
-        },
-        "graphMode": "area",
-        "colorMode": "value"
-      }
-    },
-    {
-      "id": 4,
-      "title": "Average delivery time",
-      "type": "stat",
-      "datasource": "Prometheus",
-      "gridPos": {
-        "x": 18,
-        "y": 0,
-        "w": 6,
-        "h": 6
-      },
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "expr": "sfo_business_average_delivery_seconds",
-          "refId": "A",
-          "instant": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "description": "Computed from the stored projection, not an in-process dict -- survives an analytics-service restart.",
       "options": {
         "reduceOptions": {
           "calcs": [

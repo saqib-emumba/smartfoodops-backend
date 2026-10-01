@@ -202,7 +202,7 @@ sequenceDiagram
         Worker->>OrderSvc: POST /orders/{id}/internal/events [X-Internal-Key]
         OrderSvc-)Kafka: produce order.delivered
         OrderSvc-->>Worker: 200 published
-        Kafka->>Analytics: consume order.delivered -> mark delivered, compute delivery_seconds
+        Kafka->>Analytics: consume order.delivered -> mark projection delivered
         Kafka->>NotifConsumer: consume order.delivered -> notify customer (SMS)
         Worker->>RiderSvc: release rider
         Note right of Worker: RiderWorkflow completes -- OrderWorkflow resumes

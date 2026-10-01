@@ -376,18 +376,17 @@ Two processes have no FastAPI app to hang a middleware on, so they run a bare
 
 ### 5.2 The other two families of metric
 
-- **Outbox relay metrics** (`common/outbox.py`), one set per table (`order_outbox`,
-  `payment_outbox`), labeled `outbox_table`:
-  `sfo_outbox_backlog`, `sfo_outbox_lag_seconds` (age of the oldest unpublished row),
-  `sfo_outbox_published_total`, `sfo_outbox_publish_failures_total`. Backlog and lag are the
-  two signals that say the relay is alive at all — a flat, non-zero backlog with lag climbing
-  means the relay is stuck (Kafka down, or every publish failing schema validation).
+- **Outbox relay metrics are gone (D53).** `common/outbox.py` and the `order_outbox`/
+  `payment_outbox` tables it polled were removed in favour of a Temporal activity each write
+  chains itself to, with workflow history as the durability ledger — see
+  [readme/outbox-removal-temporal-design.md](outbox-removal-temporal-design.md). There is no
+  table-backed backlog/lag to scrape any more; a stuck publish now shows up as a retrying
+  activity in Temporal Web, not a Prometheus gauge.
 - **Business metrics** (`services/analytics/consumer.py`): `sfo_business_orders_placed_total`,
   `_delivered_total`, `_cancelled_total` (all `Counter`, never `Gauge` — a `Gauge` here would
-  make `rate()`/`increase()` meaningless), `sfo_business_average_delivery_seconds` (computed
-  from the stored `order_projections` table, not an in-process dict, so a restart doesn't
-  silently reset it), and `sfo_consumer_last_message_timestamp_seconds` — a flat line on that
-  one means a wedged consumer, even though the service still reports healthy.
+  make `rate()`/`increase()` meaningless), and `sfo_consumer_last_message_timestamp_seconds`
+  — a flat line on that one means a wedged consumer, even though the service still reports
+  healthy.
   **Restart durability**: on startup, `_seed_metrics()` calls the private
   `Counter._value.set(n)` to seed each counter from the database's own totals *before* serving
   any traffic — otherwise a restart would silently reset business counters to zero even though

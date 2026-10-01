@@ -579,15 +579,10 @@ CREATE TABLE IF NOT EXISTS processed_events (
 );
 
 -- Business projection: one row per order, updated incrementally as its events arrive.
--- This is what the Prometheus Counters/Gauges in analytics/consumer.py are seeded from on
+-- This is what the Prometheus Counters in analytics/consumer.py are seeded from on
 -- startup — a Counter's in-process value does not survive a restart on its own, so the
 -- durable total this table can be queried for is what makes the metric accurate again
 -- after one (see consumer.py's own comment on `Counter._value.set(...)`).
---
--- `delivery_seconds` is computed from the envelope's own `occurred_at` timestamps
--- (order.created's vs order.delivered's), never from Kafka's transport timestamp, which
--- is when the relay happened to publish, not when the kitchen actually finished — the
--- blueprint drafted for this service made exactly that mistake.
 CREATE TABLE IF NOT EXISTS order_projections (
     order_id UUID PRIMARY KEY,
     restaurant_id UUID,
@@ -597,7 +592,6 @@ CREATE TABLE IF NOT EXISTS order_projections (
     placed_at TIMESTAMPTZ,
     delivered_at TIMESTAMPTZ,
     cancelled_at TIMESTAMPTZ,
-    delivery_seconds DOUBLE PRECISION,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

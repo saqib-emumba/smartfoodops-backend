@@ -228,7 +228,6 @@ erDiagram
         timestamptz placed_at "Nullable"
         timestamptz delivered_at "Nullable"
         timestamptz cancelled_at "Nullable"
-        double delivery_seconds "Nullable -- computed from envelope occurred_at, not Kafka transport time"
         timestamptz updated_at
     }
 ```

@@ -42,7 +42,6 @@ _UPDATE_ORDER_DELIVERED = """
     UPDATE order_projections
        SET status = 'delivered',
            delivered_at = %(occurred_at)s,
-           delivery_seconds = EXTRACT(EPOCH FROM (%(occurred_at)s::timestamptz - placed_at)),
            updated_at = CURRENT_TIMESTAMP
      WHERE order_id = %(order_id)s
 """
@@ -58,10 +57,6 @@ _UPDATE_ORDER_CANCELLED = """
 # Historical totals, queried once at startup to seed the process-local Prometheus Counters
 # — see consumer.py's own comment on why a Counter needs this and a Gauge would not.
 _COUNT_BY_STATUS = "SELECT status, count(*) AS n FROM order_projections GROUP BY status"
-_AVG_DELIVERY_SECONDS = (
-    "SELECT avg(delivery_seconds) AS avg_seconds FROM order_projections "
-    "WHERE delivery_seconds IS NOT NULL"
-)
 
 
 class ProjectionsRepository(Repository):
@@ -142,8 +137,3 @@ class ProjectionsRepository(Repository):
     def status_counts(self) -> dict[str, int]:
         rows = self.all(_COUNT_BY_STATUS)
         return {row["status"]: row["n"] for row in rows}
-
-    def average_delivery_seconds(self) -> float | None:
-        row = self.one(_AVG_DELIVERY_SECONDS)
-        value = row["avg_seconds"] if row else None
-        return float(value) if value is not None else None
