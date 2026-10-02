@@ -134,6 +134,6 @@ class UserRepository(Repository):
         if role is not None:
             return role
 
-        cur.execute("SELECT name FROM roles ORDER BY id")
+        cur.execute("SELECT name FROM roles ORDER BY created_at")
         valid = [row["name"] for row in cur.fetchall()]
         raise bad_request(f"Unknown role '{role_name}'. Valid roles: {valid}")

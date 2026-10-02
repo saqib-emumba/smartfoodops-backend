@@ -18,8 +18,12 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- 1a. Roles Lookup Table (Normalized Database Design)
+-- UUID PK, like every other table's id here, rather than a SERIAL: the old int PK was the
+-- one surrogate key in this schema that wasn't a UUID, which was a red flag for anyone
+-- reading the ERD rather than a deliberate choice. Still ordered by created_at (not id)
+-- wherever the seed order matters, since a UUID carries no ordering of its own.
 CREATE TABLE IF NOT EXISTS roles (
-    id SERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name VARCHAR(50) UNIQUE NOT NULL,
     description TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -55,7 +59,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
 -- role_id, matching the old column's behavior (a role is reference data, not disposable).
 CREATE TABLE IF NOT EXISTS user_roles (
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role_id INT NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
+    role_id UUID NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
     granted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, role_id)
 );

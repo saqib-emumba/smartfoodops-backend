@@ -47,10 +47,10 @@ erDiagram
     ORDERS ||--o| ORDER_PROJECTIONS : "projected (via Kafka, logical, cross-db)"
 
     ROLES {
-        int id PK
+        uuid id PK
         varchar name "Unique, seeded: customer/restaurant_admin/rider/system_admin"
         text description
-        timestamp created_at
+        timestamp created_at "Seed order; ORDER BY this, not id, since a uuid has no ordering of its own"
     }
 
     USERS {
@@ -65,7 +65,7 @@ erDiagram
 
     USER_ROLES {
         uuid user_id PK, FK "Composite PK with role_id -- References USERS.id, ON DELETE CASCADE"
-        int role_id PK, FK "Composite PK with user_id -- References ROLES.id, ON DELETE RESTRICT"
+        uuid role_id PK, FK "Composite PK with user_id -- References ROLES.id, ON DELETE RESTRICT"
         timestamp granted_at
     }
 
