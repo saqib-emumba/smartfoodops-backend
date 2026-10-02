@@ -29,8 +29,10 @@ import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ChildWorkflowError
+
+from orchestrator.utils.constants import DETAIL_TRUNCATE_LENGTH, PAYMENT_MODE_SAGA
+from orchestrator.utils.policies import PUBLISH_POLICY, STATE_POLICY
 
 with workflow.unsafe.imports_passed_through():
     # Every service-local import belongs inside this block, and the reason is not
@@ -43,38 +45,13 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.workflows.compensation import CompensationWorkflow
     from orchestrator.workflows.payment import PaymentWorkflow
     from orchestrator.workflows.rider import RiderWorkflow
+    from orchestrator.utils.transitions import recover_via_read, transition_and_publish
     from common.config import ORDER_TASK_QUEUE, RESTAURANT_DECISION_TIMEOUT_SECONDS
     from common.temporal import (
         compensation_workflow_id_for,
         payment_workflow_id_for,
         rider_workflow_id_for,
     )
-
-TRANSIENT = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=30),
-    maximum_attempts=3,
-)
-
-# A state write is local to the order database, so it is quick and safe to retry hard.
-STATE = RetryPolicy(
-    initial_interval=timedelta(seconds=1),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=20),
-    maximum_attempts=5,
-)
-
-# D53: no `maximum_attempts` — unlimited retries, on purpose. This is the replacement for the
-# outbox relay's own "loop forever until Kafka accepts it" contract (`common/outbox.py`,
-# deleted): a publish activity's completion in workflow history is the only thing that stops
-# Temporal from retrying it, the same durability guarantee a `published_at IS NULL` row used
-# to encode in a table instead.
-PUBLISH = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=1),
-)
 
 
 @workflow.defn
@@ -110,7 +87,7 @@ class OrderWorkflow:
             OrderActivities.create_order_activity,
             payload,
             start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=STATE,
+            retry_policy=STATE_POLICY,
         )
         self._order = result
         if result.get("created"):
@@ -118,7 +95,7 @@ class OrderWorkflow:
                 OrderActivities.publish_order_event_activity,
                 {"order_id": result["order"]["id"], "event_type": "order.created"},
                 start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=PUBLISH,
+                retry_policy=PUBLISH_POLICY,
             )
         return self._order
 
@@ -140,7 +117,7 @@ class OrderWorkflow:
             OrderActivities.decide_kitchen_activity,
             {"order_id": order_id, "decision": payload["decision"]},
             start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=STATE,
+            retry_policy=STATE_POLICY,
         )
         self._order_status = decided.get("status")
         if not decided.get("changed"):
@@ -154,7 +131,7 @@ class OrderWorkflow:
             OrderActivities.publish_order_event_activity,
             {"order_id": order_id, "event_type": "order.kitchen.decided"},
             start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=PUBLISH,
+            retry_policy=PUBLISH_POLICY,
         )
         self._restaurant_decision = decided["decision"]
         return {"decision": decided["decision"], "status": self._order_status, "changed": True}
@@ -197,7 +174,7 @@ class OrderWorkflow:
         try:
             await workflow.execute_child_workflow(
                 PaymentWorkflow.run,
-                {"order_id": order_id, "amount": amount, "mode": "saga"},
+                {"order_id": order_id, "amount": amount, "mode": PAYMENT_MODE_SAGA},
                 id=payment_workflow_id_for(order_id),
                 task_queue=ORDER_TASK_QUEUE,
             )
@@ -213,7 +190,7 @@ class OrderWorkflow:
         #    "send the ticket" call any more, because there is no ticket (D32).
         self._stage = "awaiting_kitchen"
         try:
-            await self._transition(
+            await transition_and_publish(
                 order_id, "confirmed", "payment-service", capacity_limit=capacity
             )
         except ActivityError as exc:
@@ -236,7 +213,14 @@ class OrderWorkflow:
             # refunding an order the kitchen actually accepted is a real customer-visible
             # failure, avoidable with one local lookup.
             self._stage = "recovering_kitchen_decision"
-            self._restaurant_decision = await self._recover_kitchen_decision(order_id)
+            self._restaurant_decision = await recover_via_read(
+                OrderActivities.read_kitchen_decision_activity,
+                {"order_id": order_id},
+                field="decision",
+                allowed=("accepted", "rejected"),
+                order_id=order_id,
+                what="kitchen decision",
+            )
 
             if self._restaurant_decision is None:
                 return await self._compensate(
@@ -274,89 +258,14 @@ class OrderWorkflow:
 
     # --- helpers ------------------------------------------------------------------------
 
-    async def _transition(
-        self,
-        order_id: str,
-        new_status: str,
-        updated_by: str,
-        *,
-        metadata: dict | None = None,
-        capacity_limit: int | None = None,
-    ) -> None:
-        await workflow.execute_activity(
-            OrderActivities.transition_order_activity,
-            {
-                "order_id": order_id,
-                "status": new_status,
-                "updated_by": updated_by,
-                "event": {"event": f"order_{new_status}", "order_id": order_id},
-                "metadata": metadata or {},
-                "rider_id": None,
-                "capacity_limit": capacity_limit,
-            },
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=STATE,
-        )
-        # D53: a second, independently-retried activity — replacing the outbox row
-        # `OrderRepository.transition` used to write in the same transaction as the status
-        # update.
-        await workflow.execute_activity(
-            OrderActivities.publish_order_event_activity,
-            {"order_id": order_id, "event_type": f"order.{new_status}", "metadata": metadata or {}},
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=PUBLISH,
-        )
-
-    async def _recover_kitchen_decision(self, order_id: str) -> str | None:
-        """Ask the Order Service what the ticket says, after waiting timed out.
-
-        Returns `"accepted"`, `"rejected"`, or `None` for "no decision on record".
-
-        Since D32 the read is local — `orders.kitchen_decision`, in the Order Service's own
-        database — so it uses the STATE retry policy rather than TRANSIENT. What remains is
-        only a database that will not answer, and that is treated as no decision: the safe
-        default, because refunding an accepted order is recoverable by a human while leaving
-        a charged customer on a saga that never finishes is not.
-        """
-        try:
-            recorded_on_order = await workflow.execute_activity(
-                OrderActivities.read_kitchen_decision_activity,
-                {"order_id": order_id},
-                start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=STATE,
-            )
-        except ActivityError as exc:
-            workflow.logger.error(
-                "Could not read the kitchen decision for order %s after the timeout; "
-                "treating it as no decision: %s",
-                order_id,
-                exc.cause or exc,
-            )
-            return None
-
-        recorded = recorded_on_order.get("decision")
-        if recorded in ("accepted", "rejected"):
-            workflow.logger.info(
-                "Recovered a lost kitchen decision for order %s: '%s'",
-                order_id,
-                recorded,
-            )
-            return recorded
-
-        workflow.logger.info(
-            "Order %s has no kitchen decision on record; the wait was genuine silence",
-            order_id,
-        )
-        return None
-
     async def _cancel(self, order_id: str, reason: str, detail: str) -> None:
         """Mark the order cancelled. No money moved, so nothing to give back — this is the
         one cancellation path that does not go through `CompensationWorkflow`."""
-        await self._transition(
+        await transition_and_publish(
             order_id,
             "cancelled",
             "order-workflow",
-            metadata={"reason": reason, "detail": detail[:500]},
+            metadata={"reason": reason, "detail": detail[:DETAIL_TRUNCATE_LENGTH]},
         )
 
     async def _compensate(self, order_id: str, reason: str, detail: str) -> dict:

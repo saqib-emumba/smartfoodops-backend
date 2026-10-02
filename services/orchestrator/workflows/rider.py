@@ -17,47 +17,18 @@ import asyncio
 from datetime import timedelta
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+
+from orchestrator.utils.policies import RELEASE_POLICY, TRANSIENT_POLICY
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.activities.order import OrderActivities
     from orchestrator.activities.rider import RiderActivities
+    from orchestrator.utils.transitions import recover_via_read, transition_and_publish
     from common.config import (
         DELIVERY_TIMEOUT_SECONDS,
         RIDER_SEARCH_ATTEMPTS,
         RIDER_SEARCH_INTERVAL_SECONDS,
     )
-
-TRANSIENT = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=30),
-    maximum_attempts=3,
-)
-
-STATE = RetryPolicy(
-    initial_interval=timedelta(seconds=1),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=20),
-    maximum_attempts=5,
-)
-
-# A release is a compensating action in spirit even on the happy path — giving up on it
-# leaves a rider permanently unavailable — so it retries under the same patient policy
-# OrderWorkflow's own COMPENSATION used before this move.
-RELEASE = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=1),
-    maximum_attempts=10,
-)
-
-PUBLISH = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=1),
-)
 
 
 @workflow.defn
@@ -100,7 +71,7 @@ class RiderWorkflow:
             }
 
         self._rider_id = assignment.get("rider_id")
-        await self._transition(
+        await transition_and_publish(
             order_id,
             "assigned",
             "rider-service",
@@ -137,7 +108,7 @@ class RiderWorkflow:
                     "detail": "Rider never collected the order",
                 }
 
-        await self._transition(order_id, "picked_up", "rider-service")
+        await transition_and_publish(order_id, "picked_up", "rider-service")
 
         if not self._delivered:
             try:
@@ -158,7 +129,7 @@ class RiderWorkflow:
                         "detail": "Rider never completed the delivery",
                     }
 
-        await self._transition(
+        await transition_and_publish(
             order_id, "delivered", "rider-service", metadata={"rider_id": self._rider_id}
         )
         # Released *after* the terminal transition, so availability can never say "free"
@@ -168,65 +139,15 @@ class RiderWorkflow:
 
     # --- helpers ------------------------------------------------------------------------
 
-    async def _transition(
-        self,
-        order_id: str,
-        new_status: str,
-        updated_by: str,
-        *,
-        metadata: dict | None = None,
-        rider_id: str | None = None,
-    ) -> None:
-        await workflow.execute_activity(
-            OrderActivities.transition_order_activity,
-            {
-                "order_id": order_id,
-                "status": new_status,
-                "updated_by": updated_by,
-                "event": {"event": f"order_{new_status}", "order_id": order_id},
-                "metadata": metadata or {},
-                "rider_id": rider_id,
-                "capacity_limit": None,
-            },
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=STATE,
-        )
-        await workflow.execute_activity(
-            OrderActivities.publish_order_event_activity,
-            {"order_id": order_id, "event_type": f"order.{new_status}", "metadata": metadata or {}},
-            start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=PUBLISH,
-        )
-
     async def _recover_rider_report(self, order_id: str) -> str | None:
-        try:
-            recorded_on_order = await workflow.execute_activity(
-                OrderActivities.read_rider_report_activity,
-                {"order_id": order_id},
-                start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=STATE,
-            )
-        except ActivityError as exc:
-            workflow.logger.error(
-                "Could not read the rider report for order %s after the timeout; "
-                "treating it as no report: %s",
-                order_id,
-                exc.cause or exc,
-            )
-            return None
-
-        recorded = recorded_on_order.get("stage")
-        if recorded in ("picked_up", "delivered"):
-            workflow.logger.info(
-                "Recovered a lost rider report for order %s: '%s'", order_id, recorded
-            )
-            return recorded
-
-        workflow.logger.info(
-            "Order %s has no rider report on record; the wait was genuine silence",
-            order_id,
+        return await recover_via_read(
+            OrderActivities.read_rider_report_activity,
+            {"order_id": order_id},
+            field="stage",
+            allowed=("picked_up", "delivered"),
+            order_id=order_id,
+            what="rider report",
         )
-        return None
 
     async def _find_rider(self, order_id: str, payload: dict) -> dict | None:
         """Try repeatedly to claim a rider, sleeping on a durable timer between attempts."""
@@ -239,7 +160,7 @@ class RiderWorkflow:
                     "restaurant_longitude": payload["restaurant_longitude"],
                 },
                 start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=TRANSIENT,
+                retry_policy=TRANSIENT_POLICY,
             )
             if result.get("assigned"):
                 return result
@@ -254,5 +175,5 @@ class RiderWorkflow:
             RiderActivities.release_rider_activity,
             {"order_id": order_id},
             start_to_close_timeout=timedelta(seconds=10),
-            retry_policy=RELEASE,
+            retry_policy=RELEASE_POLICY,
         )

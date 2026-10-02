@@ -16,48 +16,31 @@ completes. See workflows/compensation.py for why that split was chosen over a lo
 from datetime import timedelta
 
 from temporalio import workflow
-from temporalio.common import RetryPolicy
+
+from orchestrator.utils.constants import PAYMENT_MODE_MANUAL
+from orchestrator.utils.policies import AUTHORIZE_POLICY, PUBLISH_POLICY
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.activities.payment import PaymentActivities
-
-# A card authorisation is a round trip to an external processor and takes seconds, not
-# milliseconds — the same bound OrderWorkflow's own TRANSIENT policy used for this call
-# before the move.
-AUTHORIZE = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=30),
-    maximum_attempts=3,
-)
-
-# D53: no `maximum_attempts` — unlimited retries, on purpose. Temporal's own retry-until-
-# success is what replaced payment_outbox's relay; see OrderWorkflow's identical PUBLISH
-# policy for the full reasoning.
-PUBLISH = RetryPolicy(
-    initial_interval=timedelta(seconds=2),
-    backoff_coefficient=2.0,
-    maximum_interval=timedelta(minutes=1),
-)
 
 
 @workflow.defn
 class PaymentWorkflow:
     @workflow.run
     async def run(self, payload: dict) -> dict:
-        if payload.get("mode") == "manual":
+        if payload.get("mode") == PAYMENT_MODE_MANUAL:
             outcome = await workflow.execute_activity(
                 PaymentActivities.create_manual_payment_activity,
                 payload,
                 start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=AUTHORIZE,
+                retry_policy=AUTHORIZE_POLICY,
             )
         else:
             payment = await workflow.execute_activity(
                 PaymentActivities.authorize_payment_activity,
                 payload,
                 start_to_close_timeout=timedelta(seconds=20),
-                retry_policy=AUTHORIZE,
+                retry_policy=AUTHORIZE_POLICY,
             )
             # The saga's own authorisation never replays at this layer — each order
             # authorises exactly once, unlike the manual path's client-guessable key, which
@@ -69,6 +52,6 @@ class PaymentWorkflow:
                 PaymentActivities.publish_payment_event_activity,
                 {"event_type": "payment.authorized", "payment": outcome["payment"]},
                 start_to_close_timeout=timedelta(seconds=10),
-                retry_policy=PUBLISH,
+                retry_policy=PUBLISH_POLICY,
             )
         return outcome
