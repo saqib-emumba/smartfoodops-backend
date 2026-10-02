@@ -56,7 +56,7 @@ COMPENSATION_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
     backoff_coefficient=2.0,
     maximum_interval=timedelta(minutes=1),
-    maximum_attempts=5,
+    maximum_attempts=10,
 )
 
 # A rider release is the same patient policy as COMPENSATION_POLICY, under the name that reads
