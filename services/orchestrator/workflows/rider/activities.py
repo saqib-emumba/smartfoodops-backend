@@ -1,11 +1,12 @@
 """Activities for `RiderWorkflow` (D55, the mentor's child-workflow split).
 
 Moved out of `OrderActivities` verbatim — bodies unchanged, only which workflow calls them
-and which class holds the client changed. See `workflows/rider.py` for the state machine
-these back.
+and which class holds the client changed. See `workflow.py` beside this file for the state
+machine these back.
 """
 
 from logging import Logger
+from typing import Callable
 
 from temporalio import activity
 
@@ -16,6 +17,15 @@ class RiderActivities:
     def __init__(self, *, riders: SagaRiderClient, logger: Logger):
         self._riders = riders
         self._logger = logger
+
+    def all_activities(self) -> list[Callable]:
+        """Every activity Temporal should register for this class — see
+        `OrderActivities.all_activities`'s docstring for why this list is explicit rather
+        than reflected."""
+        return [
+            self.dispatch_rider_activity,
+            self.release_rider_activity,
+        ]
 
     @activity.defn
     def dispatch_rider_activity(self, details: dict) -> dict:

@@ -150,7 +150,7 @@ erDiagram
         uuid restaurant_id "References RESTAURANTS.id -- cross-db, no engine FK"
         uuid rider_id "Nullable; References RIDERS.id -- cross-db, no engine FK"
         decimal total_amount
-        order_status status "created/confirmed/assigned/picked_up/delivered/cancelled"
+        order_status status "created/confirmed/assigned/picked_up/delivered/cancelled/compensation_failed"
         kitchen_decision kitchen_decision "Nullable enum: accepted/rejected (D32)"
         timestamp kitchen_decided_at "Nullable"
         rider_report_stage rider_reported_stage "Nullable enum: picked_up/delivered (D46)"

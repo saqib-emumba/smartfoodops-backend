@@ -20,6 +20,25 @@ from order.schemas.orders import OrderCreateRequest, OrderResponse
 router = APIRouter(prefix="/api/v1/orders")
 
 
+@router.get(
+    "",
+    response_model=Envelope[list[OrderResponse]],
+    dependencies=[Depends(require_role("system_admin"))],
+)
+def list_orders_by_status(status: str) -> Envelope[list[OrderResponse]]:
+    """Every order in one status, oldest first — admin-only.
+
+    The one way to find an order stuck in a state that needs a human
+    (`compensation_failed`, the saga's own refund-permanently-failed outcome) without
+    already knowing its id or reaching for a psql session — no equivalent existed before
+    this; every other read here is by id. `status` is not validated against a Python-side
+    list: the same `order_status` enum the column itself uses is what rejects an invented
+    value, the one list of valid statuses this service keeps (see schemas/tracking.py).
+    """
+    rows = deps.orders.list_by_status(status)
+    return ok([OrderResponse(**row) for row in rows], message=f"Orders with status '{status}'")
+
+
 @router.post(
     "",
     response_model=Envelope[OrderResponse],

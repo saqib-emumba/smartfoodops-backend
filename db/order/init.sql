@@ -22,7 +22,13 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Define custom ENUM types
-CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled');
+-- 'compensation_failed': the saga tried to refund and cancel but the refund itself
+-- permanently failed (every retry, at both the activity and the workflow level,
+-- exhausted) -- a terminal state that needs a human, not a silently-failed Temporal
+-- workflow as the only trace of it. Declared after 'cancelled' so its place in the
+-- lifecycle reads naturally, but OrderRepository.transition's compare-and-set does not
+-- rely on that ordering for it (see its own comment) the way it does for every other value.
+CREATE TYPE order_status AS ENUM ('created', 'confirmed', 'assigned', 'picked_up', 'delivered', 'cancelled', 'compensation_failed');
 
 -- The kitchen's answer, which is a fact about this order and therefore lives on it.
 -- Deliberately NOT a member of order_status: acceptance does not move the order

@@ -8,8 +8,9 @@ chain a publish step off of otherwise.
 
 KEEP THIS FILE A DOCSTRING. It sits on the same sandbox import path as
 `orchestrator/__init__.py`, `orchestrator/workflows/__init__.py` and
-`orchestrator/activities/__init__.py` — resolving `orchestrator.activities.payment`'s own
-imports from inside `workflow.unsafe.imports_passed_through()` walks through all four, for
+`orchestrator/workflows/payment/__init__.py` — resolving
+`orchestrator.workflows.payment.activities`'s own imports from inside
+`workflow.unsafe.imports_passed_through()` walks through all four, for
 the same reason `clients/order/__init__.py` documents at length. A re-export here would put
 the order saga's clients back in this workflow's import graph regardless of which one it
 actually calls.

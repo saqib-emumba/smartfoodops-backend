@@ -21,8 +21,8 @@ from temporalio import workflow
 from orchestrator.utils.policies import RELEASE_POLICY, TRANSIENT_POLICY
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.activities.order import OrderActivities
-    from orchestrator.activities.rider import RiderActivities
+    from orchestrator.workflows.order.activities import OrderActivities
+    from orchestrator.workflows.rider.activities import RiderActivities
     from orchestrator.utils.transitions import recover_via_read, transition_and_publish
     from common.config import (
         DELIVERY_TIMEOUT_SECONDS,

@@ -12,8 +12,8 @@ would be written into durable, UI-visible history.
 
 KEEP THIS FILE A DOCSTRING. It sits on the same sandbox import path as
 `orchestrator/__init__.py`, `orchestrator/workflows/__init__.py`,
-`orchestrator/activities/__init__.py` and `orchestrator/clients/__init__.py` — resolving
-`orchestrator.activities.order`'s own imports from inside
+`orchestrator/workflows/order/__init__.py` and `orchestrator/clients/__init__.py` —
+resolving `orchestrator.workflows.order.activities`'s own imports from inside
 `workflow.unsafe.imports_passed_through()` walks through all five. A re-export here would
 put every client for this entity back in the worker's import graph regardless of which
 one an activity actually calls, undoing the reason `clients/` is split by callee at all.

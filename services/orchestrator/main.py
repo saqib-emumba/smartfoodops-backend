@@ -13,8 +13,8 @@ answers, and the `/metrics` route `instrument_app` mounts. The real work of this
 in the sibling process — `orchestrator/worker.py`, running whatever `registry.py` declares.
 
 Adding a workflow does not touch this file. That is the point of the split: a new entity
-needs `workflows/<entity>.py`, `activities/<entity>.py`, a task-queue constant, and one
-registry line — never a route and never a schema.
+needs `workflows/<entity>/workflow.py`, `workflows/<entity>/activities.py`, a task-queue
+constant, and one registry line — never a route and never a schema.
 """
 
 from fastapi import FastAPI

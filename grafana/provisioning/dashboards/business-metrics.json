@@ -206,6 +206,50 @@
         "overrides": []
       },
       "description": "The analytics read-model's view of the same lifecycle scripts/smoke-test.sh reads straight out of order_tracking_logs -- both should agree on shape, never on identical values (analytics is order.created / order.delivered / order.cancelled events; the tracking log is the full transition history)."
+    },
+    {
+      "id": 7,
+      "title": "Orders needing manual review (compensation failed)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sfo_business_orders_compensation_failed_total",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value"
+      },
+      "description": "A saga whose refund permanently failed every retry -- GET /api/v1/orders?status=compensation_failed (system_admin) lists which ones. Should stay at zero; any non-zero value needs a human, not a replay."
     }
   ]
 }

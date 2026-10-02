@@ -9,7 +9,7 @@ which activity does the write; both paths publish through the same activity afte
 since `PaymentEventData`'s shape never differed between them.
 
 Refunding lives entirely in `CompensationWorkflow`, not here — this workflow authorises and
-completes. See workflows/compensation.py for why that split was chosen over a long-lived
+completes. See workflows/compensation/workflow.py for why that split was chosen over a long-lived
 `PaymentWorkflow` that stays open waiting for a possible refund signal.
 """
 
@@ -21,7 +21,7 @@ from orchestrator.utils.constants import PAYMENT_MODE_MANUAL
 from orchestrator.utils.policies import AUTHORIZE_POLICY, PUBLISH_POLICY
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.activities.payment import PaymentActivities
+    from orchestrator.workflows.payment.activities import PaymentActivities
 
 
 @workflow.defn

@@ -15,14 +15,14 @@ client alongside the sync one). Sized generically now, not against a connection 
 process no longer has — see `orders`/`activities` construction below, which takes an
 `OrderServiceClient` instead of the `OrderRepository` this file built before the split.
 
-One worker process, one `Worker` per task queue, and — since `activities/`, `clients/` and
-`workflows/` are all entity-scoped — potentially several entities registered on it. What
-runs is declared in `registry.py`, not here: this file knows how to *run* a registration,
-not which ones exist. A second entity needs `workflows/<entity>.py`,
-`activities/<entity>.py`, a task-queue constant, and one line in that registry — and no
-HTTP surface at all, since services name workflows by string through
-`common.temporal.SagaClient`. A second *container* is only warranted if a future entity
-should scale or deploy independently of this one.
+One worker process, one `Worker` per task queue, and — since `workflows/` (each entity's
+workflow and activities together) and `clients/` are both entity-scoped — potentially
+several entities registered on it. What runs is declared in `registry.py`, not here: this
+file knows how to *run* a registration, not which ones exist. A second entity needs
+`workflows/<entity>/workflow.py`, `workflows/<entity>/activities.py`, a task-queue
+constant, and one line in that registry — and no HTTP surface at all, since services name
+workflows by string through `common.temporal.SagaClient`. A second *container* is only
+warranted if a future entity should scale or deploy independently of this one.
 
 Connects through `TemporalGateway` rather than a bare `Client.connect()` (Week 3): that is
 the one place `TracingInterceptor` is wired in, so this process and the Orchestrator

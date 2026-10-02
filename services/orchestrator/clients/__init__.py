@@ -14,7 +14,7 @@ Docstring only: no re-exports, at this level or the entity level below it. Impor
 the specific module you need
 (`from orchestrator.clients.order.order_service import OrderServiceClient`) — this
 package's `__init__.py` sits on the same sandbox import path as `orchestrator/__init__.py`
-and `orchestrator/activities/__init__.py`, and a re-export here would put every entity's
-every client back in the worker's import graph regardless of which one an activity
-actually calls.
+and `orchestrator/workflows/<entity>/__init__.py` (whichever entity's `activities.py` the
+import chain is resolving), and a re-export here would put every entity's every client
+back in the worker's import graph regardless of which one an activity actually calls.
 """

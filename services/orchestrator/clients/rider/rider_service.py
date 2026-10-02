@@ -1,7 +1,7 @@
 """`RiderWorkflow`'s fleet calls: dispatch and release, on the internal key.
 
 Moved verbatim from `clients/order/rider.py` (D55): the calls did not change, only which
-workflow's activities make them — see `activities/rider.py`.
+workflow's activities make them — see `workflows/rider/activities.py`.
 """
 
 from uuid import UUID

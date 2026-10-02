@@ -33,6 +33,10 @@ _DLQ_SUFFIX = ".dlq"
 ORDERS_PLACED_TOTAL = Counter("sfo_business_orders_placed_total", "Orders placed")
 ORDERS_DELIVERED_TOTAL = Counter("sfo_business_orders_delivered_total", "Orders delivered")
 ORDERS_CANCELLED_TOTAL = Counter("sfo_business_orders_cancelled_total", "Orders cancelled")
+ORDERS_COMPENSATION_FAILED_TOTAL = Counter(
+    "sfo_business_orders_compensation_failed_total",
+    "Orders whose saga compensation (refund) permanently failed and need manual review",
+)
 CONSUMER_LAST_MESSAGE_SECONDS = Gauge(
     "sfo_consumer_last_message_timestamp_seconds",
     "Unix time of the last message this consumer processed — a flat line means a wedged consumer",
@@ -41,7 +45,11 @@ CONSUMER_LAST_MESSAGE_SECONDS = Gauge(
 # Terminal/status event types this projection tracks. `payment.*` and
 # `order.kitchen.decided` are schema-validated and offset-committed like any other event,
 # but carry no order-lifecycle status of their own, so they update no projection row.
-_STATUS_EVENT_TYPES = {"order.confirmed", "order.assigned", "order.picked_up"}
+# `order.compensation_failed` goes through the same generic path as these three (a plain
+# status update, no extra timestamp column) rather than earning its own `apply_*`/`*_at`
+# pair the way delivered/cancelled did — those needed a timestamp for a rate/duration
+# metric; this one only needs to be visible, which the generic path already gives it.
+_STATUS_EVENT_TYPES = {"order.confirmed", "order.assigned", "order.picked_up", "order.compensation_failed"}
 
 logger_name = "analytics.consumer"
 
@@ -99,6 +107,7 @@ class AnalyticsConsumer:
         ORDERS_PLACED_TOTAL._value.set(placed)
         ORDERS_DELIVERED_TOTAL._value.set(counts.get("delivered", 0))
         ORDERS_CANCELLED_TOTAL._value.set(counts.get("cancelled", 0))
+        ORDERS_COMPENSATION_FAILED_TOTAL._value.set(counts.get("compensation_failed", 0))
         self._logger.info(
             "Analytics consumer seeded from %d existing projection rows", placed
         )
@@ -220,6 +229,8 @@ class AnalyticsConsumer:
             ORDERS_DELIVERED_TOTAL.inc()
         elif event_type == "order.cancelled":
             ORDERS_CANCELLED_TOTAL.inc()
+        elif event_type == "order.compensation_failed":
+            ORDERS_COMPENSATION_FAILED_TOTAL.inc()
 
     async def _to_dlq(self, msg, *, reason: str) -> None:
         if self._dlq_producer is None:

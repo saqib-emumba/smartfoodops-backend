@@ -971,6 +971,56 @@ else
   printf '  %sSKIP%s  no-rider compensation (docker/sfo-rider-db not reachable)\n' "$DIM" "$RESET"
 fi
 
+# --- compensation: the refund itself fails ------------------------------------------------
+# Every compensation path above ends in 'cancelled' because the refund eventually succeeds.
+# This one takes the Payment Service off the air for the whole retry window, so
+# CompensationWorkflow's refund activity exhausts COMPENSATION_POLICY and the saga has to
+# fall back to 'compensation_failed' instead — the one outcome none of the sections above
+# can reach. Same "take a dependency off the road, trigger the saga, restore it" shape as
+# the no-rider section above, aimed at a service instead of a fleet.
+section "Order saga — compensation when the refund itself permanently fails"
+
+if have_container sfo-payment-service; then
+  CF_IDEM="idem-compfail-$TAG"
+  expect "place an order to be rejected with payment-service down" 201 POST /api/v1/orders "$ORDER" \
+    -H "X-Idempotency-Key: $CF_IDEM" "${CUST_AUTH[@]}"
+  CF_ORDER=$(jfield "['id']")
+  poll_status "$CF_ORDER" confirmed 40 "${CUST_AUTH[@]}"
+
+  docker stop sfo-payment-service >/dev/null 2>&1
+  ok "took payment-service off the road"
+
+  expect "kitchen rejects the order" 200 POST "/api/v1/orders/$CF_ORDER/reject" \
+    "" "${OWNER_AUTH[@]}"
+  assert "  decision recorded as rejected" "$(jfield "['decision']")" "rejected"
+
+  # COMPENSATION_POLICY: initial_interval=2s, backoff x2, 5 attempts -> ~30s of retries
+  # before the activity gives up; allow a wide margin for scheduling overhead.
+  poll_status "$CF_ORDER" compensation_failed 90 "${CUST_AUTH[@]}"
+
+  docker start sfo-payment-service >/dev/null 2>&1
+  for _ in $(seq 1 30); do
+    [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/payments/health")" == "200" ]] && break
+    sleep 2
+  done
+  ok "returned payment-service to the road"
+
+  CF_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$CF_ORDER' AND new_status='compensation_failed';" \
+    2>/dev/null | tr -d '[:space:]')
+  assert "  the tracking trail records why" "$CF_REASON" "kitchen_rejected"
+
+  expect "the admin listing surfaces it" 200 GET "/api/v1/orders?status=compensation_failed" \
+    "" "${ADMIN_AUTH[@]}"
+  CF_LISTED=$(python3 -c "import json,sys; print('$CF_ORDER' in [o['id'] for o in json.load(sys.stdin)['body']])" <<<"$BODY" 2>/dev/null)
+  assert "  and it's in the admin's compensation_failed listing" "$CF_LISTED" "True"
+
+  expect "a non-admin may not list orders by status -> 403" 403 GET \
+    "/api/v1/orders?status=compensation_failed" "" "${CUST_AUTH[@]}"
+else
+  printf '  %sSKIP%s  refund-permanently-fails compensation (docker/sfo-payment-service not reachable)\n' "$DIM" "$RESET"
+fi
+
 # --- capacity ----------------------------------------------------------------------------
 # `restaurants.capacity` went unread by anything until Week 2, and since D32 it is enforced
 # in the same local transaction that puts an order on the rail — so two orders can never

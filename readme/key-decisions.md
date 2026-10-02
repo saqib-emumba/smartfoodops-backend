@@ -71,6 +71,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger) | The outbox tables are removed; workflow history becomes the publish ledger | 2026-09-29 | Accepted |
 | [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) | Order creation moves inside Temporal, via Update-with-Start | 2026-09-30 | Accepted |
 | [D55](#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow) | Payment, rider and compensation become child workflows of `OrderWorkflow` | 2026-10-01 | Accepted |
+| [D56](#d56--a-refund-that-permanently-fails-becomes-compensation_failed-not-a-silently-failed-workflow) | A refund that permanently fails becomes `'compensation_failed'`, not a silently-failed workflow | 2026-10-02 | Accepted |
 
 ---
 
@@ -785,6 +786,62 @@ open waiting for a possible refund signal."
   child executions beyond `OrderWorkflow` itself (payment, rider, and — only on failure —
   compensation), each visible and independently queryable in Temporal Web, which is the
   explicit point of the split, not an accident of it.
+
+### D56 — A refund that permanently fails becomes `'compensation_failed'`, not a silently-failed workflow
+
+**Decided:** `CompensationWorkflow.run()` wraps its refund activity (and the publish that
+follows it) in a `try`/`except ActivityError`. On a failure that survives every retry —
+`COMPENSATION_POLICY`'s own activity-level attempts, and a workflow-level `retry_policy` on
+top of that from `OrderWorkflow._compensate` — it logs the cause and transitions the order
+to a new terminal `order_status` value, `'compensation_failed'`, instead of letting the
+exception propagate. `OrderWorkflow.run()`'s own `_stage` query reflects whichever outcome
+actually happened (`result["status"]`) rather than assuming `"cancelled"`. The one
+transition this does *not* wrap is the ordinary `'cancelled'` write that follows a
+successful refund: a failure writing that is a deeper local-database outage, not something
+this mechanism can route around either, so it is left to surface as a failed Temporal
+workflow the same way every unhandled failure here always has.
+
+A listing endpoint was added alongside this because none existed for any status before:
+`GET /api/v1/orders?status=<status>` (`system_admin`-only, `OrderRepository.list_by_status`)
+— the only way, previously, to find an order by its status rather than its id was a direct
+`psql` session. `order.compensation_failed` is also registered with the Schema Registry
+(`OrderTransitionData`, same shape every other transition event uses), and the Analytics
+Service's consumer counts it (`sfo_business_orders_compensation_failed_total`, a new Grafana
+panel) through the same generic status-event path `order.confirmed`/`assigned`/`picked_up`
+already use.
+
+**Instead of:** the gap D55 left open — `CompensationWorkflow.run()` had no `try`/`except`
+at all, so a refund that exhausted its retries (or hit a non-retryable error) propagated
+unhandled, failing `CompensationWorkflow` itself, then `OrderWorkflow._compensate`
+(no catch there either), then `OrderWorkflow.run()` — the entire saga ending up as a failed
+Temporal workflow with no application-level record of why, discoverable only by knowing to
+check Temporal's own failed-workflow list.
+
+**Why:** this codebase's own stated rule for activities — "a business outcome is not a
+failure" (`OrderActivities`'s docstring) — had never been extended to this one case. A
+refund that cannot be completed after every reasonable retry is exactly that: a business
+outcome (the customer needs a manual refund, support needs to know), not a technical fluke
+that should end a workflow with no trace a non-Temporal-operator would ever see.
+`compensation_failed` is a real `order_status` value rather than a flag or a log line alone
+so it is visible through the *same* surfaces every other transition already is —
+`order_tracking_logs`, the new listing endpoint, Kafka, Grafana — instead of inventing a
+second, parallel way to say "this order needs attention."
+
+**Costs:**
+
+- **A new terminal `order_status` value touches more than the enum.** Declaring it required
+  updating `OrderRepository.transition`'s compare-and-set in two places (the terminal-state
+  guard, and the forward-movement clause — `compensation_failed` is reachable from anywhere
+  still in flight, the same as `cancelled`, which does not follow from its position in the
+  enum's declaration order the way ordinary forward movement does), a one-off migration
+  SQL file for the already-running `sfo-order-db` volume, registering a new event type with
+  the Schema Registry, and a new branch each in the Analytics consumer and the Grafana
+  dashboard. None of these are optional once a new terminal status exists; a status nothing
+  can query, nothing publishes, and nothing counts would not actually be visible to anyone.
+- **Still no alerting.** A Grafana panel and a listing endpoint mean a human *can* find a
+  `compensation_failed` order, not that one *will* be told without looking. Nothing pages
+  on this yet — the same gap D19's "secrets manager" open question names for a different
+  reason, worth deciding deliberately rather than assuming the panel is enough.
 
 ### D26 — The worker authenticates with the internal key, never a forwarded bearer
 

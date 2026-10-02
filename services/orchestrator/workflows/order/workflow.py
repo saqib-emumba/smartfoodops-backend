@@ -17,12 +17,14 @@ moved out of this file into their own workflow — `PaymentWorkflow`, `RiderWork
 in this file is what is genuinely about the *order* as a whole: creating it, holding the
 kitchen's decision, and deciding which child runs next based on what the last one returned.
 
-Read alongside activities/order.py: the division of labour is that activities decide what a
-*service* said, and this file decides what the *saga* does about it.
+Read alongside `activities.py` beside this file: the division of labour is that activities
+decide what a *service* said, and this file decides what the *saga* does about it.
 
-Lives at `workflows/order.py`, not a flat `workflows.py`, so each entity this service
-orchestrates gets its own `workflows/<entity>.py` — see `workflows/__init__.py` for why that
-package boundary carries the same sandbox constraint this file's own import block does.
+Lives at `workflows/order/workflow.py`, not a flat `workflows/order.py`, so each entity this
+service orchestrates gets its own `workflows/<entity>/` holding both its workflow and the
+activities backing it — see `workflows/__init__.py` and `workflows/order/__init__.py` for
+why that package boundary carries the same sandbox constraint this file's own import block
+does.
 """
 
 import asyncio
@@ -32,7 +34,7 @@ from temporalio import workflow
 from temporalio.exceptions import ActivityError, ChildWorkflowError
 
 from orchestrator.utils.constants import DETAIL_TRUNCATE_LENGTH, PAYMENT_MODE_SAGA
-from orchestrator.utils.policies import PUBLISH_POLICY, STATE_POLICY
+from orchestrator.utils.policies import COMPENSATION_POLICY, PUBLISH_POLICY, STATE_POLICY
 
 with workflow.unsafe.imports_passed_through():
     # Every service-local import belongs inside this block, and the reason is not
@@ -41,10 +43,10 @@ with workflow.unsafe.imports_passed_through():
     # sandbox reuses the already-loaded modules; outside the block it would re-execute
     # them under restriction and fail the workflow task — forever, since Temporal
     # retries it. Add imports here, never above.
-    from orchestrator.activities.order import OrderActivities
-    from orchestrator.workflows.compensation import CompensationWorkflow
-    from orchestrator.workflows.payment import PaymentWorkflow
-    from orchestrator.workflows.rider import RiderWorkflow
+    from orchestrator.workflows.order.activities import OrderActivities
+    from orchestrator.workflows.compensation.workflow import CompensationWorkflow
+    from orchestrator.workflows.payment.workflow import PaymentWorkflow
+    from orchestrator.workflows.rider.workflow import RiderWorkflow
     from orchestrator.utils.transitions import recover_via_read, transition_and_publish
     from common.config import ORDER_TASK_QUEUE, RESTAURANT_DECISION_TIMEOUT_SECONDS
     from common.temporal import (
@@ -269,13 +271,27 @@ class OrderWorkflow:
         )
 
     async def _compensate(self, order_id: str, reason: str, detail: str) -> dict:
-        """Start `CompensationWorkflow` as a child and wait for its result (D55)."""
+        """Start `CompensationWorkflow` as a child and wait for its result (D55).
+
+        `retry_policy` here is a *workflow*-level retry — on top of the activity-level
+        retries already inside `CompensationWorkflow` itself — so a failure that outlasts
+        those (a Payment Service outage longer than the activity's own retry window, say)
+        still gets a few full attempts at the whole compensation flow before this gives up
+        for good. Safe to retry wholesale: `refund_payment_activity` is idempotent by the
+        payment's own status, not a caller-supplied key, so starting over never double-
+        refunds.
+        """
         self._stage = f"compensating:{reason}"
         result = await workflow.execute_child_workflow(
             CompensationWorkflow.run,
             {"order_id": order_id, "reason": reason, "detail": detail},
             id=compensation_workflow_id_for(order_id),
             task_queue=ORDER_TASK_QUEUE,
+            retry_policy=COMPENSATION_POLICY,
         )
-        self._stage = f"cancelled:{reason}"
+        # `result["status"]` rather than a hardcoded "cancelled": compensation does not
+        # always end in a clean cancellation any more — see CompensationWorkflow's own
+        # docstring for the 'compensation_failed' outcome — and this query is the cheap
+        # observability `OrderWorkflow.stage` exists to give, same as every other stage.
+        self._stage = f"{result['status']}:{reason}"
         return result

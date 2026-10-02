@@ -67,7 +67,7 @@ class PaymentServiceClient(ServiceFacade):
 
         `passthrough` is what keeps a business rejection (unsettled amount, an order
         already paid) from flattening into a generic `502` here — see
-        `activities/payment.py::create_manual_payment_activity`, which converts these into
+        `workflows/payment/activities.py::create_manual_payment_activity`, which converts these into
         non-retryable `ApplicationError`s Temporal can actually stop retrying on."""
         return self._client.post(
             "/api/v1/payments/manual",

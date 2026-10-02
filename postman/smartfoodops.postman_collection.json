@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "15eb2594-8df7-4a41-8247-69b17551c6b6",
     "name": "SmartFoodOps API",
-    "description": "Every route the Nginx gateway exposes across all 7 services (user, restaurant, menu, order, payment, rider, orchestrator), organised and asserted the same way scripts/smoke-test.sh drives them: happy path, authorisation boundaries, edge cases, and the Temporal-driven order saga end to end.\n\n**Run order matters.** Folders 1-9 are numbered because later ones depend on variables (tokens, ids) captured by earlier ones. Run the whole collection with the Collection Runner, top to bottom, in one sitting -- individual folders can be re-run later, but only after folder 2 has populated tokens in this session.\n\n**Folders 7 and 8 contain self-looping poll requests** (they re-send themselves via `postman.setNextRequest` until the order reaches the status they're waiting on, up to a bounded number of tries) -- since Week 2 the order lifecycle is driven by a Temporal saga, so a status is reached *eventually*, not by the time the request that triggered it returns. These only work in the Collection Runner, not on a single Send click; set a ~2000ms delay between requests there.\n\n**Two things smoke-test.sh checks that this collection can't**: it reads three tables directly (payments, order_tracking_logs, riders) via `docker exec` to assert refunds, trail rows and fleet-leak invariants no HTTP response exposes, and it drives two compensation paths (no rider available, kitchen at capacity) that need direct database manipulation to set up. Both are read-only observations layered on top of the same HTTP contract this collection already exercises.\n\nSee readme/observability-and-eventing-guide.md and readme/order-saga-orchestration-guide.md for how the pieces underneath these routes actually work.",
+    "description": "Every route the Nginx gateway exposes across all 7 services (user, restaurant, menu, order, payment, rider, orchestrator), organised and asserted the same way scripts/smoke-test.sh drives them: happy path, authorisation boundaries, edge cases, and the Temporal-driven order saga end to end.\n\n**Run order matters.** Folders 1-9 are numbered because later ones depend on variables (tokens, ids) captured by earlier ones. Run the whole collection with the Collection Runner, top to bottom, in one sitting -- individual folders can be re-run later, but only after folder 2 has populated tokens in this session.\n\n**Folders 7 and 8 contain self-looping poll requests** (they re-send themselves via `postman.setNextRequest` until the order reaches the status they're waiting on, up to a bounded number of tries) -- since Week 2 the order lifecycle is driven by a Temporal saga, so a status is reached *eventually*, not by the time the request that triggered it returns. These only work in the Collection Runner, not on a single Send click; set a ~2000ms delay between requests there.\n\n**Two things smoke-test.sh checks that this collection can't**: it reads three tables directly (payments, order_tracking_logs, riders) via `docker exec` to assert refunds, trail rows and fleet-leak invariants no HTTP response exposes, and it drives three compensation paths (no rider available, kitchen at capacity, and a permanently-failed refund) that need direct database or container manipulation to set up. Both are read-only observations layered on top of the same HTTP contract this collection already exercises.\n\nSee readme/observability-and-eventing-guide.md and readme/order-saga-orchestration-guide.md for how the pieces underneath these routes actually work.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "event": [
@@ -3041,6 +3041,61 @@
               }
             }
           ]
+        },
+        {
+          "id": "2635a07d-ce2d-46f3-b984-6a1098c73f41",
+          "name": "Admin lists orders by status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders?status=cancelled",
+            "description": "No listing-by-status endpoint existed for any status before D56's 'compensation_failed' needed one -- see readme/key-decisions.md#d56. system_admin only; OrderRepository.list_by_status, oldest first."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"body is a list\", () => pm.expect(Array.isArray(pm.response.json().body)).to.eql(true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "daf5e98b-cc41-41fb-a3eb-b30bdf6568f4",
+          "name": "A non-admin cannot list orders by status -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders?status=cancelled"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
         }
       ],
       "description": "'Create order' must run before every other request in this folder; several rows populate {{order_id}} / {{second_order_id}} that later folders (Payment, Saga) depend on."
@@ -4537,7 +4592,7 @@
           ]
         }
       ],
-      "description": "Also a Collection Runner folder (self-looping polls). The no-rider-available and at-capacity compensation paths in scripts/smoke-test.sh aren't reproduced here -- both need direct database manipulation (grounding the whole fleet, racing two orders) that isn't reachable through the HTTP API at all."
+      "description": "Also a Collection Runner folder (self-looping polls). The no-rider-available and at-capacity compensation paths in scripts/smoke-test.sh aren't reproduced here -- both need direct database manipulation (grounding the whole fleet, racing two orders) that isn't reachable through the HTTP API at all. Same reason the refund-permanently-fails path (D56, 'compensation_failed') isn't here either -- it needs sfo-payment-service stopped and restarted, which is a docker operation, not an HTTP one; see scripts/smoke-test.sh's 'compensation when the refund itself permanently fails' section."
     },
     {
       "id": "4a832965-e59e-4811-ad7a-de5b4e0aef60",

@@ -12,10 +12,11 @@ own record once to tell a genuine timeout apart from a lost signal/Update, since
 identical from inside the wait. `recover_via_read` below is that pattern, generalized over
 which activity to call and which field/values to look for.
 
-Reaches `orchestrator.activities`, so its own service-local import lives inside
-`imports_passed_through()` — see `order.py`'s docstring for why. Every workflow file that
-imports this module does so inside its own `imports_passed_through()` block for the same
-reason (reaching this module reaches `activities` transitively).
+Reaches `orchestrator.workflows.order.activities`, so its own service-local import lives
+inside `imports_passed_through()` — see `workflows/order/workflow.py`'s docstring for why.
+Every workflow file that imports this module does so inside its own
+`imports_passed_through()` block for the same reason (reaching this module reaches an
+entity's `activities.py` transitively).
 """
 
 from datetime import timedelta
@@ -27,7 +28,7 @@ from temporalio.exceptions import ActivityError
 from orchestrator.utils.policies import PUBLISH_POLICY, STATE_POLICY
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.activities.order import OrderActivities
+    from orchestrator.workflows.order.activities import OrderActivities
 
 
 async def transition_and_publish(

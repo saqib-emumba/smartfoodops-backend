@@ -5,19 +5,19 @@ moved this worker out of its image and database. See
 orchestrator/clients/order/order_service.py for what replaced the direct access.
 
 D55 (mentor's child-workflow split) moved payment and rider activities out of this class
-entirely — `activities/payment.py` and `activities/rider.py` now back `PaymentWorkflow` and
-`RiderWorkflow`, each a child of `OrderWorkflow`. What remains here is what is genuinely
-about the `order` entity's own state: creating it, transitioning it, and publishing its
-events. `read_rider_report_activity` stays here rather than moving to `activities/rider.py`
-because it reads `orders.rider_reported_stage` through `OrderServiceClient`, not anything the
-Rider Service owns — a fact about the order, read back by `RiderWorkflow`'s own recovery
-logic across the entity boundary, the same way `read_kitchen_decision_activity` always has
-been read across it by `OrderWorkflow` itself.
+entirely — `workflows/payment/activities.py` and `workflows/rider/activities.py` now back
+`PaymentWorkflow` and `RiderWorkflow`, each a child of `OrderWorkflow`. What remains here is
+what is genuinely about the `order` entity's own state: creating it, transitioning it, and
+publishing its events. `read_rider_report_activity` stays here rather than moving to
+`workflows/rider/activities.py` because it reads `orders.rider_reported_stage` through
+`OrderServiceClient`, not anything the Rider Service owns — a fact about the order, read
+back by `RiderWorkflow`'s own recovery logic across the entity boundary, the same way
+`read_kitchen_decision_activity` always has been read across it by `OrderWorkflow` itself.
 
-This module — like `clients/order/` and `workflows/order.py` — is scoped to the `order`
+This module — like `clients/order/` and `workflow.py` beside it — is scoped to the `order`
 entity specifically, so a future second entity this service orchestrates gets its own
-`activities/<entity>.py` beside this one rather than a second class crammed in here, and
-declares it in `registry.py`.
+`workflows/<entity>/activities.py` beside this one rather than a second class crammed in
+here, and declares it in `registry.py`.
 
 Two rules decide the shape of every function below, unchanged by any of the moves above.
 
@@ -39,6 +39,7 @@ argument is durable, UI-visible history, so a bearer token must never be one; an
 """
 
 from logging import Logger
+from typing import Callable
 
 from fastapi import HTTPException
 from temporalio import activity
@@ -67,6 +68,21 @@ class OrderActivities:
     def __init__(self, *, orders: OrderServiceClient, logger: Logger):
         self._orders = orders
         self._logger = logger
+
+    def all_activities(self) -> list[Callable]:
+        """Every activity Temporal should register for this class — read by `registry.py`,
+        not discovered: an activity's registered name is part of Temporal's durable
+        contract, so this list is kept explicit rather than reflected, the same reasoning
+        `registry.py`'s own docstring gives in full."""
+        return [
+            self.transition_order_activity,
+            self.read_kitchen_decision_activity,
+            # Week 3, D43 (cited as "D46" in much of the surrounding code — a miscitation).
+            self.read_rider_report_activity,
+            self.create_order_activity,
+            self.decide_kitchen_activity,
+            self.publish_order_event_activity,
+        ]
 
     # --- creation (D54/order-creation-temporal-update-design.md) -------------------------
 

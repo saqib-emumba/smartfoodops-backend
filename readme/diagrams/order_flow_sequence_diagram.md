@@ -4,10 +4,14 @@ Creation through delivery, the failure/compensation path, and the Kafka eventing
 alongside — the one diagram for the order flow. Verified against
 `services/order/apis/checkout.py`, `services/order/apis/internal_orders.py`,
 `services/order/apis/internal_kitchen.py`, `services/order/apis/internal_events.py`,
-`services/orchestrator/workflows/order.py`, `services/orchestrator/workflows/payment.py`,
-`services/orchestrator/workflows/rider.py`, `services/orchestrator/workflows/compensation.py`,
-`services/orchestrator/activities/order.py`, `services/orchestrator/activities/payment.py`,
-`services/orchestrator/activities/rider.py`, `services/order/apis/kitchen.py`,
+`services/orchestrator/workflows/order/workflow.py`,
+`services/orchestrator/workflows/payment/workflow.py`,
+`services/orchestrator/workflows/rider/workflow.py`,
+`services/orchestrator/workflows/compensation/workflow.py`,
+`services/orchestrator/workflows/order/activities.py`,
+`services/orchestrator/workflows/payment/activities.py`,
+`services/orchestrator/workflows/rider/activities.py`,
+`services/orchestrator/utils/transitions.py`, `services/order/apis/kitchen.py`,
 `services/order/apis/rider_reports.py`, `services/order/apis/transitions.py`,
 `services/rider/apis/delivery.py`, `services/rider/fleet.py`, and
 `services/common/kafka.py`'s `KafkaGateway`. See
@@ -47,6 +51,14 @@ about what it observed, not a call made *as* the customer.
 > `RiderWorkflow` releases whatever rider it claimed on *every one of its own* exit paths —
 > delivered, or a timed-out pickup/delivery with nothing recovered — so `CompensationWorkflow`
 > never touches the fleet at all, unlike the single-workflow version this replaces.
+
+> **A refund that permanently fails reaches `compensation_failed`, per
+> [D56](../key-decisions.md#d56--a-refund-that-permanently-fails-becomes-compensation_failed-not-a-silently-failed-workflow), implemented.**
+> `CompensationWorkflow` catches a refund activity that exhausts every retry instead of
+> letting the exception fail the workflow unhandled — drawn as a `break` in the
+> compensation section below, mirroring every other `break` in this diagram. The order
+> never reaches `cancelled` on this path; nothing was given back, so claiming otherwise
+> would be worse than an honest "needs a human."
 
 ```mermaid
 sequenceDiagram
@@ -211,7 +223,17 @@ sequenceDiagram
     rect rgb(255, 230, 230)
         Note over Worker, OrderSvc: If it fails instead: kitchen rejects/stays silent past 300s,<br/>or RiderWorkflow reports it could not complete -- compensate
         Note right of Worker: OrderWorkflow starts CompensationWorkflow as a child (D55) and awaits it.<br/>No rider involvement at all here -- RiderWorkflow already released whatever<br/>it claimed (or never claimed one), so this is purely money and order state.
-        Worker->>PaymentSvc: refund
+        Worker->>PaymentSvc: refund (retries per COMPENSATION_POLICY)
+        break every retry exhausted -- the refund permanently fails (D56)
+            PaymentSvc-->>Worker: still failing
+            Note right of Worker: CompensationWorkflow catches this instead of failing<br/>unhandled -- a business outcome, not a technical fluke
+            Worker->>OrderSvc: transition -> compensation_failed [reason, detail]
+            Worker->>OrderSvc: POST /orders/{id}/internal/events [X-Internal-Key]
+            OrderSvc-)Kafka: produce order.compensation_failed
+            OrderSvc-->>Worker: 200 published
+            Kafka->>Analytics: consume order.compensation_failed -> mark projection compensation_failed
+            Note right of Worker: visible via order_tracking_logs and<br/>GET /api/v1/orders?status=compensation_failed (system_admin) --<br/>never reaches 'cancelled' on this path
+        end
         PaymentSvc-->>Worker: refunded
         Worker->>PaymentSvc: POST /payments/internal/events [X-Internal-Key]
         PaymentSvc-)Kafka: produce payment.refunded

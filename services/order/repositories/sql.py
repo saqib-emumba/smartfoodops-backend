@@ -152,14 +152,20 @@ RECORD_RIDER_REPORT = f"""
 #   `status <> new` makes a replay a no-op instead of a second identical transition, which
 #   is what keeps the audit trail from growing an entry per retry.
 #
-#   `status NOT IN ('delivered','cancelled')` makes the terminal states final. A late
-#   signal for an order that has already been cancelled cannot resurrect it.
+#   `status NOT IN ('delivered','cancelled','compensation_failed')` makes the terminal
+#   states final. A late signal for an order that has already been cancelled (or whose
+#   compensation has already failed) cannot resurrect it.
 #
-#   The last clause only allows forward movement, except into 'cancelled', which is
-#   reachable from anywhere still in flight. It leans on a property of the schema worth
-#   knowing: a Postgres enum compares by *declaration order*, and `order_status` was
-#   declared in lifecycle order, so `'delivered' > 'assigned'` is simply true. That is why
-#   no separate ordering table is needed here.
+#   The last clause only allows forward movement, except into 'cancelled' or
+#   'compensation_failed', both reachable from anywhere still in flight — the saga can hit
+#   either from any in-progress state, not just ones declared earlier. It leans on a
+#   property of the schema worth knowing for every other value: a Postgres enum compares by
+#   *declaration order*, and `order_status` was declared in lifecycle order, so
+#   `'delivered' > 'assigned'` is simply true, and no separate ordering table is needed here.
+#   'compensation_failed' is declared last for readability only — its reachability is
+#   listed explicitly below rather than relied on from its position, unlike every other
+#   value, because "anywhere still in flight" does not follow from declaration order the
+#   way plain forward movement does.
 #
 # `rider_id` is COALESCEd so a later transition never clears an assignment made earlier.
 TRANSITION_ORDER = f"""
@@ -169,12 +175,20 @@ TRANSITION_ORDER = f"""
            updated_at = CURRENT_TIMESTAMP
      WHERE id = %(order_id)s::uuid
        AND status <> %(new_status)s::order_status
-       AND status NOT IN ('delivered', 'cancelled')
+       AND status NOT IN ('delivered', 'cancelled', 'compensation_failed')
        AND (
-             %(new_status)s::order_status = 'cancelled'
+             %(new_status)s::order_status IN ('cancelled', 'compensation_failed')
              OR %(new_status)s::order_status > status
            )
     RETURNING {_COLUMNS}
+"""
+
+# The admin surface for finding orders a status alone can't otherwise be queried by — no
+# listing-by-status endpoint existed before `compensation_failed` needed one (every other
+# read here is by id). Oldest first, the same ordering `SELECT_KITCHEN_QUEUE` uses for the
+# same reason: the longest-stuck order is the most urgent one.
+SELECT_BY_STATUS = f"""
+    SELECT {_COLUMNS} FROM orders WHERE status = %(status)s::order_status ORDER BY created_at
 """
 
 

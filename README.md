@@ -484,8 +484,11 @@ What it covers beyond status codes:
 
 - **The whole lifecycle** — `created → confirmed → assigned → picked_up → delivered`, read
   back out of the tracking trail with each `previous_status` derived rather than asserted
-- **Both compensation paths** — a kitchen rejection and an empty fleet each reach
-  `cancelled` with the payment `refunded` and **no rider left claimed**
+- **Every compensation path** — a kitchen rejection and an empty fleet each reach
+  `cancelled` with the payment `refunded` and **no rider left claimed**; a refund that
+  permanently fails (Payment Service taken off the road for the whole retry window) reaches
+  `compensation_failed` instead, recorded in the tracking trail and listable via
+  `GET /api/v1/orders?status=compensation_failed` (`system_admin`-only)
 - **Idempotency** — a replayed `X-Idempotency-Key` returns the *same* order, and the saga's
   payment key is derived from the order id so a retried activity cannot double-charge
 - **Server-side pricing** — asserts the recalculated unit price and total, not just a `201`

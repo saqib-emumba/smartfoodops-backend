@@ -26,6 +26,7 @@ from order.repositories.sql import (
     RECORD_RIDER_REPORT,
     SELECT_BY_ID,
     SELECT_BY_KEY,
+    SELECT_BY_STATUS,
     SELECT_KITCHEN_QUEUE,
     SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
     SELECT_LINE_ITEMS_FOR_ORDERS,
@@ -325,6 +326,15 @@ class OrderRepository(Repository):
             # compensation reason on `order.cancelled`, say — D38: the orchestrator holds no
             # outbox of its own) travels with that second call instead of being written here.
             return updated, True
+
+    def list_by_status(self, status: str) -> list[dict]:
+        """Every order currently in one status, oldest first — the admin surface for
+        finding orders stuck in a status that needs a human (`compensation_failed`), since
+        no listing-by-status endpoint existed for any status before this one needed it.
+        """
+        orders = self.all(SELECT_BY_STATUS, {"status": status})
+        self._attach_items(orders)
+        return orders
 
     def kitchen_queue(self, restaurant_id: UUID) -> list[dict]:
         """Orders awaiting this kitchen's decision, oldest first."""

@@ -9,6 +9,7 @@ them.
 """
 
 from logging import Logger
+from typing import Callable
 
 from fastapi import HTTPException
 from temporalio import activity
@@ -35,6 +36,18 @@ class PaymentActivities:
     def __init__(self, *, payments: PaymentServiceClient, logger: Logger):
         self._payments = payments
         self._logger = logger
+
+    def all_activities(self) -> list[Callable]:
+        """Every activity Temporal should register for this class — see
+        `OrderActivities.all_activities`'s docstring for why this list is explicit rather
+        than reflected. Used by both `PaymentWorkflow` (authorize/create/publish) and
+        `CompensationWorkflow` (refund/publish)."""
+        return [
+            self.authorize_payment_activity,
+            self.refund_payment_activity,
+            self.create_manual_payment_activity,
+            self.publish_payment_event_activity,
+        ]
 
     # --- saga -----------------------------------------------------------------------------
 

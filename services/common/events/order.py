@@ -28,8 +28,9 @@ class OrderCreatedData(BaseModel):
 
 class OrderTransitionData(BaseModel):
     """`order.confirmed` / `order.assigned` / `order.picked_up` / `order.delivered` /
-    `order.cancelled`. `metadata` carries whatever `OrderRepository.transition()` was
-    called with — for `order.cancelled` specifically, the saga's compensation `reason` and
+    `order.cancelled` / `order.compensation_failed`. `metadata` carries whatever
+    `OrderRepository.transition()` was called with — for `order.cancelled` and
+    `order.compensation_failed` specifically, the saga's compensation `reason` and
     `detail`, which is how a cause recorded nowhere the orchestrator can write reaches
     Kafka at all (D38: the orchestrator holds no outbox of its own).
     """
@@ -59,5 +60,6 @@ EVENT_DATA_MODELS: dict[str, tuple[type[BaseModel], int]] = {
     "order.picked_up": (OrderTransitionData, 1),
     "order.delivered": (OrderTransitionData, 1),
     "order.cancelled": (OrderTransitionData, 1),
+    "order.compensation_failed": (OrderTransitionData, 1),
     "order.kitchen.decided": (OrderKitchenDecidedData, 1),
 }
