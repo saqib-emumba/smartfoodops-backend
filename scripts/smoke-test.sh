@@ -424,8 +424,10 @@ ORDER_ID=$(jfield "['id']")
 assert "  customer taken from the token, not the body" "$(jfield "['customer_id']")" "$CUST_ID"
 assert "  server-recalculated unit price" "$(jfield "['items'][0]['unit_price']")" "13.5"
 assert "  server-recalculated total"      "$(jfield "['total_amount']")"          "27.0"
-# Still 'created' in this response, and that is not a race: the row is built from the
-# INSERT's RETURNING clause, so it is the state at commit time. The saga advances it after.
+# Still 'created' in this response, and that is not a race: the row is the one
+# `create_order_activity` returned, built from the INSERT's RETURNING clause, so it is the
+# state at commit time. Since D58 this response only arrives once OrderWorkflow has also
+# authorised the payment and confirmed the order -- asserted below, without polling.
 assert "  initial status is 'created'"    "$(jfield "['status']")"                "created"
 
 expect "replay same idempotency key -> 200" 200 POST /api/v1/orders "$ORDER" \
@@ -435,12 +437,18 @@ assert "  replay returned the SAME order (no duplicate)" "$(jfield "['id']")" "$
 # The Payment Service reads the order over HTTP, so this endpoint is part of the contract.
 expect "fetch order by id" 200 GET "/api/v1/orders/$ORDER_ID" "" "${CUST_AUTH[@]}"
 assert "  returned the same order" "$(jfield "['id']")" "$ORDER_ID"
+assert "  already 'confirmed' when the checkout response arrives (D58: no polling)" \
+  "$(jfield "['status']")" "confirmed"
 
 # --- payment is now the saga's job, not the client's -------------------------------------
 #
 # Week 1 had the customer POST /api/v1/payments themselves. Since the Week 2 saga owns
 # authorisation (D30) that call would race the workflow and lose on UNIQUE (order_id), so
 # what is asserted here changed from "create a payment" to "observe the one the saga made".
+# D58: the 201 above was only sent after payment was authorised, so the row is there at once.
+IMMEDIATE_PAY=$(docker_payment_row "$ORDER_ID")
+[[ -n "$IMMEDIATE_PAY" ]] && assert "  payment already 'authorized' when the checkout response arrives (D58)" \
+  "$(cut -d'|' -f1 <<<"$IMMEDIATE_PAY")" "authorized"
 poll_status "$ORDER_ID" confirmed 40 "${CUST_AUTH[@]}"
 
 PAYMENT_ID=""
@@ -950,6 +958,101 @@ if [[ -n "$INTERNAL_KEY" ]]; then
     '{"stage":"restaurant_decision"}' "${INTERNAL[@]}"
 fi
 
+# --- checkout answers after payment (D58) ------------------------------------------------
+section "Order saga — checkout answers after payment (D58)"
+
+# `OrderWorkflow` is checkout only now: create, pay, confirm, start fulfilment, complete. The
+# 201 the happy path received *is* its completion, and the kitchen's wait lives on a separate
+# `FulfillmentWorkflow` it started abandoned -- so the two have different lifetimes.
+if have_container sfo-temporal-server; then
+  wf_info() {
+    docker exec sfo-temporal-server temporal workflow describe --address 127.0.0.1:7233 \
+      --workflow-id "$1" -o json 2>/dev/null \
+      | python3 -c "import json,sys; i=json.load(sys.stdin)['workflowExecutionInfo']; print($2)" 2>/dev/null
+  }
+  assert "  order-<id> (checkout) has already completed" \
+    "$(wf_info "order-$ORDER_ID" "i['status']")" "WORKFLOW_EXECUTION_STATUS_COMPLETED"
+  assert "  fulfillment-<id> is still running, awaiting the kitchen" \
+    "$(wf_info "fulfillment-$ORDER_ID" "i['status']")" "WORKFLOW_EXECUTION_STATUS_RUNNING"
+  assert "  and it is a FulfillmentWorkflow" \
+    "$(wf_info "fulfillment-$ORDER_ID" "i['type']['name']")" "FulfillmentWorkflow"
+else
+  printf '  %sSKIP%s  workflow-shape checks (docker/sfo-temporal-server not reachable)\n' "$DIM" "$RESET"
+fi
+
+# Two requests with one idempotency key, truly concurrent. Whichever reaches Temporal first
+# starts the workflow; the other either attaches to that run (WorkflowAlreadyStarted) or, if
+# the first has already finished, starts a fresh run whose insert finds the order -- and in
+# both cases answers 200 without a second payment.
+CONC_KEY="idem-conc-$TAG"
+CONC_DIR=$(mktemp -d)
+for n in a b; do
+  curl -sS -m 90 -o "$CONC_DIR/$n.body" -w '%{http_code}\n' -X POST "$BASE_URL/api/v1/orders" \
+    -H 'Content-Type: application/json' -d "$ORDER" -H "X-Idempotency-Key: $CONC_KEY" \
+    "${CUST_AUTH[@]}" > "$CONC_DIR/$n.code" 2>/dev/null &
+done
+wait
+CONC_CODES=$(cat "$CONC_DIR/a.code" "$CONC_DIR/b.code" | sort | tr '\n' ' ' | sed 's/ $//')
+assert "two concurrent checkouts with one key: one 201 and one 200" "$CONC_CODES" "200 201"
+CONC_IDS=$(python3 -c "
+import json,sys
+print(len({json.load(open(f))['body']['id'] for f in sys.argv[1:]}))" "$CONC_DIR/a.body" "$CONC_DIR/b.body" 2>/dev/null)
+assert "  both answered with the same order" "$CONC_IDS" "1"
+CONC_ORDER=$(python3 -c "import json; print(json.load(open('$CONC_DIR/a.body'))['body']['id'])" 2>/dev/null)
+rm -rf "$CONC_DIR"
+if have_container sfo-payment-db && [[ -n "$CONC_ORDER" ]]; then
+  CONC_PAYMENTS=$(docker exec sfo-payment-db psql -U sfo_payment_admin -d sfo_payment_core -tA -c \
+    "SELECT count(*) FROM payments WHERE order_id='$CONC_ORDER';" 2>/dev/null | tr -d '[:space:]')
+  assert "  and it was only charged once" "$CONC_PAYMENTS" "1"
+fi
+
+# A payment that cannot be authorised fails the checkout itself: the customer is told so by
+# the response (402) rather than by a 201 for an order cancelled a moment later. Taking the
+# Payment Service off the road is the same device the refund-failure test below uses.
+if have_container sfo-payment-service; then
+  DECL_KEY="idem-declined-$TAG"
+  docker stop sfo-payment-service >/dev/null 2>&1
+  ok "took payment-service off the road"
+
+  # -m 70 overrides `expect`'s own -m 20: authorisation retries (AUTHORIZE_POLICY) outlast it.
+  expect "checkout with the payment service down -> 402" 402 POST /api/v1/orders "$ORDER" \
+    -H "X-Idempotency-Key: $DECL_KEY" "${CUST_AUTH[@]}" -m 70
+  assert "  the error says the payment was not authorised" \
+    "$([[ "$BODY" == *"not authorised"* ]] && echo yes)" "yes"
+
+  docker start sfo-payment-service >/dev/null 2>&1
+  for _ in $(seq 1 30); do
+    [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/payments/health")" == "200" ]] && break
+    sleep 2
+  done
+  ok "returned payment-service to the road"
+
+  if have_container sfo-order-db; then
+    DECL_ROW=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT id||'|'||status FROM orders WHERE idempotency_key='$DECL_KEY';" 2>/dev/null | tr -d '[:space:]')
+    DECL_ORDER=$(cut -d'|' -f1 <<<"$DECL_ROW")
+    assert "  the order exists, cancelled" "$(cut -d'|' -f2 <<<"$DECL_ROW")" "cancelled"
+    DECL_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$DECL_ORDER';" \
+      2>/dev/null | tr -d '[:space:]')
+    assert "  it never confirmed: created -> cancelled" "$DECL_TRAIL" "created,cancelled"
+    DECL_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$DECL_ORDER' AND new_status='cancelled';" \
+      2>/dev/null | tr -d '[:space:]')
+    assert "  and the trail names why" "$DECL_REASON" "payment_failed"
+    assert "  nothing was charged, so there is no payment row" "$(docker_payment_row "$DECL_ORDER")" ""
+  fi
+
+  # The first run is closed, so this starts a fresh one; its insert finds the order already
+  # there and the workflow stops at once -- no second authorisation attempt.
+  expect "replaying the declined checkout answers 200 with the cancelled order" 200 POST /api/v1/orders \
+    "$ORDER" -H "X-Idempotency-Key: $DECL_KEY" "${CUST_AUTH[@]}"
+  assert "  it reports the order as cancelled" "$(jfield "['status']")" "cancelled"
+  [[ -n "${DECL_ORDER:-}" ]] && assert "  and still did not try to charge" "$(docker_payment_row "$DECL_ORDER")" ""
+else
+  printf '  %sSKIP%s  declined-payment checkout (docker/sfo-payment-service not reachable)\n' "$DIM" "$RESET"
+fi
+
 # --- happy path all the way to delivered -------------------------------------------------
 section "Order saga — happy path to 'delivered'"
 
@@ -1162,10 +1265,11 @@ else
 fi
 
 # --- capacity ----------------------------------------------------------------------------
-# `restaurants.capacity` went unread by anything until Week 2, and since D32 it is enforced
-# in the same local transaction that puts an order on the rail — so two orders can never
-# both take the last slot. Onboard a kitchen with room for exactly one and prove the second
-# order is refused, refunded, and never reaches 'confirmed'.
+# `restaurants.capacity` is enforced twice (D58). An early, advisory check at order creation
+# turns a full kitchen away before anything is written or charged; the authoritative check is
+# atomic with the transition to 'confirmed' (D32) and refunds whoever loses a race to it. The
+# first is deterministic when orders are placed one after another; the second needs two
+# checkouts that are still paying at the same moment.
 section "Order saga — capacity is enforced"
 
 expect "onboard a one-slot kitchen" 201 POST /api/v1/restaurants/onboard \
@@ -1180,57 +1284,81 @@ TIGHT_ORDER="{\"restaurant_id\":\"$TIGHT_ID\",\"items\":[{\"item_id\":\"burger\"
 expect "first order takes the only slot" 201 POST /api/v1/orders "$TIGHT_ORDER" \
   -H "X-Idempotency-Key: $IDEM-cap1" "${CUST_AUTH[@]}"
 CAP1=$(jfield "['id']")
-expect "second order is placed too" 201 POST /api/v1/orders "$TIGHT_ORDER" \
+poll_status "$CAP1" confirmed 10 "${CUST_AUTH[@]}"
+
+# Checkout waits through payment and confirmation, so by now the first order is on the rail
+# and the second is refused up front: no order row, nothing charged, nothing to refund.
+expect "second order is turned away at creation -> 409" 409 POST /api/v1/orders "$TIGHT_ORDER" \
   -H "X-Idempotency-Key: $IDEM-cap2" "${CUST_AUTH[@]}"
-CAP2=$(jfield "['id']")
-
-# WHICH of the two takes the slot is not defined behaviour, so it is not asserted. Both
-# orders are placed milliseconds apart; each saga authorises a payment through a gateway
-# that sleeps MOCK_GATEWAY_LATENCY_SECONDS, and whichever of those two concurrent calls
-# returns first reaches the capacity gate first and wins. Submitting first usually wins,
-# which is exactly what makes hardcoding it a test that passes until it doesn't.
-#
-# What the platform actually guarantees is that *exactly one* gets in — so that is what is
-# checked here, and the refusal assertions below follow whichever one lost.
-poll_either "$CAP1" confirmed cancelled 60 "${CUST_AUTH[@]}"; CAP1_STATUS="$POLLED"
-poll_either "$CAP2" confirmed cancelled 60 "${CUST_AUTH[@]}"; CAP2_STATUS="$POLLED"
-
-if [[ "$CAP1_STATUS" == "confirmed" && "$CAP2_STATUS" == "cancelled" ]]; then
-  WINNER="$CAP1"; LOSER="$CAP2"
-elif [[ "$CAP2_STATUS" == "confirmed" && "$CAP1_STATUS" == "cancelled" ]]; then
-  WINNER="$CAP2"; LOSER="$CAP1"
-else
-  WINNER=""; LOSER=""
-fi
-
-if [[ -n "$WINNER" ]]; then
-  ok "exactly one of the two orders took the only slot"
-  printf '        %sslot won by %s, refused %s%s\n' "$DIM" "${WINNER:0:8}" "${LOSER:0:8}" "$RESET"
-else
-  bad "exactly one of the two orders took the only slot" \
-      "expected one 'confirmed' and one 'cancelled', got '$CAP1_STATUS' and '$CAP2_STATUS'"
-fi
-
-if [[ -n "$LOSER" ]]; then
-  LOSER_PAY=$(docker_payment_row "$LOSER")
-  [[ -n "$LOSER_PAY" ]] && assert "  the refused order was refunded" "$(cut -d'|' -f1 <<<"$LOSER_PAY")" "refunded"
-fi
-
-if have_container sfo-order-db && [[ -n "$LOSER" ]]; then
-  # It never reached 'confirmed' at all: the gate is *entry* to the rail, so the refused
-  # order goes created -> cancelled without ever occupying a slot.
-  LOSER_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
-    "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$LOSER';" \
-    2>/dev/null | tr -d '[:space:]')
-  assert "  it never joined the rail" "$LOSER_TRAIL" "created,cancelled"
-  LOSER_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
-    "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$LOSER' AND new_status='cancelled';" \
-    2>/dev/null | tr -d '[:space:]')
-  assert "  and the trail names why" "$LOSER_REASON" "kitchen_at_capacity"
+assert "  the error says the kitchen is at capacity" \
+  "$([[ "$BODY" == *"at capacity"* ]] && echo yes)" "yes"
+if have_container sfo-order-db; then
+  EARLY_ROWS=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT count(*) FROM orders WHERE idempotency_key='$IDEM-cap2';" 2>/dev/null | tr -d '[:space:]')
+  assert "  no order row was written for it" "$EARLY_ROWS" "0"
   RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
     "SELECT count(*) FROM orders WHERE restaurant_id='$TIGHT_ID' AND status='confirmed' AND kitchen_decision IS NULL;" \
     2>/dev/null | tr -d '[:space:]')
-  assert "  the rail never exceeded its capacity of 1" "$RAIL" "1"
+  assert "  the rail holds exactly its capacity of 1" "$RAIL" "1"
+fi
+expect "replaying the first order is unaffected by the full kitchen -> 200" 200 POST /api/v1/orders \
+  "$TIGHT_ORDER" -H "X-Idempotency-Key: $IDEM-cap1" "${CUST_AUTH[@]}"
+assert "  it is the same order" "$(jfield "['id']")" "$CAP1"
+
+# The race the early check cannot see: both orders are placed while the rail is still empty,
+# because neither has confirmed yet. Only the atomic check at 'confirmed' separates them, and
+# the loser has already been charged -- so it is refunded, then refused with a 409.
+expect "onboard a second one-slot kitchen for the race" 201 POST /api/v1/restaurants/onboard \
+  "{\"name\":\"Race Diner\",\"address\":\"2 Tight Street\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":1}" \
+  "${OWNER_AUTH[@]}"
+RACE_ID=$(jfield "['id']")
+expect "publish its menu" 200 POST /api/v1/menus \
+  "{\"restaurant_id\":\"$RACE_ID\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true}]}]}" \
+  "${OWNER_AUTH[@]}"
+
+RACE_ORDER="{\"restaurant_id\":\"$RACE_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}"
+RACE_DIR=$(mktemp -d)
+for n in a b; do
+  curl -sS -m 90 -o "$RACE_DIR/$n.body" -w '%{http_code}\n' -X POST "$BASE_URL/api/v1/orders" \
+    -H 'Content-Type: application/json' -d "$RACE_ORDER" -H "X-Idempotency-Key: $IDEM-race-$n" \
+    "${CUST_AUTH[@]}" > "$RACE_DIR/$n.code" 2>/dev/null &
+done
+wait
+RACE_CODES=$(cat "$RACE_DIR/a.code" "$RACE_DIR/b.code" | sort | tr '\n' ' ' | sed 's/ $//')
+# WHICH request wins is not defined behaviour, so it is not asserted: whichever payment
+# authorisation returns first reaches the gate first. What is guaranteed is exactly one 201.
+assert "exactly one of two simultaneous orders takes the only slot (201 + 409)" "$RACE_CODES" "201 409"
+rm -rf "$RACE_DIR"
+
+if have_container sfo-order-db; then
+  RACE_ROWS=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT count(*) FROM orders WHERE restaurant_id='$RACE_ID';" 2>/dev/null | tr -d '[:space:]')
+  RACE_RAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+    "SELECT count(*) FROM orders WHERE restaurant_id='$RACE_ID' AND status='confirmed' AND kitchen_decision IS NULL;" \
+    2>/dev/null | tr -d '[:space:]')
+  assert "  the rail never exceeded its capacity of 1" "$RACE_RAIL" "1"
+  if [[ "$RACE_ROWS" == "2" ]]; then
+    # Both got past the early check -- the case this block exists for. The loser was charged
+    # and refunded, and never joined the rail.
+    LOSER=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT id FROM orders WHERE restaurant_id='$RACE_ID' AND status='cancelled';" 2>/dev/null | tr -d '[:space:]')
+    ok "  both passed the early check; the loser was cancelled at 'confirmed'"
+    LOSER_PAY=$(docker_payment_row "$LOSER")
+    [[ -n "$LOSER_PAY" ]] && assert "  the refused order was refunded" "$(cut -d'|' -f1 <<<"$LOSER_PAY")" "refunded"
+    LOSER_TRAIL=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT string_agg(new_status::text, ',' ORDER BY seq) FROM order_tracking_logs WHERE order_id='$LOSER';" \
+      2>/dev/null | tr -d '[:space:]')
+    assert "  it never joined the rail" "$LOSER_TRAIL" "created,cancelled"
+    LOSER_REASON=$(docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core -tA -c \
+      "SELECT metadata->>'reason' FROM order_tracking_logs WHERE order_id='$LOSER' AND new_status='cancelled';" \
+      2>/dev/null | tr -d '[:space:]')
+    assert "  and the trail names why" "$LOSER_REASON" "kitchen_at_capacity"
+  else
+    # The first order confirmed before the second was inserted (a very fast gateway), so the
+    # early check caught it and no row exists -- still correct, just the other path.
+    assert "  the early check caught the loser (no row written)" "$RACE_ROWS" "1"
+    printf '        %sthe gateway was fast enough that the early check, not the refund path, won%s\n' "$DIM" "$RESET"
+  fi
 fi
 
 # --- no rider left behind ----------------------------------------------------------------

@@ -167,6 +167,12 @@ class OrderRepository(Repository):
         nothing has been committed for the client to have been told about.
         """
         with self._db.cursor(commit=True) as cur:
+            # A unique violation aborts the whole transaction in Postgres, so without this the
+            # re-select in the handler below fails with InFailedSqlTransaction instead of
+            # finding the existing order. Rolling back to a savepoint keeps the transaction
+            # usable. Since D58 this is the *ordinary* replay path -- a retry after the first
+            # run finished starts a fresh run whose insert collides here -- not a rare race.
+            cur.execute("SAVEPOINT insert_order")
             try:
                 cur.execute(
                     INSERT_ORDER,
@@ -179,6 +185,7 @@ class OrderRepository(Repository):
                     ),
                 )
             except psycopg2.errors.UniqueViolation as exc:
+                cur.execute("ROLLBACK TO SAVEPOINT insert_order")
                 # Same order_id (a same-customer race, converged below) or the same literal
                 # idempotency_key chosen by a different customer (a genuine collision, since
                 # two different customers never derive the same order_id to race on).
