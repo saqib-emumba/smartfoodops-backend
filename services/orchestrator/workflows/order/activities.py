@@ -12,7 +12,7 @@ publishing its events. `read_rider_report_activity` stays here rather than movin
 `workflows/rider/activities.py` because it reads `orders.rider_reported_stage` through
 `OrderServiceClient`, not anything the Rider Service owns — a fact about the order, read
 back by `RiderWorkflow`'s own recovery logic across the entity boundary, the same way
-`read_kitchen_decision_activity` always has been read across it by `OrderWorkflow` itself.
+`read_kitchen_decision_activity` is read across it by `FulfillmentWorkflow` (D58).
 
 This module — like `clients/order/` and `workflow.py` beside it — is scoped to the `order`
 entity specifically, so a future second entity this service orchestrates gets its own
@@ -88,7 +88,7 @@ class OrderActivities:
 
     @activity.defn
     def create_order_activity(self, payload: dict) -> dict:
-        """The write behind `OrderWorkflow.create_order`'s Update handler.
+        """Step 1 of `OrderWorkflow.run()` (D58; an Update handler's write before that).
 
         `OrderInternalCreateRequest` on the wire does the re-pricing, verification and
         insert `checkout.py` used to do directly — see
@@ -118,7 +118,7 @@ class OrderActivities:
 
     @activity.defn
     def decide_kitchen_activity(self, details: dict) -> dict:
-        """The write behind `OrderWorkflow.kitchen_decision`'s Update handler — see
+        """The write behind `FulfillmentWorkflow.kitchen_decision`'s Update handler — see
         order/apis/internal_kitchen.py. Returns `{order_id, decision, status, changed}`;
         `changed` is what lets the Update handler decide whether to publish."""
         order_id = details["order_id"]

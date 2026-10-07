@@ -1,8 +1,8 @@
 """Internal-only: publish one event to Kafka (D53).
 
 Replaces `order_outbox` and its relay. Deliberately dumb — validate and produce, nothing
-else — because the caller (`publish_order_event_activity`, called from `OrderWorkflow` right
-after the activity that made the underlying write) has already read the order fresh and
+else — because the caller (`publish_order_event_activity`, called from `OrderWorkflow` or
+`FulfillmentWorkflow` right after the activity that made the underlying write) has already read the order fresh and
 assembled `data` itself; this endpoint's only job is the one thing a Temporal activity cannot
 do safely inside a `@workflow.defn` body (D38): talk to Kafka.
 

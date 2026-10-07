@@ -126,6 +126,11 @@ POOL_MAX_CONNECTIONS = 10
 # taken, which costs a real sale to save a few seconds.
 RESTAURANT_DECISION_TIMEOUT_SECONDS = 300
 
+# D58: how long the checkout request waits for OrderWorkflow to create and pay for the order.
+# Sits under the gateway's 90s read timeout on /api/v1/orders, so the API gives its own answer
+# ("still processing — retry with the same key") rather than nginx answering 504 for it.
+CHECKOUT_DEADLINE_SECONDS = 85
+
 # Rider search. Repeated short attempts separated by durable timers rather than one long
 # call, because "no rider free right now" is a condition that resolves with time, and a
 # single blocking attempt cannot wait for it. Total window is attempts x interval.

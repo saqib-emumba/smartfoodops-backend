@@ -26,6 +26,11 @@ def unauthorized(detail: str) -> HTTPException:
     )
 
 
+def payment_required(detail: str) -> HTTPException:
+    """402 — the request was valid, but its payment was not authorised (D58)."""
+    return HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=detail)
+
+
 def forbidden(detail: str) -> HTTPException:
     """403 — the caller is known but not authorised for this action."""
     return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)

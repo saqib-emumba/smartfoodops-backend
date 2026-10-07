@@ -10,6 +10,18 @@ sharing neither the Order Service's image nor its database. Every diagram and tr
 reflects that split — where the code used to write `sfo_order_core` directly it now makes an
 HTTP call, and the container that used to be `order-worker` is `orchestrator-worker`.
 
+> **Since [D55](key-decisions.md#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow)
+> and [D58](key-decisions.md#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) the saga is a tree of workflows**,
+> not the single `OrderWorkflow` the traces below show. `OrderWorkflow` creates the order and
+> starts `PaymentWorkflow`; once payment is authorised it hands off to `FulfillmentWorkflow`,
+> which holds the kitchen's decision (as the `kitchen_decision` Update on
+> `fulfillment-<order_id>`) and starts `RiderWorkflow` and `CompensationWorkflow`. Checkout
+> starts `OrderWorkflow` and waits for its result — it ends once the order is paid for,
+> having started `FulfillmentWorkflow` abandoned — so `POST /api/v1/orders` returns after
+> payment. The `confirmed` transition (payment recorded, capacity slot claimed, and the refund
+> if the kitchen is full) runs in `OrderWorkflow`, before `FulfillmentWorkflow` starts. The
+> step-by-step logic below is otherwise what each of those workflows does.
+
 `activities/`, `clients/`, `schemas/`, `workflows/` and `apis/` under `services/orchestrator/`
 are all entity-scoped — every file below named `order.py` or `order/` is that entity's own,
 so a second workflow this service might one day orchestrate gets its own set beside it

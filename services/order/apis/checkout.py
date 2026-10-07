@@ -1,9 +1,11 @@
 """Checkout: place an order, then read it back — bearer and internal variants.
 
 `create_order` is a thin wrapper as of D53/order-creation-temporal-update-design.md: it
-derives the order's id, hands the raw cart to Temporal via Update-with-Start, and maps the
-result onto 201/200. Re-pricing, verification and the insert itself moved to
-apis/internal_orders.py, reached only through the workflow now.
+derives the order's id, starts `OrderWorkflow` with the raw cart (D58 — no Update; D54 used
+Update-with-Start), and maps the outcome onto 201/200. Re-pricing, verification and the insert itself moved to
+apis/internal_orders.py, reached only through the workflow now. Since D58 the answer comes
+after payment authorisation, so a declined payment is a 402 here rather than a 201 for an
+order the saga cancels a moment later.
 """
 
 from uuid import UUID, uuid5
@@ -43,7 +45,10 @@ def list_orders_by_status(status: str) -> Envelope[list[OrderResponse]]:
     "",
     response_model=Envelope[OrderResponse],
     status_code=status.HTTP_201_CREATED,
-    responses=REPLAY_RESPONSE,
+    responses={
+        **REPLAY_RESPONSE,
+        402: {"description": "Payment was not authorised; the order was cancelled"},
+    },
 )
 async def create_order(
     payload: OrderCreateRequest,
@@ -51,7 +56,7 @@ async def create_order(
     x_idempotency_key: str = Header(..., alias="X-Idempotency-Key"),
     current_user: CurrentUser = Depends(require_permission("order:create")),
 ) -> Envelope[OrderResponse]:
-    """Place an order idempotently, via a Temporal Update-with-Start.
+    """Place an order idempotently, by starting its Temporal saga.
 
     `order_id` is derived deterministically from `(customer_id, idempotency_key)` — never
     the idempotency key alone, so two different customers reusing the same literal key
@@ -60,11 +65,16 @@ async def create_order(
     apis/internal_orders.py). This is what lets the workflow be addressed before Postgres
     has ever heard of the order.
 
+    Returns once payment has been authorised (D58), not merely once the order row exists:
+    `OrderWorkflow` creates and pays, and its result is what this waits for. A refused payment comes back as `402`; the order still
+    exists, as `cancelled`.
+
     Temporal being unreachable now means no order can be created at all — see
-    `common.temporal.SagaClient.start_with_update`, which raises `503` rather than
+    `common.temporal.SagaClient.start_and_wait`, which raises `503` rather than
     degrading gracefully the way D25's fire-and-forget saga start used to.
     """
-    order_id = uuid5(ORDER_ID_NAMESPACE, f"{current_user.user_id}:{x_idempotency_key}")
+    order_id = uuid5(ORDER_ID_NAMESPACE,
+                     f"{current_user.user_id}:{x_idempotency_key}")
 
     result = await deps.orchestrator_service.create_order(
         order_id,

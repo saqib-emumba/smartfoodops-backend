@@ -1,16 +1,16 @@
 """`RiderWorkflow` — dispatch, pickup, delivery, for one order (D55, the mentor's
 child-workflow split).
 
-Started as a child of `OrderWorkflow` once the kitchen has accepted. Owns the rider's whole
-lifecycle for this order end to end, including releasing whatever it claimed on *every* exit
-path — delivered, or a pickup/delivery timeout with nothing recovered — so `OrderWorkflow`'s
-own compensation path never needs to know whether a rider was ever assigned at all: by the
+Started as a child of `FulfillmentWorkflow` (D58; of `OrderWorkflow` before that) once the
+kitchen has accepted. Owns the rider's whole lifecycle for this order end to end, including
+releasing whatever it claimed on *every* exit path — delivered, or a pickup/delivery timeout
+with nothing recovered — so `FulfillmentWorkflow`'s compensation path never needs to know whether a rider was ever assigned at all: by the
 time `CompensationWorkflow` might start, this workflow has already cleaned up after itself,
 or there was never anything to clean up (dispatch never found one, or never ran because the
 kitchen rejected first).
 
 Signalled directly by the Rider Service now (`services/rider/fleet.py`), not relayed through
-`OrderWorkflow` — see `common.temporal.rider_workflow_id_for`.
+its parent — see `common.temporal.rider_workflow_id_for`.
 """
 
 import asyncio

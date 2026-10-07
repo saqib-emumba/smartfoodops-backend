@@ -25,7 +25,8 @@ earns a second *container* if it needs to scale or deploy independently of this 
 D55 (the mentor's child-workflow split) added `PaymentWorkflow`, `RiderWorkflow` and
 `CompensationWorkflow` here, all sharing `ORDER_TASK_QUEUE` rather than a queue each: they
 are children `OrderWorkflow` starts and awaits directly, not independently-scheduled sagas
-of their own, so there is nothing a second queue would buy beyond ceremony.
+of their own, so there is nothing a second queue would buy beyond ceremony. D58's
+`FulfillmentWorkflow` joins them on the same queue for the same reason.
 """
 
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from orchestrator.clients.order.order_service import OrderServiceClient
 from orchestrator.clients.payment.payment_service import PaymentServiceClient
 from orchestrator.clients.rider.rider_service import SagaRiderClient
 from orchestrator.workflows.compensation.workflow import CompensationWorkflow
+from orchestrator.workflows.fulfillment.workflow import FulfillmentWorkflow
 from orchestrator.workflows.order.activities import OrderActivities
 from orchestrator.workflows.order.workflow import OrderWorkflow
 from orchestrator.workflows.payment.activities import PaymentActivities
@@ -68,7 +70,13 @@ def registrations(logger: Logger) -> list[Registration]:
     return [
         Registration(
             task_queue=ORDER_TASK_QUEUE,
-            workflows=[OrderWorkflow, PaymentWorkflow, RiderWorkflow, CompensationWorkflow],
+            workflows=[
+                OrderWorkflow,
+                PaymentWorkflow,
+                FulfillmentWorkflow,
+                RiderWorkflow,
+                CompensationWorkflow,
+            ],
             activities=[
                 *order_activities.all_activities(),
                 *payment_activities.all_activities(),

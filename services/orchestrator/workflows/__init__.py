@@ -1,7 +1,9 @@
 """Temporal workflow definitions, one subpackage per entity this service orchestrates —
 `order/` (`OrderWorkflow`, the parent), and, since D55's child-workflow split, `payment/`
-(`PaymentWorkflow`), `rider/` (`RiderWorkflow`) and `compensation/` (`CompensationWorkflow`),
-each started as a child and awaited by `OrderWorkflow` itself.
+(`PaymentWorkflow`), `rider/` (`RiderWorkflow`) and `compensation/` (`CompensationWorkflow`).
+D58 added `fulfillment/` (`FulfillmentWorkflow`): `OrderWorkflow` runs `PaymentWorkflow` as a
+child, then starts `FulfillmentWorkflow` abandoned and completes; `FulfillmentWorkflow`
+starts the rider and compensation children in turn.
 
 Each entity subpackage holds its workflow (`workflow.py`) and, where it has one, the
 activities backing it (`activities.py`) side by side — moved here from a separate top-level

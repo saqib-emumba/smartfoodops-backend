@@ -1,7 +1,7 @@
 """`CompensationWorkflow` — undo a saga that cannot proceed (D55, the mentor's
 child-workflow split).
 
-Started as a child of `OrderWorkflow` whenever forward progress stops: the kitchen's rail is
+Started as a child of `FulfillmentWorkflow` (D58) whenever forward progress stops: the kitchen's rail is
 full, it never answers, it rejects the order, or `RiderWorkflow` reports it could not
 complete (no rider found, or a pickup/delivery that never happened). Refunds the payment,
 then cancels the order — in that order, because the refund is the customer's money.
@@ -14,7 +14,7 @@ this workflow to release, is what lets this workflow stay a pure "undo the money
 order" concern with no fleet awareness at all.
 
 If the refund itself cannot be completed — `COMPENSATION_POLICY`'s own retries exhausted,
-and `OrderWorkflow._compensate`'s workflow-level retry of this whole workflow exhausted on
+and `FulfillmentWorkflow._compensate`'s workflow-level retry of this whole workflow exhausted on
 top of that — that is treated as a business outcome, not a technical failure left to kill
 this workflow unhandled: `'compensation_failed'` is a real `order_status` value precisely so
 this case is visible the same way every other transition is (`order_tracking_logs`, the

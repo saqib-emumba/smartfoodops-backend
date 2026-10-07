@@ -130,18 +130,37 @@ Rules the code enforces deliberately:
 
 ### The order saga
 
-`POST /api/v1/orders` still does everything it did in Week 1 — re-prices the cart, verifies
-the customer and restaurant over HTTP, and commits the order with the opening entry of its
-audit trail in one transaction. It then starts a workflow whose id is derived from the order
-id, so starting one twice is a no-op.
+`POST /api/v1/orders` derives the order id from `(customer, X-Idempotency-Key)`, starts
+`OrderWorkflow` under it with the cart, and waits for that workflow's result — nothing is sent
+into it and nothing is polled (D58). The workflow re-prices and inserts the order (the same
+Week 1 checks, now behind `create_order_activity`), authorises payment, starts the
+fulfilment workflow and completes. The API answers with that result: `201` paid, `200`
+replay, `402` declined (the order is cancelled), `409` if the kitchen is full (turned away
+before any charge when it is already full at creation; refunded and cancelled if it fills up
+while the order is being paid for), or the usual `422`/`404`/`409` for a rejected cart.
+
+The saga is a handful of workflows, one per concern:
+
+```
+order-<id>         OrderWorkflow        create → pay → start fulfilment, then it ends
+├── payment-<id>       PaymentWorkflow      authorise (child; awaited)
+└── fulfillment-<id>   FulfillmentWorkflow  kitchen — started *abandoned*, outlives order-<id>
+    ├── rider-<id>         RiderWorkflow        dispatch, pickup, delivery
+    └── compensation-<id>  CompensationWorkflow refund, then cancel
+```
+
+`order-<id>` therefore means "checkout", not "the whole order": ask `fulfillment-<id>` where
+an order has got to.
 
 ```
 created ──payment authorised──▶ confirmed  (= on the kitchen's rail;
-                                    │       entering it claims a capacity slot,
-                                    │       checked in the same transaction)
+   │                                │       entering it claims a capacity slot,
+   ├─payment declined──▶ cancelled  │       checked in the same transaction)
+   │ (API answers 402)              │
+   └─kitchen full──▶ refund ──▶ cancelled   (API answers 409)
                                     │  durable timer (120s)
                     ┌───────────────┴───────────────┐
-              accepted                   rejected / silence / at capacity
+              accepted                   rejected / silence
                     │                               │
           rider search (6 × 10s)                    │
                     │                               │

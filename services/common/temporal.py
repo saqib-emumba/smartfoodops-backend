@@ -15,6 +15,7 @@ thing this module owns. That is what makes starting a saga idempotent: two attem
 order compute the same id, and Temporal is then the thing that refuses the duplicate.
 """
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from logging import Logger
@@ -22,13 +23,12 @@ from uuid import UUID
 
 from temporalio.client import (
     Client,
-    WithStartWorkflowOperation,
     WorkflowFailureError,
     WorkflowUpdateFailedError,
 )
 from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
 
 from common.errors import (
@@ -38,6 +38,7 @@ from common.errors import (
     forbidden,
     internal_error,
     not_found,
+    payment_required,
     service_unavailable,
     unauthorized,
     unprocessable,
@@ -53,6 +54,12 @@ _ERROR_TYPE_STATUS = {
     "OrderCreateConflict": conflict,
     "ManualPaymentRejected": unprocessable,
     "ManualPaymentConflict": conflict,
+    # D58: how `OrderWorkflow` fails when the saga's own payment authorisation does — raised
+    # by the workflow itself rather than an activity, but mapped through the same table.
+    "PaymentDeclined": payment_required,
+    # D58: the kitchen was full when `OrderWorkflow` tried to confirm a paid order. By the time
+    # this is raised the payment has been refunded and the order cancelled.
+    "KitchenAtCapacity": conflict,
 }
 
 # The generic fallback: an activity that catches a plain `HTTPException` it has no
@@ -182,9 +189,16 @@ def rider_workflow_id_for(order_id: UUID | str) -> str:
     return workflow_id("rider", order_id)
 
 
+def fulfillment_workflow_id_for(order_id: UUID | str) -> str:
+    """`FulfillmentWorkflow`'s id (D58) — the child `OrderWorkflow` hands a paid order to.
+    It holds the `kitchen_decision` Update now, so the Order Service's kitchen endpoints
+    address this id rather than `workflow_id_for`'s."""
+    return workflow_id("fulfillment", order_id)
+
+
 def compensation_workflow_id_for(order_id: UUID | str) -> str:
-    """`CompensationWorkflow`'s id — started at most once per order, by `OrderWorkflow`
-    itself, whenever the saga cannot proceed."""
+    """`CompensationWorkflow`'s id — started at most once per order, by
+    `FulfillmentWorkflow`, whenever the saga cannot proceed after payment."""
     return workflow_id("compensation", order_id)
 
 
@@ -395,39 +409,57 @@ class SagaClient:
             self._logger.error("Could not send update '%s' to saga %s: %s", update, wf_id, exc)
             raise conflict(f"The saga {wf_id} would not accept update '{update}'") from exc
 
-    async def start_with_update(
+    async def start_and_wait(
         self,
         workflow: str,
         *,
         task_queue: str,
         wf_id: str,
-        update: str,
-        update_payload: dict,
-    ) -> dict:
-        """Update-with-Start (D53/the order-creation design): atomically start a workflow if
-        it is not already running, deliver an Update to it, and block for the Update's
-        result — one round trip for "the order exists and the saga is running", instead of
-        an insert followed by a separate, best-effort saga start (D25).
+        payload: dict,
+        deadline: float,
+    ) -> tuple[dict, bool]:
+        """Start a workflow and wait for its result, saying whether this call started it (D58).
 
-        `USE_EXISTING` is what makes a retried request safe: it routes the Update to the
-        workflow already running under this id rather than starting a duplicate, exactly as
-        `start()` already relies on for a retried checkout.
+        For a workflow whose *result* is the answer the caller needs and which ends when that
+        answer is ready — checkout's `OrderWorkflow` creates and pays, returns, and leaves
+        the rest of the order to an abandoned child. Nothing is sent into the workflow and
+        nothing is polled: it is started with `payload` and its result awaited, which is
+        what the mentors asked for in place of D54's Update-with-Start.
+
+        Returns `(result, started)`. The SDK does not report whether a `USE_EXISTING` start
+        began a new run, so this starts with `FAIL` and treats `WorkflowAlreadyStartedError`
+        as "a retry of a request still in flight": attach to that run and wait for it
+        instead. A *closed* workflow under the same id does not raise — Temporal starts a
+        fresh run, as it would have before.
+
+        A workflow that fails with an `ApplicationError` is mapped onto an HTTP status through
+        the same `_status_factory` table activity errors use. Past `deadline` the workflow is
+        still working, so the answer is a retryable 503 — and a retry with the same business
+        key addresses the same workflow, so it is safe. The timeout only abandons *this
+        caller's wait*; it does not cancel the workflow.
         """
         if not self._gateway.connected:
             raise service_unavailable("Temporal is unreachable; the order was not created")
 
-        start_operation = WithStartWorkflowOperation(
-            workflow,
-            args=[],
-            id=wf_id,
-            task_queue=task_queue,
-            id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
-        )
+        client = self._gateway.client
         try:
-            return await self._gateway.client.execute_update_with_start_workflow(
-                update,
-                args=[update_payload],
-                start_workflow_operation=start_operation,
+            handle = await client.start_workflow(
+                workflow,
+                payload,
+                id=wf_id,
+                task_queue=task_queue,
+                id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
             )
-        except WorkflowUpdateFailedError as exc:
+            started = True
+        except WorkflowAlreadyStartedError:
+            handle = client.get_workflow_handle(wf_id)
+            started = False
+
+        try:
+            return await asyncio.wait_for(handle.result(), timeout=deadline), started
+        except asyncio.TimeoutError as exc:
+            raise service_unavailable(
+                f"Saga {wf_id} is still processing; retry with the same idempotency key"
+            ) from exc
+        except WorkflowFailureError as exc:
             _raise_mapped(exc, default=conflict)

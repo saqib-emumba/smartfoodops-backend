@@ -7,6 +7,14 @@ the mentor's direction that order creation should go through Temporal rather tha
 through the Order Service, scoped to order creation only (not every write endpoint
 platform-wide).
 
+> **Partly superseded by [D58](key-decisions.md#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow).** At the mentors'
+> direction the API no longer uses Update-with-Start: it starts `OrderWorkflow` with the cart
+> as its start argument and waits for that workflow's result. The insert this document
+> moves behind Temporal is now the first step of `OrderWorkflow.run()`, not a `create_order`
+> Update handler, and the API answers after payment authorisation rather than after the
+> insert. §3 (the derived order id) and §4 (racing duplicates) still hold; §2 and §5 describe
+> the replaced mechanism.
+
 ## 1. The problem
 
 Today (`services/order/apis/checkout.py::create_order`), placing an order is two separate

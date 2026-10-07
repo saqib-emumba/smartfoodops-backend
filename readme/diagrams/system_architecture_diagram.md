@@ -3,14 +3,15 @@
 Every container in `docker-compose.yml`, with real host/container ports and the actual
 dependency graph — not an idealized version. See
 [readme/key-decisions.md](../key-decisions.md) for the D-numbers behind the shape (D01
-database-per-service, D25/D54 orchestration over choreography — order creation itself now
-happens inside the saga via a Temporal Update, D36 the orchestrator split, D38 Kafka
+database-per-service, D25/D54 orchestration over choreography — order creation itself
+happens inside the saga, started by the API and awaited for its result, D58, D36 the orchestrator split, D38 Kafka
 carries facts / Temporal owns decisions, D47 services hold their own Temporal client, D51
 the gateway's `auth_request` chokepoint, D52 internal calls asserting identity headers
 instead of forwarding the bearer token, D53 the transactional outbox tables are removed in
 favour of a Temporal-activity publish, D55 payment/rider/compensation become child
-workflows of `OrderWorkflow`, D57 RBAC moves into the database and is enforced at the
-gateway).
+workflows, D57 RBAC moves into the database and is enforced at the gateway, D58 checkout
+starts `OrderWorkflow` and answers after payment, with the post-payment work in an abandoned
+`FulfillmentWorkflow`).
 
 Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
 Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
@@ -47,7 +48,7 @@ flowchart TB
 
     subgraph Saga ["Orchestration (Temporal)"]
         TemporalServer["Temporal Server (dev, embedded SQLite)<br/>7233 / 8233 / 9233"]
-        OrchestratorWorker["Orchestrator Worker<br/>OrderWorkflow + child workflows<br/>(PaymentWorkflow, RiderWorkflow,<br/>CompensationWorkflow -- D55)<br/>metrics 9108"]
+        OrchestratorWorker["Orchestrator Worker<br/>OrderWorkflow (create, pay, confirm)<br/>-> PaymentWorkflow (child)<br/>-> FulfillmentWorkflow (abandoned, D58)<br/>-> RiderWorkflow, CompensationWorkflow<br/>metrics 9108"]
     end
 
     subgraph Eventing ["Eventing"]
@@ -92,7 +93,7 @@ flowchart TB
     RiderSvc -->|record pickup / delivery stage| OrderSvc
 
     %% -- saga: services hold their own Temporal client (D47) --
-    OrderSvc -->|create_order / kitchen_decision Update, D53/D54| TemporalServer
+    OrderSvc -->|start OrderWorkflow + await result, D58<br/>kitchen_decision Update on FulfillmentWorkflow| TemporalServer
     PaymentSvc -->|start PaymentWorkflow, manual mode, D55| TemporalServer
     RiderSvc -->|signal RiderWorkflow: pickup / delivery, D55| TemporalServer
     OrchestratorAPI -.->|health probe only| TemporalServer

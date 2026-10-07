@@ -125,8 +125,19 @@ class OrderRepository(Repository):
         items_snapshot: list[dict],
         total: Decimal,
         idempotency_key: str,
+        capacity_limit: int | None = None,
     ) -> tuple[dict, bool]:
         """Insert an order and open its audit trail in one transaction.
+
+        `capacity_limit` is the *early*, advisory capacity check (D58): once a fresh order has
+        been inserted, count the kitchen's rail and, if it is already full, raise `AtCapacity`
+        — which rolls the insert back, so a turned-away order leaves no row and is never
+        charged. It runs only on a genuine insert, never on a replay (those return above, from
+        the unique-violation branch), so replaying an order that exists never fails because the
+        kitchen has since filled up. It is advisory because the rail only counts `confirmed`
+        orders: concurrent checkouts that are still paying are invisible to it, so several can
+        pass together. `transition(capacity_limit=...)` at `confirmed` is the atomic check that
+        actually guarantees the limit, and refunds whoever loses that race.
 
         `order_id` arrives from the caller rather than the column's own default
         (order-creation-temporal-update-design.md ss3): it is derived deterministically from
@@ -183,6 +194,12 @@ class OrderRepository(Repository):
                 ) from exc
             order = cur.fetchone()
 
+            if capacity_limit is not None:
+                cur.execute(COUNT_ON_RAIL_FOR_ORDER, {"order_id": str(order_id)})
+                on_rail = cur.fetchone()["on_rail"]
+                if on_rail >= capacity_limit:
+                    raise AtCapacity(order_id, on_rail, capacity_limit)
+
             # Same transaction as the order itself: an order without its line items cannot
             # exist, the same guarantee D24 already gives the trail row below. Already have
             # `items_snapshot` in hand, so the row handed back to the caller is built from
@@ -232,9 +249,9 @@ class OrderRepository(Repository):
             )
 
             # No outbox row here any more (D53): `order.created` reaches Kafka via a
-            # `publish_order_event_activity` the workflow's `create_order` Update handler
-            # calls right after this method returns, which re-reads the row fresh over
-            # `GET /orders/{id}/internal` — see orchestrator/activities/order.py.
+            # `publish_order_event_activity` `OrderWorkflow.run()` calls right after this
+            # method returns, which re-reads the row fresh over `GET /orders/{id}/internal`
+            # — see orchestrator/workflows/order/activities.py.
             return order, True
 
     def transition(
@@ -357,9 +374,9 @@ class OrderRepository(Repository):
             decided = cur.fetchone()
             if decided is not None:
                 # No outbox row here any more (D53): `order.kitchen.decided` reaches Kafka
-                # via a `publish_order_event_activity` call the workflow's `kitchen_decision`
-                # Update handler makes right after this write — see
-                # orchestrator/workflows/order.py. `decided is not None` is still the guard
+                # via a `publish_order_event_activity` call `FulfillmentWorkflow`'s
+                # `kitchen_decision` Update handler makes right after this write — see
+                # orchestrator/workflows/fulfillment/workflow.py. `decided is not None` is still the guard
                 # that keeps a second accept on an already-decided order from publishing
                 # twice, the same role it played when the outbox write lived here directly.
                 return decided, True

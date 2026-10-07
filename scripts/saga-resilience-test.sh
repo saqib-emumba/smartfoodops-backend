@@ -178,9 +178,10 @@ got=$(wait_status "$DUR" confirmed 45)
 assert "reached 'confirmed' before the restart" "$got" "confirmed"
 
 # The saga is now parked on a durable timer waiting for the kitchen. Nothing about that
-# wait lives in the worker process, which is the claim under test.
+# wait lives in the worker process, which is the claim under test. Since D58 the timer
+# lives in FulfillmentWorkflow, so that is the workflow whose stage says so.
 STAGE_BEFORE=$(docker exec sfo-temporal-server temporal workflow query \
-  --address 127.0.0.1:7233 --workflow-id "order-$DUR" --type stage 2>/dev/null \
+  --address 127.0.0.1:7233 --workflow-id "fulfillment-$DUR" --type stage 2>/dev/null \
   | grep -o '"stage":"[^"]*"' | cut -d'"' -f4)
 note "saga stage before restart: ${STAGE_BEFORE:-unknown}"
 

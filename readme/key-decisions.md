@@ -69,10 +69,11 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) | nginx gains a fail-closed `auth_request` chokepoint | 2026-09-24 | Extended by [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) |
 | [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) | Internal calls assert identity headers instead of forwarding the bearer token | 2026-09-24 | Accepted |
 | [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger) | The outbox tables are removed; workflow history becomes the publish ledger | 2026-09-29 | Accepted |
-| [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) | Order creation moves inside Temporal, via Update-with-Start | 2026-09-30 | Accepted |
-| [D55](#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow) | Payment, rider and compensation become child workflows of `OrderWorkflow` | 2026-10-01 | Accepted |
+| [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) | Order creation moves inside Temporal, via Update-with-Start | 2026-09-30 | Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) |
+| [D55](#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow) | Payment, rider and compensation become child workflows of `OrderWorkflow` | 2026-10-01 | Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) |
 | [D56](#d56--a-refund-that-permanently-fails-becomes-compensation_failed-not-a-silently-failed-workflow) | A refund that permanently fails becomes `'compensation_failed'`, not a silently-failed workflow | 2026-10-02 | Accepted |
 | [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) | RBAC moves into the database and is enforced at the gateway | 2026-10-06 | Accepted |
+| [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) | Checkout starts `OrderWorkflow` and waits for its result; post-payment work moves to `FulfillmentWorkflow` | 2026-10-07 | Accepted |
 
 ---
 
@@ -784,6 +785,11 @@ rather than in FastAPI's threadpool.
 
 ### D54 — Order creation moves inside Temporal, via Update-with-Start
 
+> **Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow):** the insert stays inside the workflow, but
+> it is now the first step of `OrderWorkflow.run()` rather than a `create_order` Update
+> handler, and the API starts the workflow and waits for its result instead of using
+> Update-with-Start. The derived `order_id` and the idempotency story below are unchanged.
+
 **Decided:** `POST /api/v1/orders` derives `order_id = uuid5(NAMESPACE, "{customer_id}:
 {idempotency_key}")` before touching Temporal or Postgres, then calls
 `client.execute_update_with_start_workflow` — atomically starting `OrderWorkflow` under
@@ -820,6 +826,10 @@ a hidden regression. `OrderWorkflow.run()`'s signature change is also a **breaki
 contract change**: `order-service` and `orchestrator-worker` must deploy together.
 
 ### D55 — Payment, rider and compensation become child workflows of `OrderWorkflow`
+
+> **Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow):** `RiderWorkflow` and `CompensationWorkflow`
+> are now started by `FulfillmentWorkflow`, not `OrderWorkflow`, and the `kitchen_decision`
+> Update moved with them. `PaymentWorkflow` is still `OrderWorkflow`'s own child.
 
 **Decided:** `OrderWorkflow` stops calling payment, dispatch and compensation activities
 directly and instead starts three child workflows, awaiting each for its result —
@@ -942,6 +952,80 @@ second, parallel way to say "this order needs attention."
   `compensation_failed` order, not that one *will* be told without looking. Nothing pages
   on this yet — the same gap D19's "secrets manager" open question names for a different
   reason, worth deciding deliberately rather than assuming the panel is enough.
+
+### D58 — Checkout starts `OrderWorkflow` and waits for its result; post-payment work moves to `FulfillmentWorkflow`
+
+**Decided:** `POST /api/v1/orders` starts `OrderWorkflow` with the cart as its start
+argument, sends nothing into it, and awaits its result (`common.temporal.SagaClient.start_and_wait`,
+bounded by `CHECKOUT_DEADLINE_SECONDS`). `run()` does the work in order:
+`create_order_activity` and the `order.created` publish, then the `PaymentWorkflow` child,
+then the `confirmed` transition — which records the payment on the order and claims a
+capacity slot in one local transaction — and only then it *starts* a new `FulfillmentWorkflow`
+with `ParentClosePolicy.ABANDON` and returns the order. `FulfillmentWorkflow` owns what
+follows — the kitchen's decision (the `kitchen_decision` Update and its timeout read-back),
+`RiderWorkflow`, and `CompensationWorkflow` — and keeps running after `OrderWorkflow` has
+completed. An order is therefore never on the kitchen's rail with its payment unrecorded.
+
+Capacity is checked twice, deliberately. An **early, advisory** check inside the creation
+transaction turns a full kitchen away before any row is written or any money taken
+(`OrderRepository.create(capacity_limit=...)`, only on a genuine insert, never on a replay).
+It is advisory because the rail counts only `confirmed` orders, so concurrent checkouts that
+are still paying are invisible to it. The **authoritative** check is the one atomic with the
+`confirmed` transition; whoever loses that race is refunded. No new status is involved. So `order-<id>` means "checkout"; the rest of the order's life is on
+`fulfillment-<id>` and below.
+
+A failure before payment settles fails `OrderWorkflow` with an `ApplicationError` whose
+`type` the API maps onto a status through the existing `_status_factory` table:
+
+| Outcome | Response |
+|---|---|
+| created and payment authorised | `201` |
+| idempotent replay | `200` |
+| cart rejected (bad item, price mismatch, no menu, key collision) | `422` / `404` / `409`, as before |
+| payment not authorised (`PaymentDeclined`) | `402` — the order exists, `cancelled`, reason `payment_failed` |
+| kitchen already full at creation | `409` — turned away before anything is written or charged; no order row exists |
+| kitchen filled up during checkout (`KitchenAtCapacity`) | `409` — payment refunded and the order `cancelled` before the API answers (previously a `201` that cancelled a moment later) |
+| still running at the deadline | `503` — retry with the same `X-Idempotency-Key` |
+
+"Was this request the first checkout?" is answered on the API side: the start uses
+`WorkflowIDConflictPolicy.FAIL`, and `WorkflowAlreadyStartedError` means a retry of a
+request still in flight. A retry after the run has *finished* starts a fresh run under the
+same id; that run's insert finds the order already there (`created=False`) and the run
+returns immediately rather than authorising the same payment a second time — a hole the D54
+shape had.
+
+**Instead of:** D54's Update-with-Start, in any of its forms — a `create_order` Update that
+did the insert itself while `run()` waited on it, or a read-only "early return" Update that
+only waited for `run()` to reach payment. And instead of a read-only Query the API would poll
+for an outcome (built first, then replaced), or a `202 Accepted` with no outcome at all,
+which would have moved cart validation errors off the POST.
+
+**Why:** the mentors' direction: creating an order should just start the workflow, with no
+Update. A workflow that *ends* where the API needs its answer makes the plain "start and
+await the result" call enough — no handler, no Query, no polling loop, no tuning knob beyond
+a deadline. Answering after payment (rather than after the insert) means the customer is told
+"declined" by the checkout call itself instead of receiving a `201` for an order the saga
+cancels a moment later. Splitting the post-payment work into an abandoned child is what lets
+the parent end there.
+
+**Costs:**
+
+- **`order-<id>` no longer spans the order's life.** It completes after payment, and the
+  kitchen and rider progress — including the `stage` Query — is on `fulfillment-<id>`. The
+  child is abandoned, so it has no live link to the parent: terminating `order-<id>` does not
+  touch it, and a stuck order is found by its own `fulfillment-` id.
+- **A failed checkout is a failed workflow.** A rejected cart or a declined payment shows
+  `Failed` for `order-<id>` in the Temporal UI. That is the signal the API reads, not an
+  incident.
+- **Checkout latency now includes payment authorisation** — about a second normally, up to
+  `AUTHORIZE_POLICY`'s worst case (~66s) against a hung Payment Service. The deadline must stay
+  under the gateway's `proxy_read_timeout` on `/api/v1/orders`, raised to 90s for this, or nginx
+  answers `504` before the API can answer `503`. Timing out abandons only the caller's wait,
+  not the workflow.
+- **The kitchen's Update moved to a new workflow id** (`fulfillment-<order_id>`), and
+  `OrderWorkflow.run()` now takes an argument. Workflows in flight from before this deploys
+  cannot replay against the new code — the same caveat as D55: drain or terminate them
+  first.
 
 ### D26 — The worker authenticates with the internal key, never a forwarded bearer
 

@@ -112,7 +112,7 @@ class PaymentRepository(Repository):
         for a compensating action and the first is worth saying out loud.
 
         No outbox row here either (D53): `payment.refunded` reaches Kafka via a
-        `publish_payment_event_activity` call chained after `OrderWorkflow._compensate`'s
+        `publish_payment_event_activity` call chained after `CompensationWorkflow`'s
         refund activity, guarded the same way the outbox row used to be — a payment already
         `refunded` returns `None` here and reaches this method's *caller*'s no-op path,
         never generating a second publish.

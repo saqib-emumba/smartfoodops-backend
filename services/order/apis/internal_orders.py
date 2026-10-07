@@ -1,11 +1,11 @@
 """Internal-only: where an order is actually created now (D53/
 order-creation-temporal-update-design.md).
 
-Reached exclusively by the order-creation saga's `create_order_activity`, itself called from
-`OrderWorkflow`'s `create_order` Update — before this, `checkout.py::create_order` ran all of
-this directly as a synchronous HTTP handler. Re-pricing, customer/restaurant verification, and
+Reached exclusively by the order-creation saga's `create_order_activity`, the first step of
+`OrderWorkflow.run()` (D58; until then it ran inside a `create_order` Update) — before this,
+`checkout.py::create_order` ran all of this directly as a synchronous HTTP handler. Re-pricing, customer/restaurant verification, and
 the insert all moved here unchanged; only the caller changed, from "an HTTP request" to "a
-Temporal activity, on behalf of an Update".
+Temporal activity".
 
 Internal-key only, same convention `transitions.py` and `/orders/{id}/internal` already use:
 without a bearer token there is no ownership check left on this route by itself, so it must not
@@ -15,9 +15,11 @@ be reachable by anyone who is not already a sibling service.
 from fastapi import APIRouter, Depends
 
 from common.auth import CurrentUser, require_internal
+from common.errors import conflict
 from common.responses import Envelope, ok
 from order import deps
 from order.pricing import build_order_snapshot
+from order.repositories.orders import AtCapacity
 from order.schemas.orders import (
     OrderCreateRequest,
     OrderInternalCreateRequest,
@@ -53,14 +55,24 @@ def create_order_internally(
     deps.user_service.verify_customer(payload.customer_id, current_user)
     restaurant = deps.restaurant_service.verify_restaurant(payload.restaurant_id, current_user)
 
-    order, created = deps.orders.create(
-        payload.order_id,
-        cart,
-        payload.customer_id,
-        items_snapshot,
-        total,
-        payload.idempotency_key,
-    )
+    # The early capacity check (D58): turn a full kitchen away before anything is written or
+    # charged. `409` rides the same passthrough the activity already maps for a key
+    # collision (`OrderCreateConflict`, non-retryable), so the customer gets the message
+    # below as a `409`. The authoritative check is still the one at `confirmed`.
+    try:
+        order, created = deps.orders.create(
+            payload.order_id,
+            cart,
+            payload.customer_id,
+            items_snapshot,
+            total,
+            payload.idempotency_key,
+            capacity_limit=restaurant["capacity"],
+        )
+    except AtCapacity as exc:
+        raise conflict(
+            "The kitchen is at capacity right now; please try again shortly"
+        ) from exc
 
     return ok(
         OrderInternalCreateResponse(

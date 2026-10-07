@@ -1871,6 +1871,12 @@ http {
             auth_request_set $auth_user_roles $upstream_http_x_user_roles;
             auth_request_set $auth_user_permissions $upstream_http_x_user_permissions;
 
+            # D58: `POST /api/v1/orders` now answers after payment authorisation, not after
+            # the insert. AUTHORIZE_POLICY's worst case — three 20s attempts against a hung
+            # Payment Service, plus backoff — is ~66s, past nginx's 60s default, which would
+            # turn a slow decline into a 504 for an order the saga then cancels.
+            proxy_read_timeout 90s;
+
             proxy_pass http://order-service:8004;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;

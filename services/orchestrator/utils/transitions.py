@@ -1,12 +1,12 @@
 """Shared order-transition and lost-signal-recovery helpers.
 
-`OrderWorkflow` and `RiderWorkflow` each write the order's new status and publish the matching
+`OrderWorkflow`, `FulfillmentWorkflow` and `RiderWorkflow` each write the order's new status and publish the matching
 event through the same two activities (`transition_order_activity` then
 `publish_order_event_activity`); `CompensationWorkflow` did the same for its own cancellation
 step inline. Previously each workflow reimplemented this pair itself. `transition_and_publish`
 below is that pair, defined once.
 
-Likewise, `OrderWorkflow`'s kitchen-decision recovery and `RiderWorkflow`'s rider-report
+Likewise, `FulfillmentWorkflow`'s kitchen-decision recovery (`OrderWorkflow`'s before D58) and `RiderWorkflow`'s rider-report
 recovery were structurally identical: on a `wait_condition` timeout, read the Order Service's
 own record once to tell a genuine timeout apart from a lost signal/Update, since both look
 identical from inside the wait. `recover_via_read` below is that pattern, generalized over

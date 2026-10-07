@@ -1071,9 +1071,10 @@ docker exec sfo-order-db psql -U sfo_order_admin -d sfo_order_core \
   -c "UPDATE orders SET kitchen_decision='accepted', kitchen_decided_at=NOW()
        WHERE id='$ORDER_ID';"
 
-# The saga has no idea. Watch it sit, then recover when its 120s timer fires:
+# The saga has no idea. Watch it sit, then recover when its 120s timer fires
+# (the kitchen wait lives in the fulfilment workflow since D58):
 docker exec sfo-temporal-server temporal workflow query \
-  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID" --type stage
+  --address 127.0.0.1:7233 --workflow-id "fulfillment-$ORDER_ID" --type stage
 # -> "stage":"awaiting_kitchen"     ...then, after the timeout:
 # -> "stage":"dispatching_rider"    (recovered — NOT cancelled)
 
@@ -1091,12 +1092,13 @@ order stuck?":
 
 ```bash
 docker exec sfo-temporal-server temporal workflow query \
-  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID" --type stage
+  --address 127.0.0.1:7233 --workflow-id "fulfillment-$ORDER_ID" --type stage
 # -> {"stage":"awaiting_kitchen","rider_id":null,...}
 
-# The full history, including every retry and timer
+# The full history, including every retry and timer. `order-$ORDER_ID` is only the checkout
+# (create + pay) since D58; the kitchen and rider history is on fulfillment-$ORDER_ID.
 docker exec sfo-temporal-server temporal workflow show \
-  --address 127.0.0.1:7233 --workflow-id "order-$ORDER_ID"
+  --address 127.0.0.1:7233 --workflow-id "fulfillment-$ORDER_ID"
 ```
 
 ---

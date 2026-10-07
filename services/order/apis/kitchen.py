@@ -62,7 +62,7 @@ async def _decide_kitchen(
     An already-decided order is answered from this database read alone, *before* touching
     Temporal. This isn't an optimisation — it's load-bearing: by the time a second accept or
     reject on an already-decided order arrives, the saga itself may already have finished
-    (an outright reject completes `OrderWorkflow.run()` via `_compensate`), and Temporal
+    (an outright reject completes `FulfillmentWorkflow.run()` via `_compensate`), and Temporal
     refuses to deliver an Update to a workflow that no longer exists. The database's own
     `kitchen_decision` column, unlike the workflow, outlives the saga — the same durability
     gap D32 already closed for reading a decision back after a timeout, applied here to

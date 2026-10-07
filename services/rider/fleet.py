@@ -71,7 +71,8 @@ async def report_event(
     order that matters.
 
     Signals `RiderWorkflow` directly (D55), not `OrderWorkflow` — the child workflow
-    `OrderWorkflow` starts for dispatch/pickup/delivery now owns these signals itself.
+    started for dispatch/pickup/delivery (by `FulfillmentWorkflow` since D58) owns these
+    signals itself.
     """
     held = rider.get("current_order_id")
     if held is None or str(held) != str(order_id):
