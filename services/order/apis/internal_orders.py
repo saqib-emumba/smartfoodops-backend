@@ -46,7 +46,6 @@ def create_order_internally(
     cart = OrderCreateRequest(
         restaurant_id=payload.restaurant_id,
         items=payload.items,
-        total_amount=payload.total_amount,
         idempotency_key=payload.idempotency_key,
     )
     menu = deps.menu_service.fetch_menu(payload.restaurant_id, current_user)

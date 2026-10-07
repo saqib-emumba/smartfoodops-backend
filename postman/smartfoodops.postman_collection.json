@@ -246,6 +246,10 @@
       "key": "payment_id",
       "value": "",
       "description": "Fill manually -- see the last Payment Service request."
+    },
+    {
+      "key": "cap1_order_id",
+      "value": ""
     }
   ],
   "item": [
@@ -2068,7 +2072,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2089,7 +2093,7 @@
                   "pm.test(\"customer taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.customer_id)).to.eql(String(\"{{cust_id}}\")));",
                   "pm.test(\"server-recalculated unit price\", () => pm.expect(String(pm.response.json().body.items[0].unit_price)).to.eql(String(13.5)));",
                   "pm.test(\"server-recalculated total\", () => pm.expect(String(pm.response.json().body.total_amount)).to.eql(String(27.0)));",
-                  "pm.test(\"initial status is 'created' (INSERT ... RETURNING; the saga advances it after)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(String(\"created\")));"
+                  "pm.test(\"initial status is 'created' (the row create_order_activity returned; the order is already confirmed by now, see Fetch order by id)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(String(\"created\")));"
                 ]
               }
             }
@@ -2117,7 +2121,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2162,7 +2166,8 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"returned the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));"
+                  "pm.test(\"returned the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));",
+                  "pm.test(\"already 'confirmed' when the checkout response arrived (D58: checkout waits through payment)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(\"confirmed\"));"
                 ]
               }
             }
@@ -2190,7 +2195,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2257,7 +2262,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2281,7 +2286,7 @@
         },
         {
           "id": "2b94e6dc-72f4-4ff6-b602-30bbff54950e",
-          "name": "Edge: total_amount mismatch -> 422",
+          "name": "Edge: a client-sent total_amount is ignored; the server prices the cart -> 201",
           "request": {
             "method": "POST",
             "header": [
@@ -2295,7 +2300,7 @@
               },
               {
                 "key": "X-Idempotency-Key",
-                "value": "{{tag}}-idem-mismatch"
+                "value": "{{tag}}-idem-ignored-total"
               }
             ],
             "url": "{{base_url}}/api/v1/orders",
@@ -2307,7 +2312,8 @@
                   "language": "json"
                 }
               }
-            }
+            },
+            "description": "D58: the client sends no price. A total_amount sent anyway (1.00 here) is ignored -- the order is created at the real price, 10.00 + cheddar 1.50 = 11.50."
           },
           "response": [],
           "event": [
@@ -2316,8 +2322,9 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
-                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"the order carries the server-computed total, not the 1.00 claimed\", () => pm.expect(String(pm.response.json().body.total_amount)).to.eql(String(11.5)));"
                 ]
               }
             }
@@ -2345,7 +2352,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}],\"total_amount\":5.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2389,7 +2396,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"nope\",\"quantity\":1}],\"total_amount\":5.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"nope\",\"quantity\":1}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2433,7 +2440,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"ghost\":\"x\"}}],\"total_amount\":10.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"ghost\":\"x\"}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2477,7 +2484,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}],\"total_amount\":10.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2521,7 +2528,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}],\"total_amount\":10.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2565,7 +2572,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}],\"total_amount\":11.50}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2609,7 +2616,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}",
+              "raw": "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2653,7 +2660,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[],\"total_amount\":10.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -2697,7 +2704,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}],\"total_amount\":11.50}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -3741,7 +3748,7 @@
               }
             ],
             "url": "{{base_url}}/api/v1/orders/{{order_id}}",
-            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 30 times until the order reaches 'confirmed', mirroring smoke-test.sh's poll_status(). Runs after checkout; the saga authorises payment and confirms before the kitchen can act on it."
+            "description": "Self-looping poll (Collection Runner only -- set a ~2000ms delay in the Runner so this doesn't hammer the gateway). Re-sends itself up to 30 times until the order reaches 'confirmed', mirroring smoke-test.sh's poll_status(). Since D58 checkout only answers after payment is authorised and the order is confirmed, so this normally passes on the first try; it stays as a guard."
           },
           "response": [],
           "event": [
@@ -4404,7 +4411,7 @@
             "url": "{{base_url}}/api/v1/orders",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -4593,6 +4600,179 @@
         }
       ],
       "description": "Also a Collection Runner folder (self-looping polls). The no-rider-available and at-capacity compensation paths in scripts/smoke-test.sh aren't reproduced here -- both need direct database manipulation (grounding the whole fleet, racing two orders) that isn't reachable through the HTTP API at all. Same reason the refund-permanently-fails path (D56, 'compensation_failed') isn't here either -- it needs sfo-payment-service stopped and restarted, which is a docker operation, not an HTTP one; see scripts/smoke-test.sh's 'compensation when the refund itself permanently fails' section."
+    },
+    {
+      "id": "c67aecde-5578-4070-8139-b37812a12e6d",
+      "name": "8b. Order Saga -- Capacity (D58)",
+      "description": "The kitchen's capacity is checked twice. This folder covers the deterministic half: an early, advisory check at order creation turns a full kitchen away with 409 before anything is written or charged. The race half (two simultaneous checkouts, loser refunded) and the declined-payment 402 need concurrency / stopping a container, so they live in scripts/smoke-test.sh only.",
+      "item": [
+        {
+          "id": "b6d59021-e95c-47f8-bb85-9de47e5910c9",
+          "name": "First order takes the only slot -> 201",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-cap1"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{tight_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Uses the one-slot restaurant onboarded and published earlier ({{tight_id}})."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"cap1_order_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3433a97b-cb97-44bc-97e1-93511ca7d0b5",
+          "name": "First order is already on the rail (confirmed)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{cap1_order_id}}"
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"confirmed already -- checkout waited through payment and confirmation\", () => pm.expect(String(pm.response.json().body.status)).to.eql(\"confirmed\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "99d8f7be-5708-4efb-b4e4-4116e5263ea8",
+          "name": "Second order is turned away at creation -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-cap2"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{tight_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "The kitchen is full, so the early check refuses it before any row is written or any payment is taken."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"the error says the kitchen is at capacity\", () => pm.expect(pm.response.text()).to.include(\"at capacity\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "23453309-4407-44fb-947b-a19b2442440e",
+          "name": "Replaying the first order is unaffected by the full kitchen -> 200",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              },
+              {
+                "key": "X-Idempotency-Key",
+                "value": "{{tag}}-cap1"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{tight_id}}\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "A replay returns the existing order; the capacity check only runs on a genuine insert."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"it is the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(pm.collectionVariables.get(\"cap1_order_id\"))));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     },
     {
       "id": "4a832965-e59e-4811-ad7a-de5b4e0aef60",

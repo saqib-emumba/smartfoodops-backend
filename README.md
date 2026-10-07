@@ -760,15 +760,15 @@ curl -s -X POST http://localhost/api/v1/orders \
   -H 'X-Idempotency-Key: sfo-key-0001' \
   -d '{"restaurant_id":"<RESTAURANT_UUID>",
        "items":[{"item_id":"item_burger_001","quantity":2,
-                 "customizations":{"grp_add_ons":["Extra Cheddar Cheese"]}}],
-       "total_amount":28.98}'
+                 "customizations":{"grp_add_ons":["Extra Cheddar Cheese"]}}]}'
 ```
 
 The order belongs to the token's subject — there is no `customer_id` to send, and therefore
 no way to place an order in someone else's name. Requires the `customer` role.
 
-The total is **recalculated server-side** from the live menu (12.99 + 1.50 × 2 = 28.98) —
-the client's `total_amount` is only checked, never trusted. Repeating the same
+The client sends no price (D58). The total is **computed server-side** from the live menu
+(12.99 + 1.50 × 2 = 28.98) and comes back on the order; a `total_amount` sent anyway is
+ignored. Repeating the same
 `X-Idempotency-Key` returns the original order as `200` instead of creating a second one.
 
 **6 — Payment happens on its own** (the saga's first step)

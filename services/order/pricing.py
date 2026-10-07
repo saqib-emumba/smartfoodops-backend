@@ -1,18 +1,19 @@
 """Server-side re-pricing of a checkout against the restaurant's published menu.
 
-The client's `total_amount` is never trusted: every line is recomputed from the menu the
-Menu Service currently serves, and the order is rejected if the two disagree. Money is
-handled as Decimal and only converted to float at the persistence boundary.
+The client does not send a price at all (D58): every line and the order total are computed
+here from the menu the Menu Service currently serves, so there is no client-declared figure to
+trust, reconcile or reject. Money is handled as Decimal and only converted to float at the
+persistence boundary.
 """
 
 from collections.abc import Iterable
 from decimal import Decimal
 
 from common.errors import unprocessable
-from common.money import CENTS, to_cents
+from common.money import CENTS
 from order.schemas.orders import OrderCreateRequest, OrderItemSelection
 
-# CENTS and to_cents come from common.money so this service and the Payment Service round
+# CENTS comes from common.money so this service and the Payment Service round
 # identically. They sit either side of a boundary where a disagreement rejects a *correct*
 # payment: this file computes the total, and payment/amounts.py refuses anything that does
 # not settle it to the cent.
@@ -120,7 +121,7 @@ def price_line(item: dict, selection: OrderItemSelection) -> tuple[dict, Decimal
 def build_order_snapshot(
     menu: dict, payload: OrderCreateRequest
 ) -> tuple[list[dict], Decimal]:
-    """Validate availability and recompute the authoritative total for the checkout."""
+    """Validate availability and compute the authoritative total for the checkout."""
     catalogue = flatten_catalogue(menu)
     snapshot: list[dict] = []
     total = Decimal("0.00")
@@ -135,10 +136,4 @@ def build_order_snapshot(
         snapshot.append(line)
         total += line_total
 
-    total = total.quantize(CENTS)
-    claimed = to_cents(payload.total_amount)
-    if total != claimed:
-        raise unprocessable(
-            f"total_amount mismatch: client sent {claimed}, server recalculated {total}"
-        )
-    return snapshot, total
+    return snapshot, total.quantize(CENTS)

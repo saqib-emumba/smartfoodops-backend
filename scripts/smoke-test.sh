@@ -415,7 +415,7 @@ expect "publish menu" 200 POST /api/v1/menus "$MENU" "${OWNER_AUTH[@]}"
 expect "fetch published menu" 200 GET "/api/v1/menus/$REST_ID" "" "${CUST_AUTH[@]}"
 
 # base 10.00 + cheddar 1.50 + bacon 2.00 = 13.50, x2 = 27.00
-ORDER="{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}"
+ORDER="{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}"
 IDEM="idem-$TAG"
 
 expect "create order" 201 POST /api/v1/orders "$ORDER" \
@@ -754,35 +754,39 @@ expect "no menu published -> 404" 404 GET /api/v1/menus/11111111-1111-1111-1111-
 # -------------------------------------------------------- order service
 section "Order Service edge cases"
 expect "missing idempotency key -> 422" 422 POST /api/v1/orders "$ORDER" "${CUST_AUTH[@]}"
-expect "total_amount mismatch -> 422" 422 POST /api/v1/orders \
+# D58: the client does not send a price, so there is nothing to mismatch -- the server prices
+# the cart. A legacy client that still sends `total_amount` gets it ignored, not honoured:
+# the order below is created at the real price (10.00 + cheddar 1.50), not at the 1.00 claimed.
+expect "a client-sent total_amount is ignored; the server prices the cart" 201 POST /api/v1/orders \
   "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"cheddar\"}}],\"total_amount\":1.00}" \
-  -H "X-Idempotency-Key: $IDEM-mismatch" "${CUST_AUTH[@]}"
+  -H "X-Idempotency-Key: $IDEM-ignored-total" "${CUST_AUTH[@]}"
+assert "  the order carries the server-computed total" "$(jfield "['total_amount']")" "11.5"
 expect "unavailable item -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}],\"total_amount\":5.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}]}" \
   -H "X-Idempotency-Key: $IDEM-soldout" "${CUST_AUTH[@]}"
 expect "item not on menu -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"nope\",\"quantity\":1}],\"total_amount\":5.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"nope\",\"quantity\":1}]}" \
   -H "X-Idempotency-Key: $IDEM-unknown" "${CUST_AUTH[@]}"
 expect "unknown customization group -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"ghost\":\"x\"}}],\"total_amount\":10.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"ghost\":\"x\"}}]}" \
   -H "X-Idempotency-Key: $IDEM-badgroup" "${CUST_AUTH[@]}"
 expect "option not offered -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}],\"total_amount\":10.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}]}" \
   -H "X-Idempotency-Key: $IDEM-badoption" "${CUST_AUTH[@]}"
 expect "required group omitted -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}],\"total_amount\":10.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}]}" \
   -H "X-Idempotency-Key: $IDEM-missinggrp" "${CUST_AUTH[@]}"
 expect "too many selections -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}],\"total_amount\":11.50}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}]}" \
   -H "X-Idempotency-Key: $IDEM-toomany" "${CUST_AUTH[@]}"
 expect "restaurant has no menu -> 404" 404 POST /api/v1/orders \
-  "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}" \
+  "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}" \
   -H "X-Idempotency-Key: $IDEM-nomenu" "${CUST_AUTH[@]}"
 expect "empty item list -> 422" 422 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[],\"total_amount\":10.00}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[]}" \
   -H "X-Idempotency-Key: $IDEM-empty" "${CUST_AUTH[@]}"
 expect "option object form is accepted" 201 POST /api/v1/orders \
-  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}],\"total_amount\":11.50}" \
+  "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":{\"name\":\"cheddar\"}}}]}" \
   -H "X-Idempotency-Key: $IDEM-dictform" "${CUST_AUTH[@]}"
 SECOND_ORDER_ID=$(jfield "['id']")
 expect "unknown order id -> 404" 404 GET /api/v1/orders/00000000-0000-0000-0000-000000000000 \
@@ -1280,7 +1284,7 @@ expect "publish its menu" 200 POST /api/v1/menus \
   "{\"restaurant_id\":\"$TIGHT_ID\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true}]}]}" \
   "${OWNER_AUTH[@]}"
 
-TIGHT_ORDER="{\"restaurant_id\":\"$TIGHT_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}"
+TIGHT_ORDER="{\"restaurant_id\":\"$TIGHT_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}"
 expect "first order takes the only slot" 201 POST /api/v1/orders "$TIGHT_ORDER" \
   -H "X-Idempotency-Key: $IDEM-cap1" "${CUST_AUTH[@]}"
 CAP1=$(jfield "['id']")
@@ -1316,7 +1320,7 @@ expect "publish its menu" 200 POST /api/v1/menus \
   "{\"restaurant_id\":\"$RACE_ID\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true}]}]}" \
   "${OWNER_AUTH[@]}"
 
-RACE_ORDER="{\"restaurant_id\":\"$RACE_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}"
+RACE_ORDER="{\"restaurant_id\":\"$RACE_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}"
 RACE_DIR=$(mktemp -d)
 for n in a b; do
   curl -sS -m 90 -o "$RACE_DIR/$n.body" -w '%{http_code}\n' -X POST "$BASE_URL/api/v1/orders" \

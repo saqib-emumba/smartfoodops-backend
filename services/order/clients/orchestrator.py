@@ -62,11 +62,9 @@ class OrchestratorClient:
         Service — the price of answering 402 on a declined payment instead of a 201 for an
         order that is about to be cancelled.
 
-        `amount` (here, `total_amount`) is a plain float rather than stringified: unlike the
-        old `start_saga` payload, this one is validated by `OrderInternalCreateRequest` on
-        arrival and never has to survive an intermediate JSON hop as the authoritative
-        figure — it exists only to be checked against the server's own recalculation
-        (D06), never persisted from this value directly.
+        The payload carries no price (D58): the cart is priced by `create_order_activity`,
+        inside the workflow, and `OrderWorkflow` takes the amount to authorise from the order
+        that step returns.
         """
         order, started = await self._saga.start_and_wait(
             ORDER_WORKFLOW,
@@ -79,7 +77,6 @@ class OrchestratorClient:
                 "customer_roles": current_user.roles,
                 "restaurant_id": str(payload.restaurant_id),
                 "items": [item.model_dump() for item in payload.items],
-                "total_amount": payload.total_amount,
                 "idempotency_key": idempotency_key,
             },
         )

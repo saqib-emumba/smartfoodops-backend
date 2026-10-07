@@ -413,8 +413,8 @@ curl -s -w '\n[%{http_code}]\n' "$BASE/api/v1/menus/11111111-1111-1111-1111-1111
 
 ## 4. Order Service (`:8004`)
 
-Prices are **always** recalculated server-side from the live menu. The `total_amount` you
-send is treated as a claim to verify, not a value to trust.
+You send no price (D58). The order is priced server-side from the live menu, and the total comes
+back on the order. A `total_amount` sent anyway is ignored, not honoured.
 
 For the menu above: `10.00` base `+ 1.50` cheddar `+ 2.00` bacon `= 13.50` per burger,
 `× 2 = 27.00`.
@@ -436,8 +436,7 @@ export ORDER_ID=$(curl -s -X POST "$BASE/api/v1/orders" \
       \"item_id\": \"burger\",
       \"quantity\": 2,
       \"customizations\": {\"cheese\": \"cheddar\", \"extras\": [\"bacon\"]}
-    }],
-    \"total_amount\": 27.00
+    }]
   }" | field "['id']")
 echo "ORDER_ID=$ORDER_ID"
 ```
@@ -454,7 +453,7 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
   -H "X-Idempotency-Key: $IDEM" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}],\"total_amount\":27.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":2,\"customizations\":{\"cheese\":\"cheddar\",\"extras\":[\"bacon\"]}}]}"
 ```
 
 No second order is created — that is the double-charge protection.
@@ -464,7 +463,7 @@ No second order is created — that is the double-charge protection.
 | Scenario | Expected |
 |---|---|
 | `X-Idempotency-Key` header missing | `400` |
-| `total_amount` disagrees with the recalculated total | `422` |
+| Client sends a `total_amount` anyway | ignored — the order is created at the server's price (`201`) |
 | Item has `is_available: false` | `422` |
 | Item id not on the menu | `422` |
 | Customization group not defined on the item | `422` |
@@ -482,9 +481,9 @@ No second order is created — that is the double-charge protection.
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}]}"
 
-# Under-claimed total -> 422, and the message shows both numbers
+# A client-sent total is ignored -> 201, created at the real price (11.50), not the 1.00 claimed
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-mismatch" \
@@ -494,54 +493,54 @@ curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-soldout" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}],\"total_amount\":5.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"soldout\",\"quantity\":1}]}"
 
 # Item not on the menu -> 422
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-unknown" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"pizza\",\"quantity\":1}],\"total_amount\":5.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"pizza\",\"quantity\":1}]}"
 
 # Unknown customization group -> 422
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-badgroup" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"sauce\":\"ketchup\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"sauce\":\"ketchup\"}}]}"
 
 # Option not offered -> 422
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-badoption" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"gouda\"}}]}"
 
 # Required group omitted -> 422
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-missing" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{}}]}"
 
 # Two selections in a max_selection:1 group -> 422
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-toomany" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}],\"total_amount\":11.50}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":[\"cheddar\",\"none\"]}}]}"
 
 # No token -> 401
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-anon" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}]}"
 
 # Restaurant owner trying to place an order -> 403 (valid token, wrong role)
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $OWNER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-ownerorder" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}]}"
 
 # Restaurant with no menu -> 404
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-nomenu" \
-  -d "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"11111111-1111-1111-1111-111111111111\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1}]}"
 ```
 
 A customization can be given three ways — all equivalent:
@@ -742,7 +741,7 @@ docker compose stop menu-service
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H 'X-Idempotency-Key: offline-test' \
-  -d '{"restaurant_id":"00000000-0000-0000-0000-000000000000","items":[{"item_id":"x","quantity":1}],"total_amount":1.0}'
+  -d '{"restaurant_id":"00000000-0000-0000-0000-000000000000","items":[{"item_id":"x","quantity":1}]}'
 docker compose start menu-service
 
 # Order Service depends on the User Service to verify the customer, because the customer
@@ -751,7 +750,7 @@ docker compose stop user-service
 curl -s -w '\n[%{http_code}]\n' -X POST "$BASE/api/v1/orders" \
   -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' -H "X-Idempotency-Key: $IDEM-nouser" \
-  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}],\"total_amount\":10.00}"
+  -d "{\"restaurant_id\":\"$REST_ID\",\"items\":[{\"item_id\":\"burger\",\"quantity\":1,\"customizations\":{\"cheese\":\"none\"}}]}"
 docker compose start user-service
 
 # Payment Service depends on the Order Service, because the order it is settling lives in a

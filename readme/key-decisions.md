@@ -22,7 +22,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D03](#d03--payments-split-into-its-own-service-and-database) | Payments split into its own service and database | 2026-08-13 | Accepted |
 | [D04](#d04--a-shared-chassis-in-servicescommon) | A shared chassis in `services/common/` | 2026-08-12 | Accepted |
 | [D05](#d05--one-error-contract-for-every-service) | One error contract for every service | 2026-08-12 | Accepted |
-| [D06](#d06--the-server-re-prices-every-cart) | The server re-prices every cart | 2026-08-13 | Accepted |
+| [D06](#d06--the-server-re-prices-every-cart) | The server re-prices every cart | 2026-08-13 | Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) |
 | [D07](#d07--money-is-decimal-until-the-json-boundary) | Money is `Decimal` until the JSON boundary | 2026-08-13 | Accepted |
 | [D08](#d08--idempotency-keys-are-mandatory-and-a-replay-answers-200) | Idempotency keys are mandatory; a replay answers `200` | 2026-08-13 | Accepted |
 | [D09](#d09--audit-logging-is-best-effort-and-goes-through-the-menu-service) | Audit logging is best-effort, through the Menu Service | 2026-08-13 | Superseded by [D24](#d24--the-tracking-trail-moved-into-the-order-database-and-stopped-being-best-effort) |
@@ -162,6 +162,11 @@ must be revisited whenever a new failure mode appears — as it was when auth la
 ## Correctness and money
 
 ### D06 — The server re-prices every cart
+
+> **Partly superseded by [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow):** the client no longer sends `total_amount` at all, so
+> there is no claimed figure to compare and no mismatch `422`. The server prices every cart
+> from the menu and the workflow reads the amount to authorise back from the order it created.
+> The rest of this entry — the menu is the only authority on price — is unchanged.
 
 **Decided:** the client's `total_amount` is compared, never trusted. Every line is
 recomputed from the menu the Menu Service currently serves, and a mismatch is `422` naming
@@ -993,6 +998,14 @@ request still in flight. A retry after the run has *finished* starts a fresh run
 same id; that run's insert finds the order already there (`created=False`) and the run
 returns immediately rather than authorising the same payment a second time — a hole the D54
 shape had.
+
+**Also:** the request carries **no price**. `OrderCreateRequest`/`OrderInternalCreateRequest` lose
+`total_amount`, `build_order_snapshot` drops the claimed-versus-computed comparison, and
+`OrderWorkflow` takes the amount to authorise from the order its create step returns. A
+`total_amount` an older client still sends is ignored, not honoured. This removes D06's "stale
+total" `422`: a menu that changed between viewing and checking out now charges the new price
+instead of failing, so the price the customer is charged is whatever the menu says at the moment
+of checkout.
 
 **Instead of:** D54's Update-with-Start, in any of its forms — a `create_order` Update that
 did the insert itself while `run()` waited on it, or a read-only "early return" Update that

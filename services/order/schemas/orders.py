@@ -39,7 +39,8 @@ class OrderCreateRequest(BaseModel):
     # from the body would let any caller place an order in someone else's name.
     restaurant_id: UUID
     items: List[OrderItemSelection] = Field(..., min_length=1)
-    total_amount: float = Field(..., gt=0.0)
+    # No total_amount (D58): the client does not send a price. The server prices the cart from
+    # the live menu (order/pricing.py), so there is no declared figure to trust or reject.
     idempotency_key: Optional[str] = Field(
         None, description="Client-provided unique transaction tracking ID"
     )
@@ -78,8 +79,8 @@ class OrderInternalCreateRequest(BaseModel):
     `CurrentUser` this endpoint needs to re-run the same ownership and verification calls
     `checkout.py` used to make directly as the caller (D52's "a sibling service asserting an
     identity it already holds" model, applied to a Temporal activity instead of an HTTP
-    client). `total_amount` is deliberately absent: re-pricing against the live menu happens
-    here, same as it always has (D06) — a client-declared total is never trusted either way.
+    client). There is no `total_amount` (D58): the order is priced here, against the live menu,
+    and the workflow reads the total back from the order it creates.
     """
 
     order_id: UUID
@@ -87,10 +88,6 @@ class OrderInternalCreateRequest(BaseModel):
     customer_roles: List[str]
     restaurant_id: UUID
     items: List[OrderItemSelection] = Field(..., min_length=1)
-    # The client's own claimed total, carried through unchanged from the original request —
-    # still never trusted as the authoritative amount (D06), but still needed to reject a
-    # stale or wrong client-side total the same way `build_order_snapshot` always has.
-    total_amount: float = Field(..., gt=0.0)
     idempotency_key: str
 
 

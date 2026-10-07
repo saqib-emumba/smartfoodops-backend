@@ -61,7 +61,8 @@ about what it observed, not a call made *as* the customer.
 > would be worse than an honest "needs a human."
 
 > **Checkout answers after payment, and the workflow tree is split, per [D58](../key-decisions.md#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow), implemented.**
-> `OrderSvc` *starts* `OrderWorkflow` with the cart and waits for its result — no Update, no
+> `OrderSvc` *starts* `OrderWorkflow` with the cart -- items only, **no price**: the server prices
+> it from the live menu and the workflow pays the total it computed -- and waits for its result — no Update, no
 > polling. `OrderWorkflow` (`order-<id>`) is only checkout: create the order, run
 > `PaymentWorkflow` as a child, mark the order `confirmed` (payment recorded, capacity slot
 > claimed), start `FulfillmentWorkflow` (`fulfillment-<id>`) **abandoned**, and complete — that
@@ -92,7 +93,7 @@ sequenceDiagram
 
     rect rgb(235, 245, 255)
         Note over Customer, Kafka: Order created
-        Customer->>Gateway: POST /orders [X-Idempotency-Key]
+        Customer->>Gateway: POST /orders [X-Idempotency-Key] -- cart only, no price (D58)
         Gateway->>UserSvc: auth_request verify + authorize (D51/D57)
         UserSvc-->>Gateway: 200 + X-User-Id/X-User-Roles/X-User-Permissions
         Note right of Gateway: every Gateway forward elsewhere in this platform runs<br/>this same check first -- omitted after this diagram for readability
@@ -107,8 +108,8 @@ sequenceDiagram
         Note right of OrderSvc: nothing is sent into the workflow. OrderSvc now waits for<br/>its result (up to 85s -- under the gateway's 90s read timeout)
         Temporal->>Worker: dispatch OrderWorkflow task
         Worker->>OrderSvc: POST /orders/internal/create [X-Internal-Key]
-        OrderSvc->>OrderSvc: re-price against live menu, verify customer & restaurant exist
-        break item unavailable, price mismatch, or unknown restaurant
+        OrderSvc->>OrderSvc: price the cart from the live menu (server is the only source of the total),<br/>verify customer & restaurant exist
+        break item unavailable, unknown option, or unknown restaurant
             OrderSvc-->>Worker: 422 Unprocessable Entity
             Worker-->>Temporal: OrderWorkflow fails (non-retryable, type OrderCreateRejected)
             Temporal-->>OrderSvc: WorkflowFailureError

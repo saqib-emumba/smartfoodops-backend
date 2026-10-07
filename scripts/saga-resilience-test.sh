@@ -95,7 +95,7 @@ RIDER=$(api POST /api/v1/riders \
   "${RA[@]}" | jf "['id']")
 note "restaurant=$REST  rider=$RIDER"
 
-ORDER_BODY="{\"restaurant_id\":\"$REST\",\"items\":[{\"item_id\":\"pie\",\"quantity\":1}],\"total_amount\":10.00}"
+ORDER_BODY="{\"restaurant_id\":\"$REST\",\"items\":[{\"item_id\":\"pie\",\"quantity\":1}]}"
 
 place() { api POST /api/v1/orders "$ORDER_BODY" -H "X-Idempotency-Key: $1" "${CA[@]}" | jf "['id']"; }
 accept() { api POST "/api/v1/orders/$1/accept" "" "${OA[@]}" >/dev/null; }
