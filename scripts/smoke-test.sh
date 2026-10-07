@@ -21,8 +21,8 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 209 of the 328
-# checks (counts as of Week 3's observability and eventing additions) and leaves fourteen
+# It is a real reduction in coverage, not just in runtime. --fast asserts 289 of the 456
+# checks (counts as of D58) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize

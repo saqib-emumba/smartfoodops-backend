@@ -489,9 +489,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 423 assertions against http://localhost
+./scripts/smoke-test.sh            # 456 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 287 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 289 assertions, skips the saga sections and the policy-TTL wait
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
