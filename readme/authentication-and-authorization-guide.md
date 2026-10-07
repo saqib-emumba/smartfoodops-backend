@@ -6,6 +6,12 @@ dependencies `auth.py` exports. It is the "how it runs" companion to
 [key-decisions.md](key-decisions.md) (D11–D18 cover the "why"); read that when the question
 is "why not the other way?".
 
+> **Updated for [D57](key-decisions.md#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway)
+> (2026-10-06).** Role checks are no longer written in service code. A route demands a
+> *permission*, roles are granted permissions in three tables in `sfo_user_core`, and the API
+> gateway refuses a wrong-role request before any backend service sees it. §4 is updated;
+> §1–§3 (how a token is minted and verified) are unchanged.
+
 ---
 
 ## 1. The shape of it
@@ -23,7 +29,7 @@ Two credentials exist in this platform, and they are never interchangeable:
 ```
 
 A request never carries both, and no endpoint accepts either in place of the other.
-`require_role(...)` and `require_internal` are mutually exclusive guards on any given route.
+`require_permission(...)` and `require_internal` are mutually exclusive guards on any given route.
 
 ```
                           ┌───────────────────────┐
@@ -166,12 +172,18 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 
 ## 4. Authorization: three independent mechanisms, applied in three different ways
 
-`auth.py` exports three guards, and no endpoint reaches for more than one of them at once:
+`auth.py` exports three guards, and no endpoint reaches for more than one of them at once.
+Since D57 the first of them is reached *twice* for a gateway-fronted request — once at the
+gateway, from the policy tables, and once in the handler:
 
 ```
- require_role(*allowed)          — a FastAPI dependency; wraps get_current_user;
-                                    401 unauthenticated, 403 wrong role.
+ require_permission(*allowed)    — a FastAPI dependency; wraps get_current_user;
+                                    401 unauthenticated, 403 missing permission.
                                     `system_admin` is ALWAYS admitted, everywhere.
+                                    Reads X-User-Permissions, which the gateway set
+                                    after resolving the caller's roles against
+                                    role_permissions. Replaced require_role in D57:
+                                    the handler names a capability, never a role.
 
  require_self_or_admin(p, id)    — a plain function, called inside the handler body,
                                     after the resource (or its owner column) is already
@@ -191,22 +203,36 @@ for "authenticated but not permitted". A missing token is `401`, always, with a
 |---|---|---|
 | User | `POST /users/logout` | `get_current_user` |
 | User | `GET /users/{id}` | `get_current_user` + `require_self_or_admin` |
-| Restaurant | `POST /restaurants/onboard` | `require_role("restaurant_admin")` |
+| Restaurant | `POST /restaurants/onboard` | `require_permission("restaurant:onboard")` |
 | Restaurant | `GET /restaurants/{id}` | `get_current_user` (any authenticated caller) |
-| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service |
-| Menu | `POST /menus` | `require_role("restaurant_admin")` |
+| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_permission("kitchen:read"/"kitchen:decide")` + ownership resolved over HTTP against the Restaurant Service |
+| Menu | `POST /menus` | `require_permission("menu:write")` |
 | Menu | `GET /menus/{id}` | `get_current_user` (any authenticated caller) |
-| Order | `POST /orders` | `require_role("customer")` |
+| Order | `POST /orders` | `require_permission("order:create")` |
 | Order | `GET /orders/{id}`, `GET /orders/{id}/logs` | `get_current_user` + `require_self_or_admin` on `customer_id` |
 | Order | `GET /orders/{id}/internal`, `POST /orders/logs`, `POST /orders/{id}/rider-report` | `require_internal` |
-| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_role("restaurant_admin")` + ownership resolved over HTTP against the Restaurant Service (D32) |
-| Payment | `POST /payments`, `GET /payments/{id}` | `require_role("customer")` (ownership settled by reading the order, §4.2) |
+| Order | `GET /orders/kitchen/{restaurant_id}`, `POST /orders/{id}/accept`, `POST /orders/{id}/reject` | `require_permission("kitchen:read"/"kitchen:decide")` + ownership resolved over HTTP against the Restaurant Service (D32) |
+| Payment | `POST /payments`, `GET /payments/{id}` | `require_permission("payment:create")` / `require_permission("payment:read")` (ownership settled by reading the order, §4.2) |
 | Payment | `POST /payments/authorize`, `POST /payments/refund` | `require_internal` |
-| Rider | `POST /riders`, `GET /riders/me`, `PATCH /riders/me/location`, `PATCH /riders/me/availability`, `POST /riders/me/orders/{id}/picked-up`, `/delivered` | `require_role("rider")` |
+| Rider | `POST /riders`, `GET /riders/me`, `PATCH /riders/me/location`, `PATCH /riders/me/availability`, `POST /riders/me/orders/{id}/picked-up`, `/delivered` | `require_permission("rider:profile")` / `require_permission("delivery:report")` |
 | Rider | `POST /riders/dispatch`, `POST /riders/release` | `require_internal` |
 
 Every health endpoint (`GET /api/v1/{service}/health`) is deliberately unguarded — a probe
 must not need a credential.
+
+Two things this table no longer shows, and both matter (D57):
+
+- **Every `require_permission` row above is the *second* check, not the first.** The gateway
+  already refused the request if the caller's roles did not carry that permission, by matching
+  the method and path against `route_permissions`. The in-handler check is what still stands
+  when a sibling service is reached directly, off the gateway's path, where `X-User-Roles` is
+  asserted by the caller rather than verified (D52). Deleting it would turn network
+  reachability into privilege escalation.
+- **The rows reading `get_current_user` are `NULL` permission rows in the policy table**, not
+  absent ones. Absent means refused: matching is fail-closed, so a gated route with no row is
+  a 403 for everyone, `system_admin` included. `NULL` means "any authenticated caller, the
+  handler's ownership check is the real guard" — which is why those rows and the
+  `require_self_or_admin` column beside them always appear together.
 
 ### 4.2 "Each authorisation decision lives in exactly one place"
 
@@ -243,7 +269,8 @@ check its **current** role — even though `current_user.role` already came out 
  09:10 — the same still-valid token is presented to POST /restaurants/onboard
       │
       ▼
- require_role("restaurant_admin")  → PASSES (the token still says restaurant_admin)
+ require_permission("restaurant:onboard") → PASSES (the token still says restaurant_admin,
+                                            and that role still holds the permission)
       │
       ▼
  verify_owner() → GET /api/v1/users/{id} → role is NOW "customer" → 403
@@ -252,7 +279,13 @@ check its **current** role — even though `current_user.role` already came out 
 The token's role claim is a fact about the moment it was signed, not a fact about now. Any
 endpoint that only checked the claim would honor a role for up to 15 minutes after it was
 revoked. The extra HTTP round trip is what closes that window — deliberately kept even
-though it looks redundant next to `require_role`.
+though it looks redundant next to `require_permission`.
+
+D57 narrows this window in one direction only, and it is worth being precise about which.
+Permissions are resolved from the caller's roles on every request, so *revoking a permission
+from a role* takes effect immediately, even for tokens already issued. But the caller's
+**roles** still come from the token's claims, so the scenario drawn above — an account demoted
+out of a role — is unchanged, and the HTTP round trip is still the only thing that catches it.
 
 ---
 
@@ -395,9 +428,11 @@ docker exec sfo-order-service printenv JWT_PRIVATE_KEY_B64   # must print nothin
 - **No key rotation path.** Rotating the RSA keypair invalidates every live access token at
   once — there is no `kid` header or multiple-accepted-public-keys mechanism.
 - **`system_admin` bypasses every ownership check**, in every service that has one
-  (`require_role` always admits it; `require_self_or_admin` always passes it). Convenient,
-  and currently unaudited — no log records when an admin used the bypass versus acted as
-  themselves.
+  (`require_permission` always admits it; `require_self_or_admin` always passes it).
+  Convenient, and currently unaudited — no log records when an admin used the bypass versus
+  acted as themselves. Since D57 it is also seeded with every permission explicitly, so the
+  policy table shows the privilege rather than hiding it behind the bypass; the one thing the
+  bypass does *not* skip is a missing `route_permissions` row, which refuses an admin too.
 - **The internal key is one shared secret across a list of endpoints that keeps moving** —
   **seven** of them, across three services, including refunds
   (`grep -c 'Depends(require_internal)' services/*/main.py`). It reached eleven with the Week

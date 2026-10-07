@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 
-from common.auth import CurrentUser, get_current_user, require_role
+from common.auth import CurrentUser, get_current_user, require_permission
 from common.errors import not_found
 from common.responses import Envelope, ok
 from restaurant import deps
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/api/v1/restaurants")
 )
 def onboard_restaurant(
     payload: RestaurantOnboardRequest,
-    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_permission("restaurant:onboard")),
 ) -> Envelope[RestaurantResponse]:
     """Onboard a restaurant once its owner is verified through the User Service.
 

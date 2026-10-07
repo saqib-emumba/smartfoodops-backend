@@ -25,7 +25,7 @@ def _guard_role_change(current_user: CurrentUser, user_id: UUID, role_name: str)
     Every other role is self-or-admin, same as the rest of this service's routes — a user
     may grant or revoke `customer`/`restaurant_admin`/`rider` on their own account freely.
     `system_admin` is different in kind: unlike those three, it bypasses every ownership
-    check in the platform (`require_role`, `require_self_or_admin`), so holding the label
+    check in the platform (`require_permission`, `require_self_or_admin`), so holding the label
     already *is* the access, with nothing further gating a specific resource underneath. That
     makes it the one role where self-service would let anyone opt into bypassing every check
     that would otherwise apply to them — so granting or revoking it, on any account including

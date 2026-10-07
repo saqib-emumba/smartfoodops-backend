@@ -3,7 +3,7 @@
 The workflow that calls these has no user behind it: it did not choose the order it is
 paying for or refunding, and a token in a workflow argument would be written into durable,
 UI-visible history. Both facts are D26's, restated here because they are why this file's
-routes carry no `Depends(require_role(...))` at all — see common/auth.py's `require_internal`.
+routes carry no `Depends(require_permission(...))` at all — see common/auth.py's `require_internal`.
 """
 
 from functools import partial
@@ -42,7 +42,7 @@ def authorize_for_saga(
     customer token. Since Week 2 this is how an order actually gets paid: the workflow
     authorises, and the customer-facing endpoint is left for direct and manual use (D30).
 
-    Dropping `require_role("customer")` does not drop the ownership guarantee, it relocates
+    Dropping the caller-facing permission check does not drop the ownership guarantee, it relocates
     it. The workflow did not choose this order — it was started by an already-authorised
     `POST /api/v1/orders` whose handler had already established that the caller owns it. By
     the time an activity runs there is no user in the request at all, which is exactly why

@@ -9,6 +9,7 @@ Routers should `from user import deps` and reference `deps.users`, not
 
 from common.bootstrap import bootstrap
 from common.config import DEFAULT_AUTH_REDIS_URL, service_url
+from user.repositories.policy import PolicyRepository
 from user.repositories.sessions import RefreshTokenStore
 from user.repositories.users import UserRepository
 
@@ -22,3 +23,7 @@ db = runtime.db
 
 users = UserRepository(db)
 refresh_tokens = RefreshTokenStore(AUTH_REDIS_URL, logger=logger)
+
+# The access-control policy tables (D57). Read by user/policy.py, which holds the snapshot
+# this repository fills — the gateway's verify subrequest consults that, never this directly.
+policy = PolicyRepository(db, logger=logger)

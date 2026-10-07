@@ -6,7 +6,7 @@ row via the token's subject — there is no path that takes a rider id from the 
 
 from fastapi import APIRouter, Depends, status
 
-from common.auth import CurrentUser, require_role
+from common.auth import CurrentUser, require_permission
 from common.errors import conflict
 from common.responses import Envelope, ok
 from rider import deps
@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/v1/riders")
 @router.post("", response_model=Envelope[RiderResponse], status_code=status.HTTP_201_CREATED)
 def register_rider(
     payload: RiderRegisterRequest,
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("rider:profile")),
 ) -> Envelope[RiderResponse]:
     """Enrol the calling account into the delivery fleet.
 
@@ -47,7 +47,7 @@ def register_rider(
 
 @router.get("/me", response_model=Envelope[RiderResponse])
 def get_own_profile(
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("rider:profile")),
 ) -> Envelope[RiderResponse]:
     rider = with_location(own_profile(deps.riders, current_user), deps.geo)
     return ok(RiderResponse(**rider), message="Rider found")
@@ -56,7 +56,7 @@ def get_own_profile(
 @router.patch("/me/location", response_model=Envelope[RiderResponse])
 def update_location(
     payload: RiderLocationRequest,
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("rider:profile")),
 ) -> Envelope[RiderResponse]:
     """Report the rider's current position.
 
@@ -83,7 +83,7 @@ def update_location(
 @router.patch("/me/availability", response_model=Envelope[RiderResponse])
 def set_availability(
     payload: RiderAvailabilityRequest,
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("rider:profile")),
 ) -> Envelope[RiderResponse]:
     """Go on or off shift.
 

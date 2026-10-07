@@ -4,6 +4,13 @@ Status: **implemented** — see [D48](key-decisions.md#d48--multiple-roles-per-u
 for the changelog-style record of what shipped. This doc maps how a user gains more than one
 role, and how every authorization decision in the platform behaves once that's possible.
 
+> **Partly superseded by [D57](key-decisions.md#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway)
+> on 2026-10-06.** The multi-role model below is unchanged. What changed is where the rules
+> live and who applies them: roles are now granted *permissions* in three new tables in
+> `sfo_user_core`, a route demands a permission rather than naming a role, and the API gateway
+> refuses a wrong-role request before any backend service sees it. §3.1 and §3.7 are updated;
+> read `require_role` elsewhere in this document as `require_permission`.
+
 ## 1. The problem
 
 Today `users.role_id` is a single `NOT NULL` foreign key — one role per user, enforced at the
@@ -74,6 +81,7 @@ multi-role-aware, plus one new pair of endpoints to manage the grants themselves
 | Primitive | Today (single role) | Under multi-role | Changes? |
 |---|---|---|---|
 | `require_role(*allowed)` | `current_user.role not in allowed` | `not (set(current_user.roles) & set(allowed))` | **Yes** — membership becomes set-intersection |
+| `require_permission(*allowed)` *(D57)* | did not exist | `not (set(current_user.permissions) & set(allowed))` | **Replaces `require_role`** — same intersection, over capabilities resolved from the caller's roles by the gateway rather than role names hardcoded at the call site |
 | `require_self_or_admin(current_user, subject_id)` | string-compares the caller's id to a resource's owning id; admin bypasses | unchanged — never compared roles, only identity | No |
 | `assert_account_role(account, required)` → `assert_account_has_role` | `account["role"] != required` | `required not in account["roles"]` | **Yes**, plus a rename so the plural-aware version can't silently be confused with the old one |
 | `require_internal(x_internal_key)` | shared secret header, no user identity involved at all | unchanged | No |
@@ -151,6 +159,17 @@ for abuse) could still place one more order before their token expires or refres
 it as a known, pre-existing gap for a future decision, not something this change silently papers
 over.
 
+**D57 adds an asymmetry to this section that is worth stating plainly.** Roles still come
+from the token's claims, so everything above holds unchanged: a newly granted role waits for a
+refresh or re-login. But *permissions* are no longer carried anywhere near a token — the
+gateway resolves them from the caller's roles against `role_permissions` on every request. So
+broadening what a role can do reaches tokens already in circulation immediately, while
+granting a role to a user still does not. Both halves are asserted in `smoke-test.sh`: one
+case re-logs-in after a role grant because it must, and one case does not after a permission
+grant because it need not. Note also that `require_role("customer")` no longer appears in the
+`verify_customer` gap described above — it is `require_permission("order:create")` now, which
+changes the literal but not the gap: the token's role claim is still what answers it.
+
 ### 3.6 Granting and revoking roles — the new surface, and who may use it
 
 New endpoints, `services/user/apis/roles.py`, under the existing `/api/v1/users` prefix:
@@ -195,35 +214,81 @@ reviewer might assume was overlooked rather than decided:
 
 ### 3.7 Full RBAC decision table
 
-Built from every `require_role`/`require_self_or_admin`/`require_internal` call site in the
-platform today, plus the two new role-management routes from §3.6. This table is the artifact
-meant to make "who can do what" auditable at a glance — the thing a reviewer or auditor would
-ask for first.
+> **Superseded by [D57](key-decisions.md#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway)
+> on 2026-10-06.** This section used to *be* the decision table, maintained by hand. It is now
+> a description of where that table lives: three tables in `sfo_user_core`, seeded by
+> `db/user/init.sql` sections 1d–1f. The prose version is kept below as the rationale for each
+> row, but the database is the source of truth, and `scripts/smoke-test.sh` asserts the two
+> agree rather than trusting them to.
 
-| Method + path | Role gate (`require_role`) | Ownership check | Admin bypass | Ref |
-|---|---|---|---|---|
-| `POST /api/v1/users/register` | — (public) | — | — | |
-| `POST /api/v1/users/login` | — (public) | — | — | |
-| `POST /api/v1/users/refresh` | — (valid refresh token) | — | — | D14 |
-| `GET /api/v1/users/{id}` | — (any authenticated user) | `require_self_or_admin` | Yes | |
-| `POST /api/v1/users/{id}/roles` | — (any authenticated user) | `require_self_or_admin` + (`system_admin` target requires caller `is_admin`) | Yes | §3.6 |
-| `DELETE /api/v1/users/{id}/roles/{role}` | — (any authenticated user) | `require_self_or_admin` + last-role guard + (`system_admin` target requires caller `is_admin`) | Yes | §3.6 |
-| `POST /api/v1/restaurants` | `restaurant_admin` | — (creates own restaurant) | Yes | |
-| `POST /api/v1/menus` | `restaurant_admin` | manual `owner_id` compare | Yes | |
-| `POST /api/v1/orders` (checkout) | `customer` | — (`customer_id` = caller, D13) | Yes | |
-| `GET /api/v1/orders/{id}` | — (any authenticated user) | `require_self_or_admin` on `customer_id` | Yes | |
-| `GET /api/v1/orders/kitchen/{restaurant_id}` | `restaurant_admin` | `verify_owner` → `require_self_or_admin` on `owner_id` | Yes | D33 |
-| `POST /api/v1/orders/{id}/accept` \| `/reject` | `restaurant_admin` | `verify_owner` on the order's restaurant | Yes | D33 |
-| `POST /api/v1/payments` | `customer` | — (own payment) | Yes | |
-| `/api/v1/payments/saga/*` | — | — | — | `require_internal` only, no end user reachable |
-| `POST /api/v1/riders/*` (delivery, profile) | `rider` | self-scoped by construction | Yes | |
-| `/api/v1/orders/rider-reports`, `/api/v1/orders/transitions`, `/api/v1/riders/dispatch` | — | — | — | `require_internal` only |
+The artifact a reviewer or auditor asks for first is now one query:
 
-Reading this table: role gates decide *which category of user* may reach a route at all;
-ownership checks (where present) decide whether *this specific* caller may act on *this
-specific* resource; `require_internal` routes have neither, because no end user should ever
-reach them — a forwarded bearer token would let the calling customer forge a sibling service's
-write, which is exactly what the internal-key mechanism exists to prevent (D15).
+```sql
+SELECT r.name AS role, p.name AS permission
+  FROM roles r
+  JOIN role_permissions rp ON rp.role_id = r.id
+  JOIN permissions p ON p.id = rp.permission_id
+ ORDER BY r.name, p.name;
+```
+
+**The capability vocabulary** (`permissions`), and which role holds each
+(`role_permissions`). `system_admin` additionally holds every permission, seeded by a
+`CROSS JOIN`, so the table answers the question without a reader needing to know about the
+`is_admin` bypass in code:
+
+| Permission | Held by | What it admits |
+|---|---|---|
+| `order:create` | `customer` | Checkout |
+| `order:read_any` | `system_admin` | Listing any order by status, regardless of ownership |
+| `payment:create` | `customer` | Paying directly, outside the saga |
+| `payment:read` | `customer` | Reading a payment, ownership still settled by reading its order |
+| `restaurant:onboard` | `restaurant_admin` | Registering a restaurant |
+| `menu:write` | `restaurant_admin` | Publishing or replacing a menu |
+| `kitchen:read` | `restaurant_admin` | Reading a kitchen queue |
+| `kitchen:decide` | `restaurant_admin` | Accepting or rejecting an order |
+| `rider:profile` | `rider` | Joining the fleet; own profile, location, availability |
+| `delivery:report` | `rider` | Reporting pickup and delivery |
+
+**Which permission each route demands** (`route_permissions`). Ownership checks are unchanged
+and still in the handlers — they need the resource row, so they can never move to the gateway:
+
+| Method + path | Permission demanded | Ownership check (in the handler) | Ref |
+|---|---|---|---|
+| `POST /api/v1/users/register` \| `/login` \| `/refresh` | *absent from the table* | — | public; nginx exempts them from `auth_request` |
+| `POST /api/v1/users/logout` | `NULL` (authenticated) | the refresh token is the credential | |
+| `GET /api/v1/users/{id}` | `NULL` (authenticated) | `require_self_or_admin` | |
+| `POST /api/v1/users/{id}/roles` | `NULL` (authenticated) | `require_self_or_admin` + `system_admin` carve-out | §3.6 |
+| `DELETE /api/v1/users/{id}/roles/{role}` | `NULL` (authenticated) | `require_self_or_admin` + last-role guard + carve-out | §3.6 |
+| `POST /api/v1/restaurants/onboard` | `restaurant:onboard` | — (creates own restaurant) | |
+| `GET /api/v1/restaurants/{id}` | `NULL` (authenticated) | — | |
+| `POST /api/v1/menus` | `menu:write` | manual `owner_id` compare | |
+| `GET /api/v1/menus/{restaurant_id}` | `NULL` (authenticated) | — | |
+| `POST /api/v1/orders` (checkout) | `order:create` | — (`customer_id` = caller, D13) | |
+| `GET /api/v1/orders` (by status) | `order:read_any` | — | |
+| `GET /api/v1/orders/{id}` | `NULL` (authenticated) | `require_self_or_admin` on `customer_id` | |
+| `GET /api/v1/orders/{id}/logs` | `NULL` (authenticated) | `require_self_or_admin` on `customer_id` | |
+| `GET /api/v1/orders/kitchen/{restaurant_id}` | `kitchen:read` | `verify_owner` → `require_self_or_admin` on `owner_id` | D33 |
+| `POST /api/v1/orders/{id}/accept` \| `/reject` | `kitchen:decide` | `verify_owner` on the order's restaurant | D33 |
+| `POST /api/v1/payments` | `payment:create` | — (own payment) | |
+| `GET /api/v1/payments/{id}` | `payment:read` | settled by reading the order as the caller | |
+| `POST /api/v1/riders` | `rider:profile` | self-scoped by construction | |
+| `GET /api/v1/riders/me`, `PATCH /me/location`, `/me/availability` | `rider:profile` | self-scoped by construction | |
+| `POST /api/v1/riders/me/orders/{id}/picked-up` \| `/delivered` | `delivery:report` | self-scoped by construction | |
+| `/api/v1/payments/authorize` \| `/refund` \| `/manual`, `/api/v1/orders/*/internal*`, `/transitions`, `/rider-report`, `/logs`, `/api/v1/riders/dispatch` \| `/release` | *absent from the table* | — | `require_internal` only (D15); nginx exempts them |
+
+Three things to read carefully in that table:
+
+- **`NULL` is a decision, not a gap.** It says the gateway admits any authenticated caller
+  and the handler's ownership check is the real guard. Nine routes are like this, and
+  "tidying" a `NULL` into a permission would silently replace an ownership rule with a role
+  rule. A smoke-test case asserts that `GET /api/v1/orders/{id}` is still refused by the
+  *service*, not the gateway, for a non-owner.
+- **Absent is also a decision, and it is the opposite one.** Public and internal-key routes
+  have no rows because nginx never sends them through `auth_request`, so the policy decision
+  point never sees them. For anything that *is* gated, absence means refusal: matching is
+  fail-closed, including for `system_admin`.
+- **Method is part of the match.** `DELETE /api/v1/menus` is refused even though
+  `POST /api/v1/menus` is a row, because the policy keys on both.
 
 ## 4. Worked scenario: restaurant owner places his own order
 
@@ -279,3 +344,16 @@ write, which is exactly what the internal-key mechanism exists to prevent (D15).
   (§3.5) is worth closing, independent of this change.
 - Decide whether a `user_roles.is_primary` flag (or `MIN(granted_at)`) is ever needed for a
   "default role" UI affordance — not needed today, cheap to add later.
+- **Admin endpoints for editing grants** (`POST`/`DELETE /api/v1/users/roles/{role}/permissions`,
+  `system_admin`-only, plus an immediate reload hook). Deliberately deferred by
+  [D57](key-decisions.md#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway):
+  they are endpoints that hand out privilege, and a SQL edit already takes effect within the
+  snapshot TTL without a restart. Worth adding when editing the policy becomes a routine
+  operator task rather than a deployment-time one.
+- **A shared invalidation channel for the policy snapshot** (Redis pub/sub, or simply dropping
+  the TTL). Needed the moment the User Service runs more than one replica: today a refresh
+  reaches only the process that performs it, which is correct at one replica and wrong at two.
+- **Resource-scoped grants** — `restaurant_admin` *of restaurant X* rather than of all
+  restaurants. This is the point at which a route→permission table stops being expressive
+  enough and the ownership checks in the handlers would fold into the policy model itself.
+  Today those two layers are cleanly separate (§3.4) and that is worth keeping until it isn't.

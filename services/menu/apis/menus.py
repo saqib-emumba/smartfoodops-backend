@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from pydantic import ValidationError
 
-from common.auth import CurrentUser, get_current_user, require_role
+from common.auth import CurrentUser, get_current_user, require_permission
 from common.errors import forbidden, not_found
 from common.responses import Envelope, ok
 from menu import deps
@@ -28,7 +28,7 @@ def _as_response(row: dict) -> MenuResponse:
 @router.post("", response_model=Envelope[MenuResponse])
 async def upsert_menu(
     payload: MenuUpsertRequest,
-    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_permission("menu:write")),
 ) -> Envelope[MenuResponse]:
     """Upsert the full category/item/customization tree for one restaurant.
 

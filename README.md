@@ -89,7 +89,7 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 
 | Service | Port | Owns | Its database (host port) | Reaches out to |
 |---|---|---|---|---|
-| `user-service` | 8001 | `roles`, `users` | `sfo_user_core` @ `sfo-user-db` (5432) | — |
+| `user-service` | 8001 | `roles`, `users`, and the RBAC policy (`permissions`, `role_permissions`, `route_permissions` — D57) | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
 | `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
 | `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal (starts the saga, signals the kitchen's decision — D47) |
@@ -470,9 +470,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 328 assertions against http://localhost
+./scripts/smoke-test.sh            # 423 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 209 assertions, skips the saga sections (~20s vs ~12min)
+./scripts/smoke-test.sh --fast     # 287 assertions, skips the saga sections and the policy-TTL wait
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
@@ -624,13 +624,52 @@ A failed login returns the same message whether the email is unknown or the pass
 wrong, and takes the same time either way — otherwise the endpoint would answer "does this
 person have an account here?" to anyone who asks.
 
+### Authorization: roles → permissions → routes (D57)
+
+Who may call what is **data, not code**. Three tables in `sfo_user_core` hold it:
+
+| Table | Holds |
+|---|---|
+| `permissions` | Named capabilities — `order:create`, `menu:write`, `kitchen:decide` … |
+| `role_permissions` | Which role holds which permission (`system_admin` holds all of them) |
+| `route_permissions` | Which permission a `method` + path demands; `NULL` = any signed-in user |
+
+The gateway enforces it. For every gated request nginx's `auth_request` call to the User
+Service verifies the token **and** checks the caller's roles against those tables, so a
+wrong-role request is refused with a `403` at the gateway and never reaches the service. The
+resolved permission set travels onward as `X-User-Permissions`, and each handler still
+re-checks it with `require_permission("menu:write")` — defence in depth, because a service
+reached directly (off the gateway) only has headers to trust (D52).
+
+Who can do what, as one query:
+
+```bash
+docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -c \
+  "SELECT r.name AS role, p.name AS permission FROM roles r
+     JOIN role_permissions rp ON rp.role_id = r.id
+     JOIN permissions p ON p.id = rp.permission_id ORDER BY 1, 2;"
+```
+
+Things worth knowing before you add or change a route:
+
+- **A gated route needs a `route_permissions` row.** Matching is fail-closed: no row means
+  `403` for everyone, `system_admin` included. Add the row in `db/user/init.sql` and a
+  migration for existing databases.
+- **Ownership checks stay in the handlers** (`require_self_or_admin`, `verify_owner`) — they
+  need the resource row, which the gateway never reads. Those routes have a `NULL` permission.
+- **Policy edits apply within 30 seconds, no restart** — the gateway's snapshot refreshes on a
+  TTL (`POLICY_CACHE_TTL_SECONDS`). A *permission* granted to a role reaches tokens already
+  issued; a *role* granted to a user still needs a refresh or re-login.
+- **The User Service refuses to start on an empty policy** — seed `route_permissions` first.
+
 ### Service-to-service calls
 
 Two mechanisms, deliberately different:
 
-- **On behalf of a user** — the caller's bearer token is forwarded downstream unchanged, so
-  a service can never do more than the user who invoked it. The Payment Service reads an
-  order with *your* token, which is exactly why it cannot pay for someone else's.
+- **On behalf of a user** — the caller's verified identity (`X-User-Id`, `X-User-Roles`,
+  `X-User-Permissions`) is re-asserted downstream rather than the bearer token (D52), so a
+  service can never act as anyone but whoever called it. The Payment Service reads an order
+  as *you*, which is exactly why it cannot pay for someone else's.
 - **Internal only** — `POST /api/v1/orders/logs` takes `X-Internal-Key` instead. Forwarding
   a user token there would let customers write the audit trail describing their own orders.
 
@@ -804,6 +843,9 @@ docker compose logs notification-worker | grep DISPATCH
 
 ### Endpoint reference
 
+Role names in the "Who may call it" column are shorthand for the permission that role holds
+(D57) — the authoritative mapping is the policy query under *Authorization* above.
+
 | Method | Path | Who may call it | Notes |
 |---|---|---|---|
 | `GET` | `/health` | anyone | Gateway only, does not touch services |
@@ -854,7 +896,7 @@ Interactive docs per service, once you expose a port (see below): `http://localh
 |---|---|
 | `400` | Unknown role name; missing `X-Idempotency-Key`; header disagreeing with `idempotency_key` in a payment body |
 | `401` | No bearer token, or one that is malformed, expired or badly signed; failed login; dead or already-used refresh token; internal endpoint reached without `X-Internal-Key`. Carries `WWW-Authenticate: Bearer` |
-| `403` | Authenticated, but not allowed: wrong role for the action, or someone else's user / order / payment. Also what a downstream refusal becomes when a forwarded token is rejected |
+| `403` | Authenticated, but not allowed: the caller's roles don't carry the permission the route demands (refused **at the gateway**, D57), a path with no policy row (fail-closed), or someone else's user / order / payment (refused by the service). Also what a downstream refusal becomes when identity headers are rejected |
 | `404` | Unknown restaurant / menu / order / payment; inactive restaurant. **Not** an unknown user id — that is a `403`, since the ownership check runs before the lookup and must not reveal which ids exist |
 | `409` | Duplicate email (case-insensitive) or phone; an order that already has a payment |
 | `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown restaurant; payment naming an unknown order or not settling it exactly |
@@ -983,10 +1025,10 @@ Each database is a separate container, so pick the one that owns the table you w
 in any of them is a quick proof of the split — only that service's tables are there.
 
 ```bash
-# User database — roles, users (riders moved out in Week 2 — see below)
+# User database — roles, users, user_roles, and the RBAC policy tables (riders moved out in Week 2 — see below)
 docker exec -it sfo-user-db psql -U sfo_user_admin -d sfo_user_core
 #   \dt              list tables
-#   SELECT u.email, r.name FROM users u JOIN roles r ON r.id = u.role_id;
+#   SELECT u.email, r.name FROM users u JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id;
 
 # Restaurant database — restaurants only (the kitchen queue moved to `orders`, D32)
 docker exec -it sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core
@@ -1069,7 +1111,15 @@ docker volume rm smartfoodops-backend_order_postgres_data
 docker compose up -d db-order-postgres
 ```
 
-There is no migration tooling in Week 1 — schema changes mean a volume reset.
+There is no migration tooling in Week 1 — schema changes mean a volume reset. The exception
+is one-off, hand-run SQL files beside `init.sql`, e.g. `db/user/add_rbac_permissions.sql` (D57):
+
+```bash
+docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_rbac_permissions.sql
+```
+
+That one needs `roles.id` to already be `uuid` and says so if it isn't — a user database
+created before that change has to be reset with the single-volume recipe above instead.
 
 ### Adding a dependency
 
@@ -1096,7 +1146,9 @@ smartfoodops-backend/
 │                              #   at the partition count per-order ordering depends on
 ├── rabbitmq/enabled_plugins   # Enables the management UI and the Prometheus exporter
 ├── db/                        # One schema per physical database, mounted into its container
-│   ├── user/init.sql          # roles (+ seed data), users
+│   ├── user/init.sql          # roles (+ seed data), users, user_roles, permissions, role_permissions,
+│   │                          #   route_permissions (the RBAC policy, D57)
+│   ├── user/add_rbac_permissions.sql  # hand-run migration for an already-initialised user DB
 │   ├── restaurant/init.sql    # restaurants
 │   ├── menu/init.sql          # menus (category tree as JSONB)
 │   ├── order/init.sql         # order_status enum, orders (+ outbox + rider report columns,
@@ -1106,7 +1158,7 @@ smartfoodops-backend/
 │   └── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
-│   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_role, require_self_or_admin
+│   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_permission, require_self_or_admin
 │   │   ├── bootstrap.py       # ServiceRuntime: logging + telemetry + a service's own DB pool, one call
 │   │   ├── config.py          # Env defaults, timeouts, pool bounds
 │   │   ├── errors.py          # HTTPException factories (400/403/404/409/422/500/502/503)
@@ -1129,8 +1181,9 @@ smartfoodops-backend/
 │   │   │                      #   service (Week 3, D41)
 │   │   └── temporal.py        # TemporalGateway + workflow_id_for() (Orchestrator Service +
 │   │                          #   worker only, since D36) — now with TracingInterceptor (Week 3)
-│   ├── user/                  # main.py, deps.py, apis/{users,sessions,health}.py,
-│   │                          #   security.py, repositories/{users,sessions}.py,
+│   ├── user/                  # main.py, deps.py, apis/{users,roles,sessions,internal,health}.py,
+│   │                          #   security.py, policy.py (gateway PDP: in-memory policy snapshot, D57),
+│   │                          #   repositories/{users,sessions,policy}.py,
 │   │                          #   schemas/{users,sessions}.py                     (:8001)
 │   ├── restaurant/            # + clients/user.py                                (:8002)
 │   ├── menu/                  # + clients/restaurant.py, repositories/cache.py    (:8003)

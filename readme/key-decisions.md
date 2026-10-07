@@ -63,15 +63,16 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D44](#d44--the-analytics-service-gets-its-own-database-and-dedups-by-consumer_group-event_id) | The Analytics Service gets its own database, dedups by `(consumer_group, event_id)` | 2026-09-08 | Accepted |
 | [D45](#d45--kafka-is-the-ledger-rabbitmqcelery-is-the-concurrency-pool) | Kafka is the ledger, RabbitMQ/Celery is the concurrency pool | 2026-09-09 | Accepted |
 | [D47](#d47--services-hold-their-own-temporal-client-and-name-workflows-by-string) | Services hold their own Temporal client and name workflows by string | 2026-09-09 | Accepted |
-| [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Accepted |
+| [D48](#d48--multiple-roles-per-user-via-a-junction-table-not-an-implicit-everyone-is-a-customer-rule) | Multiple roles per user via a junction table | 2026-09-22 | Partly superseded by [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) |
 | [D49](#d49--rider-live-location-moves-from-postgres-columns-to-a-redis-geo-index) | Rider live location moves from Postgres to a Redis GEO index | 2026-09-23 | Accepted |
 | [D50](#d50--menu-categories-and-order-items-move-from-jsonb-to-normalized-relational-tables) | Menu categories and order items move from JSONB to normalized relational tables | 2026-09-23 | Accepted |
-| [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) | nginx gains a fail-closed `auth_request` chokepoint | 2026-09-24 | Accepted |
+| [D51](#d51--nginx-gains-a-fail-closed-auth_request-chokepoint-in-front-of-in-process-verification) | nginx gains a fail-closed `auth_request` chokepoint | 2026-09-24 | Extended by [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) |
 | [D52](#d52--internal-calls-assert-identity-headers-instead-of-forwarding-the-bearer-token) | Internal calls assert identity headers instead of forwarding the bearer token | 2026-09-24 | Accepted |
 | [D53](#d53--the-outbox-tables-are-removed-workflow-history-becomes-the-publish-ledger) | The outbox tables are removed; workflow history becomes the publish ledger | 2026-09-29 | Accepted |
 | [D54](#d54--order-creation-moves-inside-temporal-via-update-with-start) | Order creation moves inside Temporal, via Update-with-Start | 2026-09-30 | Accepted |
 | [D55](#d55--payment-rider-and-compensation-become-child-workflows-of-orderworkflow) | Payment, rider and compensation become child workflows of `OrderWorkflow` | 2026-10-01 | Accepted |
 | [D56](#d56--a-refund-that-permanently-fails-becomes-compensation_failed-not-a-silently-failed-workflow) | A refund that permanently fails becomes `'compensation_failed'`, not a silently-failed workflow | 2026-10-02 | Accepted |
+| [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) | RBAC moves into the database and is enforced at the gateway | 2026-10-06 | Accepted |
 
 ---
 
@@ -382,6 +383,14 @@ sites pointing here.
 
 ### D51 — nginx gains a fail-closed `auth_request` chokepoint in front of in-process verification
 
+> **Extended by [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) on
+> 2026-10-06.** The chokepoint below is unchanged and still correct; what changed is how much
+> it decides. The verify subrequest now answers `403` as well as `401`, because it also
+> resolves the caller's permissions against the policy tables and matches the requested route
+> against them — so the gateway refuses a wrong-role request, not merely an unauthenticated
+> one. It also receives the caller's real method and path, which this entry's version had no
+> need for.
+
 **Decided:** `api-gateway/nginx.conf` now calls `auth_request` against
 `GET /api/v1/users/internal/verify` (`services/user/apis/internal.py`, `internal;`-only,
 unreachable from outside) before proxying any request under `/api/v1/users`,
@@ -471,6 +480,97 @@ directly: gateway does authentication, services keep authorisation (`require_rol
   most of what this gives up, without reintroducing per-hop JWT verification. Noted here
   rather than in Open Questions because, unlike those, this one was raised and consciously
   deferred in the same conversation that made this decision, not discovered afterward.
+
+
+### D57 — RBAC moves into the database and is enforced at the gateway
+
+**Decided:** the role literals that sat in fourteen `Depends(require_role("..."))` call sites
+across six services become rows in three new tables in `sfo_user_core` — `permissions`
+(named capabilities like `order:create`), `role_permissions` (which role holds which), and
+`route_permissions` (which capability a `method` + templated path demands, with `NULL`
+meaning "any authenticated caller"). nginx's existing `auth_request` subrequest (D51) now
+carries the caller's real method and path, and the User Service's verify endpoint answers
+`403` as well as `401`: a wrong-role request is refused at the gateway and never reaches a
+backend service. Handlers keep a second check, but it names a capability rather than a role —
+`require_role` is deleted in favour of `require_permission("menu:write")`, and
+`X-User-Permissions` joins the identity headers so a service needs no policy table of its
+own. Who can do what is now one SQL join. Full seed matrix and the matcher's rules live in
+[multi-role-rbac-design.md](multi-role-rbac-design.md) §3.7; this entry is the
+changelog-style record.
+
+**Instead of:**
+
+- **A policy table in code** — a module in `services/common/` holding the same mapping as
+  Python data, read by both enforcement points. Cheaper (no schema change, no query, no
+  snapshot, no cache staleness) and it was the recommendation on the table. Rejected on
+  review: the reviewers wanted the mapping to be data in the database, queryable and
+  editable without a deploy, which a code table is not. The cost of that choice is the two
+  bullets at the top of **Costs** below, and they are the direct price of the requirement.
+- **Role rows instead of a permission vocabulary** — `route_permissions(method, path, role_id)`,
+  a literal translation of the old call sites. Fewer tables and no indirection, but then
+  every new route needs a row per admitted role, and granting an existing capability to a
+  new role means editing route rows rather than one grant. The vocabulary is what decouples
+  "what a role can do" from "which URL implements it".
+- **Deleting the in-service checks** and letting the gateway be the only enforcement point.
+  Rejected for the reason D52 already names: post-D52 anything that can reach
+  `order-service:8004` can set `X-User-Roles` itself, so gateway-only enforcement would turn
+  network reachability into full privilege escalation.
+- **A separate Identity Service** owning the policy. Rejected as a split that does not cut
+  anywhere real: the User Service already is the identity service — sole token issuer, sole
+  holder of the private key, owner of `roles`/`user_roles`, and the gateway's policy decision
+  point since D51. Login needs `users.email` and `password_hash`, so an identity service
+  either takes those (leaving a profile shim) or spans two databases, which D01 forbids. The
+  honest version of the split is renaming this service and moving profile columns out. New
+  code is isolated in `user/policy.py` and `user/repositories/policy.py` so a later
+  extraction is a file move rather than a rewrite.
+- **Admin endpoints for editing grants** (`POST/DELETE /api/v1/users/roles/{role}/permissions`).
+  Deferred, not rejected: they are endpoints that hand out privilege, and the snapshot TTL
+  already makes a SQL edit take effect without a restart, so the runtime-editability argument
+  for a database table is satisfied without them.
+- **Permissions baked into the token** as scopes. Rejected: the token grows with every route,
+  and a policy change would then wait for the user's next login. Roles stay in the claim and
+  permissions resolve per request, which is what makes the asymmetry in **Costs** possible.
+
+**Why:** the mapping existed three times — as `require_role` literals, as a prose table in
+`multi-role-rbac-design.md` §3.7, and in the reviewers' heads — and nothing verified that the
+three agreed. One of them had to become the source of truth, and the reviewers asked for the
+database. Putting the decision at the gateway follows from that: once the policy is loadable
+in one place, the chokepoint D51 already built is where it costs least to consult.
+
+**Costs:**
+
+* **`sfo-user-db` joins the critical path of every gated request in the platform.** Verify
+  previously touched no database at all — one RSA signature check and nothing else. The
+  policy is held as an immutable in-memory snapshot rebuilt at most once per
+  `POLICY_CACHE_TTL_SECONDS` (30s), so steady state is a regex match and a set intersection
+  rather than a query; but a cold user-service now needs Postgres before it can authorize
+  anything, and `user/policy.py::load_initial` deliberately **refuses to boot** on an empty
+  policy, because fail-closed matching against zero rows would refuse every request.
+* **A policy edit takes up to the TTL to apply, and a refresh reaches only the process that
+  performs it.** Correct at one replica, wrong at two — a second user-service instance would
+  need a shared invalidation channel (Redis pub/sub) that does not exist. Named now because
+  it is invisible until the day someone scales the service.
+* **Two statements of route → permission remain**: the `route_permissions` row and the
+  `require_permission("...")` literal in the handler. This is the duplication the code table
+  would not have had. It is covered by an assertion in `smoke-test.sh` rather than a comment,
+  but an assertion is not a type system.
+* **A missing `route_permissions` row refuses `system_admin` too.** Fail-closed runs before
+  the admin bypass, deliberately: D48 §3.2 has `system_admin` bypassing every *gate*, and a
+  missing row is not a gate, it is an unconfigured route. Letting an operator through would
+  make the omission work for exactly the person most likely to be testing the new endpoint.
+  Ship a route without its row and the operator sees a 403 until the row lands.
+* **The old `roles.id` type blocks the migration.** `db/user/add_rbac_permissions.sql` needs
+  the UUID `roles.id` from commit `6c53df6`, which shipped no migration of its own because
+  this repo resets volumes instead. A database still on the `SERIAL` column cannot hold the
+  new foreign keys, so the migration opens with a `DO` block that says so in one sentence
+  rather than letting Postgres report a bare "foreign key constraint cannot be implemented".
+* **A role grant still needs a re-login (D18), but a permission grant does not.** The
+  asymmetry is deliberate and worth stating: roles come from the token's claims, so a newly
+  granted role waits for a refresh; permissions are resolved from those roles per request, so
+  broadening what a role can do reaches tokens already in circulation immediately. A
+  smoke-test case asserts each half.
+* **`scripts/init_bootstrap.sh` must stay byte-for-byte in sync** (D20) — two heredocs this
+  time, `db/user/init.sql` and `api-gateway/nginx.conf`.
 
 ---
 
@@ -1805,6 +1905,15 @@ not strengthen or weaken the guarantee itself.
 ## Week 4 — multi-role access control
 
 ### D48 — Multiple roles per user via a junction table, not an implicit "everyone is a customer" rule
+
+> **Partly superseded by [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway)
+> on 2026-10-06.** The junction table and the multi-role semantics below are unchanged. What
+> changed is the guard: `require_role` is gone, and a route now demands a *permission* that
+> roles are granted in `role_permissions`, so the role literals this entry describes at each
+> call site no longer exist in service code. Read "`require_role` is a set intersection"
+> below as describing `require_permission`, which is the same intersection over a different
+> vocabulary. Note also that D48's rejected alternative — "a second policy table" — was
+> rejected for the narrow case of elevation-to-grant and is not what D57 introduces.
 
 **Decided:** `users.role_id` (a single `NOT NULL` foreign key — one role per user) is replaced
 by `user_roles`, a `(user_id, role_id)` junction table (`db/user/init.sql`,

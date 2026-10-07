@@ -20,7 +20,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from common.auth import CurrentUser, require_role
+from common.auth import CurrentUser, require_permission
 from common.responses import Envelope, ok
 from rider import deps
 from rider.fleet import own_profile, report_event
@@ -31,7 +31,7 @@ router = APIRouter(prefix="/api/v1/riders/me/orders")
 @router.post("/{order_id}/picked-up", response_model=Envelope[None])
 async def mark_picked_up(
     order_id: UUID,
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("delivery:report")),
 ) -> Envelope[None]:
     """Report collecting an order from the kitchen.
 
@@ -52,7 +52,7 @@ async def mark_picked_up(
 @router.post("/{order_id}/delivered", response_model=Envelope[None])
 async def mark_delivered(
     order_id: UUID,
-    current_user: CurrentUser = Depends(require_role("rider")),
+    current_user: CurrentUser = Depends(require_permission("delivery:report")),
 ) -> Envelope[None]:
     """Report handing an order to the customer.
 

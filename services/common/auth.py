@@ -18,6 +18,15 @@ gateway's path) sets them itself via `identity_headers()`. See D51 and D52 in
 readme/key-decisions.md for the trade-off this accepts — a caller's identity is no longer
 backed by a signature once it is past the gateway, only by which container it came from.
 
+D57 moved *what* a caller is allowed to do out of this file entirely. The role literals that
+used to sit in `require_role("restaurant_admin")` call sites now live in the User Service's
+`permissions`/`role_permissions`/`route_permissions` tables; the gateway's verify subrequest
+resolves them per request and passes the answer down as `X-User-Roles` plus
+`X-User-Permissions`. What remains here is `require_permission`, which names a capability and
+knows nothing about which role holds it. Note what did *not* move: `require_self_or_admin` and
+`assert_account_has_role` below still answer questions about a *resource* or a *fetched
+account*, which need a row the gateway has never read.
+
 Services also talk to each other. Two mechanisms, deliberately distinct:
 
     end-user calls    -> the caller's own verified identity, asserted via X-User-Id/
@@ -81,6 +90,15 @@ class CurrentUser(BaseModel):
 
     user_id: UUID
     roles: list[str]
+    # Resolved from the caller's roles against `role_permissions` by the gateway's verify
+    # subrequest (D57), not carried in the token. That is what lets a permission added to a
+    # role apply to tokens already in circulation — a *role* grant still needs a refresh
+    # (D18), but what a role can do is evaluated fresh on every request.
+    #
+    # Defaulted empty rather than required: an internal caller asserting identity to a
+    # sibling may legitimately have none to pass on, and a route that demands a permission
+    # will refuse an empty set anyway. Absence is a denial, never an accidental admit.
+    permissions: list[str] = []
 
     @property
     def is_admin(self) -> bool:
@@ -149,14 +167,20 @@ def verify_access_token(
 def get_current_user(
     x_user_id: str | None = Header(None, alias="X-User-Id"),
     x_user_roles: str | None = Header(None, alias="X-User-Roles"),
+    x_user_permissions: str | None = Header(None, alias="X-User-Permissions"),
 ) -> CurrentUser:
-    """The identity behind a request, trusted rather than re-verified (D51/D52).
+    """The identity behind a request, trusted rather than re-verified (D51/D52/D57).
 
     A gateway-fronted request has these headers set by nginx, after `auth_request` calls
     `verify_access_token` and the token checks out. An internal, service-to-service request
     has them set by the caller via `identity_headers()`, re-asserting the identity it already
     had verified for its own inbound request. Either way, this dependency does not itself
     check a signature — something upstream of it already did, or should have.
+
+    `X-User-Permissions` is the capability set the gateway resolved from the caller's roles
+    against the policy tables (D57). Missing is not fatal here, unlike the other two: the
+    permission checks downstream treat an empty set as a denial, so a caller arriving without
+    it can reach an ownership-gated route and nothing more.
     """
     if not x_user_id or not x_user_roles:
         raise unauthorized(
@@ -167,20 +191,39 @@ def get_current_user(
     except ValueError as exc:
         raise unauthorized("Invalid identity header") from exc
 
-    return CurrentUser(user_id=user_id, roles=[r for r in x_user_roles.split(",") if r])
+    return CurrentUser(
+        user_id=user_id,
+        roles=[r for r in x_user_roles.split(",") if r],
+        permissions=[p for p in (x_user_permissions or "").split(",") if p],
+    )
 
 
-def require_role(*allowed: str):
-    """Build a dependency admitting callers who hold at least one of the listed roles.
+def require_permission(*allowed: str):
+    """Build a dependency admitting callers who hold at least one of the listed permissions.
 
-    Usage: ``current_user = Depends(require_role("restaurant_admin"))``. `system_admin` is
+    Usage: ``current_user = Depends(require_permission("menu:write"))``. `system_admin` is
     always admitted so an operator is never locked out of an endpoint.
+
+    Replaces `require_role` (D57). A handler names the *capability* it needs, never the role
+    that happens to hold it — which role that is lives in `role_permissions` in the User
+    Service database, so granting `menu:write` to a new role is a SQL change and no service
+    is rebuilt. The role literals that used to sit at these call sites are gone.
+
+    This is the second of two enforcement points, not the only one: the gateway already
+    refused this request if the caller lacked the permission (services/user/policy.py), and
+    this check is what still stands when a sibling service is reached directly, off the
+    gateway's path, where `X-User-Roles` is asserted by the caller rather than verified
+    (D52). Removing it would turn network reachability into privilege escalation.
+
+    The message names the required permission rather than the caller's roles: a caller
+    cannot act on "you are not a restaurant_admin", and saying so leaks how the platform's
+    roles are arranged to anyone probing endpoints.
     """
 
     def dependency(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
-        if not (set(current_user.roles) & set(allowed)) and not current_user.is_admin:
+        if not (set(current_user.permissions) & set(allowed)) and not current_user.is_admin:
             raise forbidden(
-                f"Role(s) '{', '.join(current_user.roles)}' may not perform this action "
+                "You do not hold the permission required for this action "
                 f"(requires one of: {', '.join(sorted(allowed))})"
             )
         return current_user
@@ -253,6 +296,11 @@ def identity_headers(current_user: CurrentUser) -> dict:
     return {
         "X-User-Id": str(current_user.user_id),
         "X-User-Roles": ",".join(current_user.roles),
+        # The capability set this caller was handed, forwarded unchanged (D57). Resolved
+        # rather than re-derived: a sibling service holds no policy tables and must not have
+        # to, so it can only ever pass on what the gateway already decided — the same rule
+        # the two headers above follow.
+        "X-User-Permissions": ",".join(current_user.permissions),
     }
 
 

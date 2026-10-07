@@ -1,70 +1,53 @@
 -- ============================================================================
--- User Service database — sfo_user_core (container sfo-user-db, host port 5432)
+-- One-off migration for an already-running sfo-user-db container (D57).
 --
--- Owns identity and nothing else: `roles`, `users`, and since D57 the access-control
--- policy itself (`permissions`, `role_permissions`, `route_permissions`). Only the User
--- Service connects here; every other service reads a profile through
--- GET /api/v1/users/{user_id}, and learns what a caller may do from the identity headers
--- the API gateway sets after its verify subrequest.
+-- init.sql only runs on an empty Postgres volume (docker-entrypoint-initdb.d), so a
+-- deployment that already has data needs this run by hand instead:
+--   docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_rbac_permissions.sql
 --
--- `riders` used to live here too, on the argument that a rider is an extension of
--- a user identity and the foreign key to `users` was worth keeping. Week 2 moved it
--- to sfo_rider_core (D28): the Rider Service needs to write availability and
--- location on every dispatch, and under D01 a service may not write another
--- service's tables. The foreign key was the cost of that move — `riders.user_id`
--- is now a plain UUID verified over HTTP, like every other cross-service
--- reference (D02).
+-- Adds the three RBAC policy tables and seeds them with the grant matrix the platform
+-- shipped with. Everything below mirrors sections 1d-1f of db/user/init.sql exactly, and
+-- every statement is idempotent, so re-running this is a no-op.
+--
+-- Deploy ordering: run this BEFORE the new user-service image. The policy table is read at
+-- startup and an empty one is a boot failure by design (services/user/policy.py) — the old
+-- image ignores these tables, so applying the migration early is safe and applying it late
+-- means the new user-service refuses to start until it lands.
+--
+-- Nothing here is destructive: no column is dropped and no existing row is rewritten, so
+-- unlike backfill_user_roles.sql this file needs no gated second step.
+--
+-- PREREQUISITE: `roles.id` must already be UUID. Commit 6c53df6 changed it from SERIAL and
+-- shipped no migration, because this repo has no migration tooling and handles schema
+-- changes by resetting the volume (README, "There is no migration tooling"). A database
+-- still carrying the old INT column cannot hold these foreign keys, so the guard below
+-- stops with a readable message instead of letting Postgres report a bare "foreign key
+-- constraint cannot be implemented". Reset that one volume and let init.sql rebuild it:
+--   docker compose rm -sf db-user-postgres
+--   docker volume rm smartfoodops-backend_user_postgres_data
+--   docker compose up -d db-user-postgres
 -- ============================================================================
 
--- Enable UUID extension for secure, non-sequential IDs
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+BEGIN;
 
--- 1a. Roles Lookup Table (Normalized Database Design)
--- UUID PK, like every other table's id here, rather than a SERIAL: the old int PK was the
--- one surrogate key in this schema that wasn't a UUID, which was a red flag for anyone
--- reading the ERD rather than a deliberate choice. Still ordered by created_at (not id)
--- wherever the seed order matters, since a UUID carries no ordering of its own.
-CREATE TABLE IF NOT EXISTS roles (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(50) UNIQUE NOT NULL,
-    description TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+DO $$
+DECLARE
+    id_type text;
+BEGIN
+    SELECT data_type INTO id_type
+      FROM information_schema.columns
+     WHERE table_name = 'roles' AND column_name = 'id';
 
--- Seed static user roles on initialization
-INSERT INTO roles (name, description) VALUES
-('customer', 'App Customer / Order placer'),
-('restaurant_admin', 'Restaurant Owner / Menu and Order manager'),
-('rider', 'Delivery Partner / Logistics handler'),
-('system_admin', 'SFO Platform Operations administrator')
-ON CONFLICT (name) DO NOTHING;
-
--- 1b. Users Table (Core Profiles)
-CREATE TABLE IF NOT EXISTS users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    email VARCHAR(255) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    full_name VARCHAR(255) NOT NULL,
-    phone VARCHAR(50) UNIQUE NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Case-insensitive unique constraint index for emails (prevent duplicate registrations)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON users (LOWER(email));
-
--- 1c. User <-> Role grants (many-to-many). Replaces the single users.role_id column: a
--- user can hold more than one role (e.g. a restaurant_admin who also places orders as a
--- customer). Composite PK is the grant's whole identity -- "this user holds this role" has
--- no attributes worth a surrogate id, and it doubles as the no-duplicate-grant constraint.
--- ON DELETE CASCADE on user_id (deleting a user drops their grants); ON DELETE RESTRICT on
--- role_id, matching the old column's behavior (a role is reference data, not disposable).
-CREATE TABLE IF NOT EXISTS user_roles (
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role_id UUID NOT NULL REFERENCES roles(id) ON DELETE RESTRICT,
-    granted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (user_id, role_id)
-);
+    IF id_type IS NULL THEN
+        RAISE EXCEPTION 'No `roles` table here — is this the User Service database?';
+    ELSIF id_type <> 'uuid' THEN
+        RAISE EXCEPTION
+            'roles.id is % but these tables need uuid (commit 6c53df6). This database '
+            'predates that change and has no migration path; reset the user_postgres_data '
+            'volume and let db/user/init.sql rebuild it — see the header of this file.',
+            id_type;
+    END IF;
+END $$;
 
 -- 1d. Permissions — the vocabulary a role is granted in, and the only thing a route ever
 -- demands (D57). Named `<resource>:<action>` so a grant reads as a sentence and so an
@@ -188,3 +171,21 @@ INSERT INTO route_permissions (method, path_pattern, permission_id, description)
 ('GET',    '/api/v1/orders/{order_id}',              NULL, 'require_self_or_admin on customer_id'),
 ('GET',    '/api/v1/orders/{order_id}/logs',         NULL, 'require_self_or_admin on customer_id')
 ON CONFLICT (method, path_pattern) DO NOTHING;
+
+COMMIT;
+
+-- --- Verify after running ------------------------------------------------------------
+-- Expect 10 permissions, 19 role grants (10 explicit + 9 completing system_admin), and 23
+-- routes of which 15 demand a permission and 8 are authenticated-only:
+-- SELECT count(*) FROM permissions;
+-- SELECT count(*) FROM role_permissions;
+-- SELECT count(*) FILTER (WHERE permission_id IS NOT NULL) AS gated,
+--        count(*) FILTER (WHERE permission_id IS NULL)     AS auth_only
+--   FROM route_permissions;
+--
+-- The artifact this whole change exists to produce — who can do what, in one query:
+-- SELECT r.name AS role, p.name AS permission
+--   FROM roles r
+--   JOIN role_permissions rp ON rp.role_id = r.id
+--   JOIN permissions p ON p.id = rp.permission_id
+--  ORDER BY r.name, p.name;

@@ -13,11 +13,24 @@ Reflects the actual schema across all 7 physical databases (`db/*/init.sql`), in
 > (`common.kafka.deterministic_event_id`), which is why that relationship below reads
 > straight off `ORDERS`/`PAYMENTS` rather than through an intermediate outbox entity.
 
+> **`sfo_user_core` now holds the authorization policy too (D57).** `PERMISSIONS`,
+> `ROLE_PERMISSIONS` and `ROUTE_PERMISSIONS` are what the API gateway's verify subrequest
+> reads to decide whether a caller may have a route at all — the role literals that used to
+> live in `require_role(...)` call sites across six services. `ROUTE_PERMISSIONS.permission_id`
+> is deliberately nullable: `NULL` means "any authenticated caller", for the nine routes whose
+> real guard is an ownership check inside the handler, which needs a row the gateway has never
+> read. See [readme/multi-role-rbac-design.md](../multi-role-rbac-design.md) §3.7.
+
 ```mermaid
 erDiagram
     %% ---- sfo_user_core ----
     USERS ||--o{ USER_ROLES : "has (real FK, ON DELETE CASCADE)"
     ROLES ||--o{ USER_ROLES : "granted_via (real FK, ON DELETE RESTRICT)"
+
+    %% ---- sfo_user_core: the access-control policy itself (D57) ----
+    ROLES ||--o{ ROLE_PERMISSIONS : "holds (real FK, ON DELETE CASCADE)"
+    PERMISSIONS ||--o{ ROLE_PERMISSIONS : "granted_via (real FK, ON DELETE CASCADE)"
+    PERMISSIONS ||--o{ ROUTE_PERMISSIONS : "demanded_by (real FK, ON DELETE RESTRICT, nullable)"
 
     %% ---- cross-database references, verified over HTTP, no engine FK ----
     USERS ||--o{ RESTAURANTS : "onboards / owns"
@@ -67,6 +80,24 @@ erDiagram
         uuid user_id PK, FK "Composite PK with role_id -- References USERS.id, ON DELETE CASCADE"
         uuid role_id PK, FK "Composite PK with user_id -- References ROLES.id, ON DELETE RESTRICT"
         timestamp granted_at
+    }
+    PERMISSIONS {
+        uuid id PK
+        varchar name "Unique, resource:action -- order:create, menu:write, kitchen:decide (D57)"
+        text description
+        timestamp created_at
+    }
+    ROLE_PERMISSIONS {
+        uuid role_id PK, FK "Composite PK with permission_id -- References ROLES.id, ON DELETE CASCADE"
+        uuid permission_id PK, FK "Composite PK with role_id -- References PERMISSIONS.id, ON DELETE CASCADE"
+        timestamp granted_at
+    }
+    ROUTE_PERMISSIONS {
+        uuid id PK
+        varchar method "GET/POST/PATCH/DELETE -- part of the match, so DELETE on a POST route is refused"
+        varchar path_pattern "Templated, not a regex: /api/v1/orders/{order_id}/accept. Unique with method"
+        uuid permission_id FK "NULLABLE -- References PERMISSIONS.id, ON DELETE RESTRICT. NULL = any authenticated caller, ownership checked in the handler"
+        text description
     }
 
     RESTAURANTS {

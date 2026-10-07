@@ -17,7 +17,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends
 
-from common.auth import CurrentUser, require_role
+from common.auth import CurrentUser, require_permission
 from common.errors import not_found
 from common.responses import Envelope, ok
 from order import deps
@@ -29,7 +29,7 @@ router = APIRouter(prefix="/api/v1/orders")
 @router.get("/kitchen/{restaurant_id}", response_model=Envelope[list[KitchenOrderResponse]])
 def kitchen_queue(
     restaurant_id: UUID,
-    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_permission("kitchen:read")),
 ) -> Envelope[list[KitchenOrderResponse]]:
     """The kitchen's rail: this restaurant's orders awaiting a decision, oldest first.
 
@@ -99,7 +99,7 @@ async def _decide_kitchen(
 @router.post("/{order_id}/accept", response_model=Envelope[KitchenDecisionResponse])
 async def accept_order(
     order_id: UUID,
-    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_permission("kitchen:decide")),
 ) -> Envelope[KitchenDecisionResponse]:
     """Accept an order into the kitchen, releasing the saga to find a rider."""
     return await _decide_kitchen(order_id, current_user, "accepted")
@@ -108,7 +108,7 @@ async def accept_order(
 @router.post("/{order_id}/reject", response_model=Envelope[KitchenDecisionResponse])
 async def reject_order(
     order_id: UUID,
-    current_user: CurrentUser = Depends(require_role("restaurant_admin")),
+    current_user: CurrentUser = Depends(require_permission("kitchen:decide")),
 ) -> Envelope[KitchenDecisionResponse]:
     """Decline an order, which makes the saga refund the customer and cancel it."""
     return await _decide_kitchen(order_id, current_user, "rejected")

@@ -545,6 +545,146 @@ expect "a non-admin cannot revoke someone else's system_admin -> 403" 403 DELETE
 expect "a system_admin can revoke another account's system_admin" 200 DELETE "/api/v1/users/$OTHER_ID/roles/system_admin" \
   "" "${ADMIN_AUTH[@]}"
 
+# -------------------------------------------------- gateway-level RBAC (D57)
+# Role checks now live in the database (permissions / role_permissions / route_permissions
+# in sfo_user_core) and are enforced by nginx, via the same auth_request subrequest D51
+# added for authentication. The per-route 403s asserted throughout the rest of this file
+# still pass unchanged -- what these checks prove is *where* the refusal now comes from,
+# which a status code alone cannot show.
+#
+# The discriminator is the error text. The gateway's own envelope says "your role does not
+# carry the permission...", while a service's require_permission says "You do not hold the
+# permission...". Same status, different author.
+section "Gateway-level RBAC (D57)"
+
+GATEWAY_DENIAL="your role does not carry the permission required for this action"
+
+# One per gated service, proving the chokepoint is wired for each -- the shape D51's own
+# tests use. The request never reaches the backend: a role-gated route refused here would
+# otherwise have been refused one hop later by require_permission.
+expect "gateway RBAC: customer cannot publish a menu -> 403" 403 POST /api/v1/menus "$MENU" "${CUST_AUTH[@]}"
+assert "  refused by the gateway, not the Menu Service" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+
+expect "gateway RBAC: customer cannot onboard a restaurant -> 403" 403 POST /api/v1/restaurants/onboard \
+  "{\"name\":\"Nope Diner\",\"address\":\"1 Nope Street\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":10}" \
+  "${CUST_AUTH[@]}"
+assert "  refused by the gateway, not the Restaurant Service" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+
+expect "gateway RBAC: customer cannot join the fleet -> 403" 403 POST /api/v1/riders \
+  "{\"vehicle_type\":\"bike\",\"license_number\":\"NOPE-1\"}" "${CUST_AUTH[@]}"
+assert "  refused by the gateway, not the Rider Service" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+
+expect "gateway RBAC: rider cannot read a kitchen queue -> 403" 403 GET \
+  "/api/v1/orders/kitchen/$REST_ID" "" "${RIDER_AUTH[@]}"
+assert "  refused by the gateway, not the Order Service" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+
+expect "gateway RBAC: non-admin cannot list orders by status -> 403" 403 GET \
+  "/api/v1/orders?status=created" "" "${CUST_AUTH[@]}"
+assert "  refused by the gateway, not the Order Service" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+
+# Positive controls. Without these the section would pass just as well against a policy
+# table that denies everything, which is the failure mode a fail-closed design invites.
+expect "gateway RBAC: the owner may still publish a menu" 200 POST /api/v1/menus "$MENU" "${OWNER_AUTH[@]}"
+# The rider has not been onboarded yet (that happens in the saga sections below), so this
+# is a 404 from the Rider Service rather than a 200 -- which is the stronger control: it
+# proves the gateway let a rider:profile holder through and the *service* answered.
+expect "gateway RBAC: a rider reaches own profile route -> 404, not 403" 404 GET \
+  /api/v1/riders/me "" "${RIDER_AUTH[@]}"
+assert "  the gateway allowed it; the Rider Service answered" \
+  "$([[ "$(efield "['errors'][0]")" == "$GATEWAY_DENIAL" ]] && echo gateway || echo service)" "service"
+expect "gateway RBAC: the admin may still list orders by status" 200 GET \
+  "/api/v1/orders?status=created" "" "${ADMIN_AUTH[@]}"
+
+# A NULL permission_id row means "any authenticated caller" -- the route is gated by an
+# ownership check the gateway cannot make, because it needs the resource row. The refusal
+# must therefore come from the service, and this is the test that would catch someone
+# "tidying up" those NULLs into a permission and silently breaking ownership semantics.
+expect "gateway RBAC: reading another customer's order still -> 403" 403 GET \
+  "/api/v1/orders/$ORDER_ID" "" "${OTHER_AUTH[@]}"
+assert "  refused by the Order Service's ownership check, not the gateway" \
+  "$([[ "$(efield "['errors'][0]")" == "$GATEWAY_DENIAL" ]] && echo gateway || echo service)" "service"
+
+# Fail closed: a path under a gated prefix with no route_permissions row is refused rather
+# than passed through. Adding a route without its policy row is a visible 403, never a
+# silently open endpoint -- and this holds for system_admin too, since a missing row is an
+# unconfigured route, not a gate for the admin bypass to skip.
+expect "gateway RBAC: an unmapped path under a gated prefix -> 403" 403 GET \
+  "/api/v1/orders/$ORDER_ID/invented-endpoint" "" "${CUST_AUTH[@]}"
+assert "  fail-closed refusal came from the gateway" "$(efield "['errors'][0]")" "$GATEWAY_DENIAL"
+expect "gateway RBAC: fail-closed refuses system_admin as well -> 403" 403 GET \
+  "/api/v1/orders/$ORDER_ID/invented-endpoint" "" "${ADMIN_AUTH[@]}"
+
+# The policy lives in a table, so these assertions are about the table itself: the audit
+# query a reviewer would run, and the invariant that every permission named in service code
+# actually exists. Skipped against a remote BASE_URL with no local containers.
+if have_container sfo-user-db; then
+  POLICY_COUNTS=$(docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -tA -c \
+    "SELECT (SELECT count(*) FROM permissions)||'|'||
+            (SELECT count(*) FROM role_permissions)||'|'||
+            (SELECT count(*) FROM route_permissions WHERE permission_id IS NOT NULL)||'|'||
+            (SELECT count(*) FROM route_permissions WHERE permission_id IS NULL);" 2>/dev/null | tr -d '[:space:]')
+  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "10|19|15|8"
+
+  # system_admin must hold every permission, or the seed's CROSS JOIN has regressed and the
+  # table stops telling the whole story (db/user/init.sql section 1e).
+  ADMIN_GAP=$(docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -tA -c \
+    "SELECT count(*) FROM permissions p WHERE NOT EXISTS (
+       SELECT 1 FROM role_permissions rp JOIN roles r ON r.id = rp.role_id
+        WHERE rp.permission_id = p.id AND r.name = 'system_admin');" 2>/dev/null | tr -d '[:space:]')
+  assert "system_admin holds every permission" "$ADMIN_GAP" "0"
+
+  # Drift guard: every permission a handler demands must exist in the table. This is the
+  # one duplication D57 accepts -- the route_permissions row and the require_permission
+  # literal -- so it is the one that needs an assertion rather than a comment.
+  SERVICES_DIR="$(dirname "$0")/../services"
+  CODE_PERMS=$(grep -rho --include='*.py' 'require_permission("[^"]*")' "$SERVICES_DIR" \
+    | sed 's/require_permission("//;s/")//' | sort -u)
+  DB_PERMS=$(docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -tA -c \
+    "SELECT name FROM permissions ORDER BY name;" 2>/dev/null | tr -d '\r' | sort -u)
+  MISSING=$(comm -23 <(echo "$CODE_PERMS") <(echo "$DB_PERMS") | tr '\n' ' ' | sed 's/ *$//')
+  assert "every require_permission literal exists in the permissions table" "$MISSING" ""
+
+  # A permission added to a role reaches a token already in circulation, because the
+  # gateway resolves roles -> permissions per request instead of reading them off the token.
+  # A *role* grant still needs a re-login (D18) -- the asymmetry is the point, and the
+  # multi-role section above asserts the other half of it.
+  # `/api/v1/orders/smoke/probe` deliberately matches no pattern in the policy and no route
+  # in the Order Service. Unmapped means denied with no wait at all, since an absent row is
+  # a deny by default -- only the *grant* has to wait for the snapshot.
+  expect "gateway RBAC: an unseeded probe path is denied immediately -> 403" 403 GET \
+    /api/v1/orders/smoke/probe "" "${CUST_AUTH[@]}"
+
+  docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -q -c \
+    "INSERT INTO permissions (name, description) VALUES ('smoke:probe','Temporary, smoke test only') ON CONFLICT (name) DO NOTHING;
+     INSERT INTO route_permissions (method, path_pattern, permission_id, description)
+       SELECT 'GET', '/api/v1/orders/smoke/probe', id, 'Temporary, smoke test only' FROM permissions WHERE name='smoke:probe'
+       ON CONFLICT (method, path_pattern) DO NOTHING;
+     INSERT INTO role_permissions (role_id, permission_id)
+       SELECT r.id, p.id FROM roles r, permissions p
+        WHERE r.name='customer' AND p.name='smoke:probe' ON CONFLICT DO NOTHING;" >/dev/null 2>&1
+
+  # Wait out POLICY_CACHE_TTL_SECONDS (30s) plus a margin, then prove the same token --
+  # no re-login -- now gets past the gateway. A 404 from the Order Service is the pass: the
+  # gateway allowed it and the route genuinely does not exist there. This is the one place
+  # the suite pays for the snapshot, and it is exactly the cost D57 names, so --fast skips it.
+  if (( FAST )); then
+    printf '  %sSKIP%s  SQL grant reaching an already-issued token (needs a %ss TTL wait)\n' \
+      "$DIM" "$RESET" "35"
+  else
+    echo "  (waiting 35s for the gateway's policy snapshot to expire)"
+    sleep 35
+    expect "gateway RBAC: the SQL grant reaches a token already issued -> past the gateway" 404 GET \
+      /api/v1/orders/smoke/probe "" "${CUST_AUTH[@]}"
+  fi
+
+  docker exec sfo-user-db psql -U sfo_user_admin -d sfo_user_core -q -c \
+    "DELETE FROM route_permissions WHERE path_pattern='/api/v1/orders/smoke/probe';
+     DELETE FROM role_permissions WHERE permission_id IN (SELECT id FROM permissions WHERE name='smoke:probe');
+     DELETE FROM permissions WHERE name='smoke:probe';" >/dev/null 2>&1
+else
+  echo "  (skipped policy table assertions: sfo-user-db not reachable locally)"
+fi
+
 # ------------------------------------------------------- session lifecycle
 section "Session lifecycle"
 

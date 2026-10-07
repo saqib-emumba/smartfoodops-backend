@@ -9,15 +9,20 @@ carries facts / Temporal owns decisions, D47 services hold their own Temporal cl
 the gateway's `auth_request` chokepoint, D52 internal calls asserting identity headers
 instead of forwarding the bearer token, D53 the transactional outbox tables are removed in
 favour of a Temporal-activity publish, D55 payment/rider/compensation become child
-workflows of `OrderWorkflow`).
+workflows of `OrderWorkflow`, D57 RBAC moves into the database and is enforced at the
+gateway).
 
 Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
 Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
-`UserSvc`, rather than repeated on each application-service edge. A successful verify sets
-`X-User-Id`/`X-User-Roles`, which the gateway attaches to the forwarded request and which
-every `-->|verify ...|` edge between application services below now carries in place of a
-forwarded bearer token (D52) — login, register, refresh and every `/health` route are the
-exceptions, reachable with no token at all.
+`UserSvc`, rather than repeated on each application-service edge. That round trip decides
+two things, not one (D57): whether the token is valid, and whether the caller's roles carry
+the permission the requested route demands, read from `route_permissions`/`role_permissions`
+in `sfo_user_core`. So a `403` is as likely to come from that dotted edge as a `401`, and a
+wrong-role request never reaches the service it was aimed at. A successful verify sets
+`X-User-Id`/`X-User-Roles`/`X-User-Permissions`, which the gateway attaches to the forwarded
+request and which every `-->|verify ...|` edge between application services below now carries
+in place of a forwarded bearer token (D52) — login, register, refresh and every `/health`
+route are the exceptions, reachable with no token at all.
 
 Nodes are color-coded by subsystem (application services, the Temporal saga,
 Kafka/schema-registry eventing, the notification bridge, databases, observability) so a
@@ -27,7 +32,7 @@ line's color/region tells you what it belongs to even where paths cross.
 %%{init: {"flowchart": {"curve": "linear", "nodeSpacing": 35, "rankSpacing": 55, "htmlLabels": true}}}%%
 flowchart TB
     Client["Customer / Owner / Rider client"]
-    Gateway["Nginx API Gateway<br/>host 80"]
+    Gateway["Nginx API Gateway<br/>host 80<br/>authn + RBAC chokepoint (D51/D57)"]
 
     subgraph AppServices ["Application Services"]
         UserSvc["User Service<br/>8001"]
@@ -75,7 +80,7 @@ flowchart TB
 
     %% -- request entry --
     Client --> Gateway
-    Gateway -.->|auth_request verify, D51| UserSvc
+    Gateway -.->|auth_request verify + authorize, D51/D57| UserSvc
     Gateway --> UserSvc & RestaurantSvc & MenuSvc & OrderSvc & PaymentSvc & RiderSvc
     Gateway -->|health only| OrchestratorAPI
 

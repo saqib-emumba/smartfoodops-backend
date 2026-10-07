@@ -16,7 +16,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response, status
 
-from common.auth import CurrentUser, require_role
+from common.auth import CurrentUser, require_permission
 from common.errors import bad_request, not_found
 from common.responses import Envelope, REPLAY_RESPONSE, ok
 from payment import deps
@@ -35,7 +35,7 @@ async def process_payment(
     payload: PaymentCreateRequest,
     response: Response,
     x_idempotency_key: str | None = Header(None, alias="X-Idempotency-Key"),
-    current_user: CurrentUser = Depends(require_role("customer")),
+    current_user: CurrentUser = Depends(require_permission("payment:create")),
 ) -> Envelope[PaymentResponse]:
     """Authorise a payment for an order, at most once per idempotency key.
 
@@ -66,7 +66,7 @@ async def process_payment(
 @router.get("/{payment_id}", response_model=Envelope[PaymentResponse])
 def get_payment(
     payment_id: UUID,
-    current_user: CurrentUser = Depends(require_role("customer")),
+    current_user: CurrentUser = Depends(require_permission("payment:read")),
 ) -> Envelope[PaymentResponse]:
     """Expose a payment's state so a saga (or an operator) can see where it stopped.
 

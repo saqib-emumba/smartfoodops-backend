@@ -10,7 +10,7 @@ from uuid import UUID, uuid5
 
 from fastapi import APIRouter, Depends, Header, Response, status
 
-from common.auth import CurrentUser, get_current_user, require_internal, require_role, require_self_or_admin
+from common.auth import CurrentUser, get_current_user, require_internal, require_permission, require_self_or_admin
 from common.errors import not_found
 from common.responses import Envelope, REPLAY_RESPONSE, ok
 from common.temporal import ORDER_ID_NAMESPACE
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/api/v1/orders")
 @router.get(
     "",
     response_model=Envelope[list[OrderResponse]],
-    dependencies=[Depends(require_role("system_admin"))],
+    dependencies=[Depends(require_permission("order:read_any"))],
 )
 def list_orders_by_status(status: str) -> Envelope[list[OrderResponse]]:
     """Every order in one status, oldest first — admin-only.
@@ -49,7 +49,7 @@ async def create_order(
     payload: OrderCreateRequest,
     response: Response,
     x_idempotency_key: str = Header(..., alias="X-Idempotency-Key"),
-    current_user: CurrentUser = Depends(require_role("customer")),
+    current_user: CurrentUser = Depends(require_permission("order:create")),
 ) -> Envelope[OrderResponse]:
     """Place an order idempotently, via a Temporal Update-with-Start.
 

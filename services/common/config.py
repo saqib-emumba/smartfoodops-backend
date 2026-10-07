@@ -104,6 +104,13 @@ REDIS_TIMEOUT = 2.0
 # invalidation is lost (see services/menu/cache.py), so it is a backstop, not the plan.
 MENU_CACHE_TTL_SECONDS = 3600
 
+# How long the gateway's authorization policy snapshot may outlive the tables it was read
+# from (D57). Short, because this is the ceiling on how long a permission change takes to
+# take effect — but not zero: the snapshot is consulted on every gated request in the
+# platform, and querying sfo-user-db that often would put a database round trip in front of
+# every call. Thirty seconds buys one query per half-minute per process instead.
+POLICY_CACHE_TTL_SECONDS = 30
+
 # Bounds on each service's PostgreSQL connection pool.
 POOL_MIN_CONNECTIONS = 1
 POOL_MAX_CONNECTIONS = 10
