@@ -21,8 +21,8 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 289 of the 456
-# checks (counts as of D58) and leaves fourteen
+# It is a real reduction in coverage, not just in runtime. --fast asserts 379 of the 552
+# checks (counts as of Week 4's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
@@ -1384,6 +1384,242 @@ else
 fi
 fi  # --fast
 
+# ------------------------------------------------------ AI retrieval (Week 4)
+# The AI Service (D59-D62) keeps a vector index of the menus (an ingestion worker consuming
+# `menu.published`), answers hybrid semantic search, and assembles RAG context from three stores.
+# It sits after the saga block because the RAG history assertions want a *real* delivered order —
+# which only exists on a full run — but every other assertion here is runnable under --fast.
+section "AI retrieval (Week 4)"
+
+# `jeval '<python expr over b = envelope body>'` against the last response.
+jeval() { python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print($1)" <<<"$BODY" 2>/dev/null; }
+
+# Poll /ai/search until a python predicate over `m` (the matches list) holds. Ingestion is
+# asynchronous (Kafka), so "the dish is searchable" is reached eventually, not by the time the
+# publish returns.
+ai_poll() {
+  local body="$1" pred="$2" limit="${3:-20}" waited=0 got=""
+  while (( waited < limit )); do
+    got=$(curl -sS -m 10 -X POST "$BASE_URL/api/v1/ai/search" -H 'Content-Type: application/json' \
+          -d "$body" "${CUST_AUTH[@]}" 2>/dev/null \
+          | python3 -c "import json,sys; m=json.load(sys.stdin).get('body',{}).get('matches',[]); print($pred)" 2>/dev/null)
+    [[ "$got" == "True" ]] && { ok "  search reflects the change (${waited}s)"; return 0; }
+    sleep 1; waited=$((waited + 1))
+  done
+  bad "  search reflects the change" "predicate '$pred' still false after ${limit}s"
+  return 1
+}
+
+if have_container sfo-vector-db; then
+  VEC_EXT=$(docker exec sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core -tA -c \
+    "SELECT count(*) FROM pg_extension WHERE extname='vector';" 2>/dev/null | tr -d '[:space:]')
+  assert "pgvector extension is installed in sfo_vector_core" "$VEC_EXT" "1"
+  HNSW=$(docker exec sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core -tA -c \
+    "SELECT count(*) FROM pg_indexes WHERE indexdef ILIKE '%hnsw%vector_cosine_ops%';" 2>/dev/null | tr -d '[:space:]')
+  assert "  both document tables have an HNSW cosine index" "$HNSW" "2"
+else
+  printf '  %sSKIP%s  vector database checks (docker/sfo-vector-db not reachable)\n' "$DIM" "$RESET"
+fi
+
+expect "onboard a restaurant for the AI tests" 201 POST /api/v1/restaurants/onboard \
+  '{"name":"AI Test Kitchen","address":"7 Vector Lane","latitude":33.70,"longitude":73.00,"capacity":20}' \
+  "${OWNER_AUTH[@]}"
+AI_REST=$(jfield "['id']")
+
+AI_ITEMS='{"item_id":"karahi","name":"Zesty Chicken Karahi","description":"Spicy wok cooked chicken with tomatoes and green chillies","base_price":12.50,"is_available":true,"dietary_tags":["Halal","pakistani","spicy","halal"]},
+{"item_id":"salad","name":"Garden Quinoa Salad","description":"Light crisp salad with quinoa, cucumber and lemon","base_price":8.00,"is_available":true,"dietary_tags":["vegan","light-meal"]},
+{"item_id":"lassi","name":"Sweet Mango Lassi","description":"Cold sweet yogurt drink","base_price":4.00,"is_available":true,"dietary_tags":["pakistani"]},
+{"item_id":"biryani","name":"Sold Out Biryani","description":"Fragrant spiced rice","base_price":9.00,"is_available":false,"dietary_tags":["halal","biryani"]}'
+AI_STEAK='{"item_id":"wagyu","name":"Wagyu Steak","description":"Grilled wagyu beef steak","base_price":40.00,"is_available":true,"dietary_tags":["steak"]}'
+ai_menu() { printf '{"restaurant_id":"%s","categories":[{"category_id":"c1","category_name":"Menu","display_order":1,"items":[%s]}]}' "$AI_REST" "$1"; }
+
+# Owner-declared tags are normalized on publish (lower-cased, de-duplicated, first-seen order) and
+# checked against a fixed vocabulary, because a search filter on a tag no menu can carry would just
+# silently return nothing.
+expect "publish a menu with dietary tags" 200 POST /api/v1/menus "$(ai_menu "$AI_ITEMS,$AI_STEAK")" "${OWNER_AUTH[@]}"
+assert "  tags are normalized (case, duplicates)" \
+  "$(jfield "['categories'][0]['items'][0]['dietary_tags']")" "['halal', 'pakistani', 'spicy']"
+expect "an unknown dietary tag is refused -> 422" 422 POST /api/v1/menus \
+  "$(ai_menu '{"item_id":"x","name":"X","description":"x","base_price":5,"is_available":true,"dietary_tags":["street food"]}')" \
+  "${OWNER_AUTH[@]}"
+
+# --- search -------------------------------------------------------------------------------
+ai_poll "{\"query\":\"spicy chicken curry\",\"restaurant_id\":\"$AI_REST\"}" \
+  "'Zesty Chicken Karahi' in [x['item_name'] for x in m]" 30
+
+expect "search finds the dish by meaning" 200 POST /api/v1/ai/search \
+  "{\"query\":\"a spicy chicken dish\",\"restaurant_id\":\"$AI_REST\",\"top_k\":3}" "${CUST_AUTH[@]}"
+assert "  the closest match is the karahi" "$(jeval "b['matches'][0]['item_name']")" "Zesty Chicken Karahi"
+assert "  the scoped restaurant is returned too" \
+  "$(jeval "'$AI_REST' in [r['restaurant_id'] for r in b['restaurants']]")" "True"
+assert "  the message counts the matches" "$(efield "['message']")" "Retrieved 3 matching items"
+
+expect "max_price is a hard constraint" 200 POST /api/v1/ai/search \
+  "{\"query\":\"something to eat\",\"restaurant_id\":\"$AI_REST\",\"max_price\":15,\"top_k\":10}" "${CUST_AUTH[@]}"
+assert "  nothing above the price is returned" "$(jeval "all(m['price'] <= 15 for m in b['matches'])")" "True"
+assert "  and the expensive dish is among the exclusions" \
+  "$(jeval "'Wagyu Steak' not in [m['item_name'] for m in b['matches']]")" "True"
+
+expect "a dietary filter keeps only matching dishes" 200 POST /api/v1/ai/search \
+  "{\"query\":\"something to eat\",\"restaurant_id\":\"$AI_REST\",\"dietary_filters\":[\"vegan\"],\"top_k\":10}" "${CUST_AUTH[@]}"
+assert "  only the vegan dish remains" "$(jeval "[m['item_name'] for m in b['matches']]")" "['Garden Quinoa Salad']"
+
+expect "an unavailable dish is never returned" 200 POST /api/v1/ai/search \
+  "{\"query\":\"fragrant spiced biryani rice\",\"restaurant_id\":\"$AI_REST\",\"top_k\":10}" "${CUST_AUTH[@]}"
+assert "  the sold-out biryani is absent" \
+  "$(jeval "'Sold Out Biryani' not in [m['item_name'] for m in b['matches']]")" "True"
+
+expect "top_k bounds the result" 200 POST /api/v1/ai/search \
+  "{\"query\":\"food\",\"restaurant_id\":\"$AI_REST\",\"top_k\":2}" "${CUST_AUTH[@]}"
+assert "  at most two matches" "$(jeval "len(b['matches']) <= 2")" "True"
+
+expect "filters that match nothing are a 200, not a 404" 200 POST /api/v1/ai/search \
+  "{\"query\":\"anything\",\"restaurant_id\":\"$AI_REST\",\"max_price\":0.5}" "${CUST_AUTH[@]}"
+assert "  with empty lists" "$(jeval "b['matches'] == [] and b['restaurants'] == []")" "True"
+
+expect "an unknown filter tag -> 422" 422 POST /api/v1/ai/search \
+  '{"query":"pizza","dietary_filters":["street food"]}' "${CUST_AUTH[@]}"
+expect "a blank query -> 422" 422 POST /api/v1/ai/search '{"query":"   "}' "${CUST_AUTH[@]}"
+expect "top_k of 0 -> 422" 422 POST /api/v1/ai/search '{"query":"pizza","top_k":0}' "${CUST_AUTH[@]}"
+
+# --- access control (D57) -------------------------------------------------------------------
+expect "search without a token -> 401" 401 POST /api/v1/ai/search '{"query":"pizza"}'
+expect "a rider cannot search -> 403" 403 POST /api/v1/ai/search '{"query":"pizza"}' "${RIDER_AUTH[@]}"
+expect "a restaurant admin cannot search -> 403" 403 POST /api/v1/ai/search '{"query":"pizza"}' "${OWNER_AUTH[@]}"
+expect "RAG context without a token -> 401" 401 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch\"}"
+expect "a rider cannot ask for RAG context -> 403" 403 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch\"}" "${RIDER_AUTH[@]}"
+
+# --- ingestion follows the menu ---------------------------------------------------------------
+expect "republish the menu without the steak" 200 POST /api/v1/menus "$(ai_menu "$AI_ITEMS")" "${OWNER_AUTH[@]}"
+ai_poll "{\"query\":\"grilled wagyu beef steak\",\"restaurant_id\":\"$AI_REST\",\"top_k\":10}" \
+  "'Wagyu Steak' not in [x['item_name'] for x in m]" 30
+
+if have_container sfo-ai-ingestion-worker; then
+  # Every menu is already current, so a full backfill has nothing to do: all skipped, none
+  # re-embedded. That is the idempotency the processed_events + source_version checks exist for.
+  BACKFILL=$(docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill 2>/dev/null | tail -1)
+  assert "a backfill over current menus re-embeds nothing" \
+    "$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('ingested',0)==0 and d.get('failed',0)==0)" "$BACKFILL" 2>/dev/null)" "True"
+else
+  printf '  %sSKIP%s  ingestion backfill (docker/sfo-ai-ingestion-worker not reachable)\n' "$DIM" "$RESET"
+fi
+
+if have_container sfo-kafka; then
+  # A schema-invalid menu.published is dead-lettered with its reason rather than retried forever
+  # or silently dropped. A unique event id lets this find *its* record among older DLQ entries.
+  DLQ_ID=$(python3 -c "import uuid; print(uuid.uuid4())")
+  printf '%s|{"event_id":"%s","event_type":"menu.published","event_version":1,"aggregate_type":"menu","aggregate_id":"%s","occurred_at":"2026-01-01T00:00:00+00:00","producer":"smoke","data":{"restaurant_id":"%s"}}\n' \
+    "$AI_REST" "$DLQ_ID" "$AI_REST" "$AI_REST" \
+    | docker exec -i sfo-kafka kafka-console-producer --bootstrap-server kafka:29092 --topic sfo.menu.events.v1 \
+        --property parse.key=true --property key.separator='|' >/dev/null 2>&1
+  DLQ_HIT=""
+  for _ in $(seq 1 5); do
+    DLQ_HIT=$(docker exec sfo-kafka kafka-console-consumer --bootstrap-server kafka:29092 \
+      --topic sfo.menu.events.v1.dlq --from-beginning --timeout-ms 5000 --property print.headers=true 2>/dev/null \
+      | grep "$DLQ_ID" | grep -c "schema validation failed")
+    [[ "$DLQ_HIT" -ge 1 ]] && break
+  done
+  assert "an invalid menu.published is dead-lettered with its reason" "$([[ "$DLQ_HIT" -ge 1 ]] && echo yes)" "yes"
+fi
+
+# --- RAG context ------------------------------------------------------------------------------
+expect "RAG context for the caller's own account" 200 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"Suggest lunch options available near me\",\"latitude\":33.68,\"longitude\":73.04,\"top_k\":4}" \
+  "${CUST_AUTH[@]}"
+assert "  every source answered" "$(jeval "b['sources_failed']")" "[]"
+assert "  restaurants carry a distance from the caller" \
+  "$(jeval "all(r['distance_km'] is not None for r in b['restaurants'])")" "True"
+assert "  and are listed nearest first" \
+  "$(jeval "[r['distance_km'] for r in b['restaurants']] == sorted(r['distance_km'] for r in b['restaurants'])")" "True"
+assert "  courier availability was looked up" "$(jeval "len(b['courier_availability']) > 0")" "True"
+
+expect "asking for another customer's context -> 403" 403 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$OTHER_ID\",\"prompt_query\":\"lunch\"}" "${CUST_AUTH[@]}"
+expect "an admin may ask for any customer's context" 200 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$OTHER_ID\",\"prompt_query\":\"lunch\"}" "${ADMIN_AUTH[@]}"
+expect "a latitude without a longitude -> 422" 422 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch\",\"latitude\":33.7}" "${CUST_AUTH[@]}"
+
+expect "a customer with no orders gets an empty history, not an error" 200 POST /api/v1/ai/rag-context \
+  "{\"customer_id\":\"$OTHER_ID\",\"prompt_query\":\"something spicy\"}" "${OTHER_AUTH[@]}"
+assert "  zero orders" "$(jeval "b['customer_profile']['total_orders']")" "0"
+assert "  and no favourite vendors" "$(jeval "b['customer_profile']['favourite_vendors']")" "[]"
+
+if (( ! FAST )); then
+  # The saga above delivered ORDER_ID for CUST at REST_ID, and the analytics consumer projects
+  # that off Kafka a moment later — so the history appears eventually, not instantly.
+  RAG_BODY="{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"a burger\",\"top_k\":3}"
+  RAG_HIST=0
+  for _ in $(seq 1 20); do
+    HIST=$(curl -sS -m 15 -X POST "$BASE_URL/api/v1/ai/rag-context" -H 'Content-Type: application/json' \
+           -d "$RAG_BODY" "${CUST_AUTH[@]}" 2>/dev/null \
+           | python3 -c "import json,sys; print(json.load(sys.stdin)['body']['customer_profile']['delivered_orders'])" 2>/dev/null)
+    [[ -n "$HIST" && "$HIST" -ge 1 ]] && { RAG_HIST=$HIST; break; }
+    sleep 1
+  done
+  assert "the delivered order reaches the RAG customer profile" "$([[ "$RAG_HIST" -ge 1 ]] && echo yes)" "yes"
+  expect "RAG context for a customer with history" 200 POST /api/v1/ai/rag-context "$RAG_BODY" "${CUST_AUTH[@]}"
+  assert "  their favourite vendor is the restaurant they ordered from" \
+    "$(jeval "b['customer_profile']['favourite_vendors'][0]['restaurant_id']")" "$REST_ID"
+  assert "  resolved to its name" "$(jeval "b['customer_profile']['favourite_vendors'][0]['name']")" "Smoke Diner"
+  assert "  and riders are available around a candidate restaurant" \
+    "$(jeval "any(c['available_riders'] >= 1 for c in b['courier_availability'])")" "True"
+fi
+
+# --- graceful degradation ----------------------------------------------------------------------
+# A source that is down is reported in `sources_failed`; the rest of the context is still served.
+# Silence would be worse than an error: the model would read "no riders listed" as "no riders".
+if have_container sfo-analytics-service; then
+  docker stop sfo-analytics-service >/dev/null 2>&1
+  ok "took analytics-service off the road"
+  expect "RAG context with analytics down is still a 200" 200 POST /api/v1/ai/rag-context \
+    "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch\",\"top_k\":3}" "${CUST_AUTH[@]}"
+  assert "  the failed source is named" "$(jeval "b['sources_failed']")" "['analytics']"
+  assert "  history is absent rather than invented" "$(jeval "b['customer_profile'] is None")" "True"
+  assert "  dishes are still served" "$(jeval "len(b['items']) > 0")" "True"
+  docker start sfo-analytics-service >/dev/null 2>&1
+  for _ in $(seq 1 30); do
+    [[ "$(docker exec sfo-analytics-service python -c "import urllib.request; print(urllib.request.urlopen('http://localhost:8008/api/v1/analytics/health').status)" 2>/dev/null)" == "200" ]] && break
+    sleep 2
+  done
+  ok "returned analytics-service to the road"
+else
+  printf '  %sSKIP%s  analytics degradation (docker/sfo-analytics-service not reachable)\n' "$DIM" "$RESET"
+fi
+
+if have_container sfo-rider-service; then
+  docker stop sfo-rider-service >/dev/null 2>&1
+  ok "took rider-service off the road"
+  expect "RAG context with the rider service down is still a 200" 200 POST /api/v1/ai/rag-context \
+    "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch\",\"top_k\":3}" "${CUST_AUTH[@]}"
+  assert "  the failed source is named" "$(jeval "b['sources_failed']")" "['courier']"
+  assert "  with no courier data claimed" "$(jeval "b['courier_availability']")" "[]"
+  assert "  and the order history intact" "$(jeval "b['customer_profile'] is not None")" "True"
+  docker start sfo-rider-service >/dev/null 2>&1
+  for _ in $(seq 1 30); do
+    [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/riders/health")" == "200" ]] && break
+    sleep 2
+  done
+  ok "returned rider-service to the road"
+else
+  printf '  %sSKIP%s  courier degradation (docker/sfo-rider-service not reachable)\n' "$DIM" "$RESET"
+fi
+
+# The services stopped above read as `down` in Prometheus until its next 10s scrape. Wait for that
+# to clear, or the scrape-target assertion in the Observability section would fail on a stale
+# reading rather than on anything wrong. (`prom_value` is defined further down, so this asks
+# Prometheus directly.)
+if curl -sf -m 3 http://localhost:9090/-/healthy >/dev/null 2>&1; then
+  for _ in $(seq 1 20); do
+    PROM_DOWN=$(curl -s -m 5 --data-urlencode 'query=count(up == 0)' http://localhost:9090/api/v1/query 2>/dev/null \
+      | python3 -c "import json,sys; r=json.load(sys.stdin)['data']['result']; print(r[0]['value'][1] if r else 0)" 2>/dev/null)
+    [[ "$PROM_DOWN" == "0" ]] && break
+    sleep 3
+  done
+fi
+
 # ---------------------------------------------- cross-service integration
 section "Cross-service integration"
 
@@ -1520,6 +1756,18 @@ print(sum(1 for x in t if x.get('health') == 'up'), len(t))
     bad "  route-template cardinality stays bounded" \
       "got '$ROUTE_CARD' distinct routes, expected < 60 — request.url.path may have leaked into a label"
   fi
+
+  # Week 4 (D59): the AI Service's own metrics, fed by the searches and RAG calls above. Prometheus
+  # scrapes every 10s, so allow a couple of scrape intervals for the counters to arrive.
+  for metric in sfo_ai_search_requests_total sfo_ai_rag_requests_total sfo_ai_documents_indexed; do
+    AI_METRIC=""
+    for _ in $(seq 1 6); do
+      AI_METRIC=$(prom_value "sum($metric)"); AI_METRIC=${AI_METRIC%%.*}
+      [[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && break
+      sleep 5
+    done
+    assert "  $metric is reaching Prometheus" "$([[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && echo yes)" "yes"
+  done
 else
   printf '  %sSKIP%s  Prometheus checks (localhost:9090 not reachable)\n' "$DIM" "$RESET"
 fi

@@ -74,6 +74,10 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D56](#d56--a-refund-that-permanently-fails-becomes-compensation_failed-not-a-silently-failed-workflow) | A refund that permanently fails becomes `'compensation_failed'`, not a silently-failed workflow | 2026-10-02 | Accepted |
 | [D57](#d57--rbac-moves-into-the-database-and-is-enforced-at-the-gateway) | RBAC moves into the database and is enforced at the gateway | 2026-10-06 | Accepted |
 | [D58](#d58--checkout-starts-orderworkflow-and-waits-for-its-result-post-payment-work-moves-to-fulfillmentworkflow) | Checkout starts `OrderWorkflow` and waits for its result; post-payment work moves to `FulfillmentWorkflow` | 2026-10-07 | Accepted |
+| [D59](#d59--the-ai-service-holds-its-own-pgvector-database-and-embeds-locally) | The AI Service holds its own pgvector database and embeds locally | 2026-10-08 | Accepted |
+| [D60](#d60--menu-items-carry-owner-declared-tags-from-a-fixed-vocabulary) | Menu items carry owner-declared tags from a fixed vocabulary | 2026-10-08 | Accepted |
+| [D61](#d61--a-menu-publish-is-announced-on-kafka-and-the-ai-service-re-reads) | A menu publish is announced on Kafka and the AI Service re-reads | 2026-10-08 | Accepted |
+| [D62](#d62--rag-context-is-assembled-from-three-stores-and-degrades-instead-of-failing) | RAG context is assembled from three stores and degrades instead of failing | 2026-10-08 | Accepted |
 
 ---
 
@@ -2172,6 +2176,182 @@ and is the reason the read path costs more now than it argued for.
   `drop_*_column.sql` once row counts are verified.
 
 ---
+
+## Part B — semantic retrieval (the AI layer)
+
+Weeks 4 and 5 of the GenAI track ([requirements](docs/smartfoodops-week4-5-requirements.md)). The
+phased build is in [week4-ai-retrieval-plan.md](week4-ai-retrieval-plan.md); these entries record
+the decisions behind it.
+
+### D59 — The AI Service holds its own pgvector database and embeds locally
+
+**Decided:** a ninth service, `ai-service` (port 8009), owns `sfo_vector_core` — a PostgreSQL 15
+database running the **pgvector** extension (`pgvector/pgvector:pg15`; the plain `postgres:15-alpine`
+every other database uses has no pgvector). Two document tables, `menu_item_documents` and
+`restaurant_documents`, store a natural-language chunk, its `vector(384)` embedding and the structured
+metadata a search filters on, each with an **HNSW** `vector_cosine_ops` index. A second container from
+the same image, `ai-ingestion-worker`, keeps them current (D61).
+
+Embeddings come from **`all-MiniLM-L6-v2`** (384-dim) running **in the container** on onnxruntime via
+`fastembed`, with the model baked into the image at build time. It sits behind a small `Embedder`
+interface, so `EMBEDDING_PROVIDER=openai` swaps in OpenAI's `text-embedding-3-small`, asked for 384
+dimensions so the same columns serve both. Everything that embeds goes through one instance, so a
+document and the query meant to match it can never be embedded by different models.
+
+`POST /api/v1/ai/search` embeds the query and runs **one SQL statement** per result kind: a cosine
+ordering beside ordinary WHERE clauses (available, `max_price`, tag containment, active restaurant),
+so `top_k` applies to rows that already pass the filters. pgvector 0.8's **iterative scan**
+(`hnsw.iterative_scan = relaxed_order`, `SET LOCAL`) keeps a selective filter from leaving the result
+short of `top_k`. It is gated by an `ai:search` permission granted to `customer` (D57).
+
+**Instead of:** vectors inside `sfo_menu_core` — it would put an index build on the menu's write path
+and break database-per-service (D01); Qdrant or Chroma — one more engine to run when Postgres already
+is one; OpenAI's 1536-dim model as the default — it needs a key, costs per call and sends every menu to
+a third party; `sentence-transformers`, which is the same model but pulls PyTorch (~1.5GB+ image
+against ~758MB).
+
+**Why:** retrieval is *derived* state — rebuildable from the menus — so it earns its own database that
+can be dropped and re-ingested without touching anything an owner or customer depends on, in the same
+spirit as the Analytics database (D44). A local model means the stack still runs with no key and no
+network, which is what the smoke tests assume. The `pgvector` Python package is used, with its type
+registered once per process (`register_vector(..., globally=True)`) rather than on every pooled
+connection, so the shared pool in `common` needed no change.
+
+**Costs:**
+
+- **The model is part of the image.** Changing it is a rebuild, and `vector(384)` ties the schema to
+  it: a model of another width is a schema change plus a full re-embed (truncate and
+  `--backfill`), never a config flip.
+- **Search always returns its nearest rows, however weak.** An off-topic query still gets low-scoring
+  matches (0.2–0.5 in testing). There is no minimum-similarity threshold; Week 5 will need one before
+  an assistant can honestly say "nothing matches".
+- **The restaurant document is only as fresh as its last menu publish.** A rename or deactivation
+  reaches the index on the next publish or a backfill that finds a changed menu — there is no
+  restaurant change event.
+- **A third deployable thing that must stay in step.** The ingestion worker is a second process to run,
+  monitor and restart; `sfo_ai_ingestion_last_event_timestamp_seconds` exists for the day it wedges.
+- **Both processes must register the type.** The API and the worker each call
+  `register_vector_types()` at startup; a future third process touching embeddings would need to as well.
+
+### D60 — Menu items carry owner-declared tags from a fixed vocabulary
+
+**Decided:** `menu_items.dietary_tags TEXT[]`, declared by the owner on `POST /api/v1/menus` from a
+fixed vocabulary in `common/dietary.py` — 40 tags in seven groups: diets (vegan, keto, …), religious
+(halal, kosher), allergen-free (gluten-free, nut-free, …), cuisine (pakistani, italian, …), format
+(fast-food, bbq), dish type (steak, burger, pizza, …) and meal style (light-meal, comfort-meal, hot,
+warm, spicy). They are lower-cased, de-duplicated and validated on publish — an unknown tag is a
+`422`, and so is one in a search filter. Nothing is inferred.
+
+The field keeps the spec's name, `dietary_tags`, although it now holds more than diets. A filter
+requires **every** tag listed (array containment).
+
+**Instead of:** inferring tags from a dish's name or description ("spicy" from "jalapeño") — a guessed
+tag is exactly the kind of fact a zero-hallucination assistant must not serve as fact; and, as
+recommended and then declined, separate fields for cuisine (on the restaurant) and meal style (on the
+item), which would have kept the restriction and allergen filters strictly apart from taste.
+
+**Why:** a filter is only useful if "keto" means the same string to the owner who writes it and the
+customer who searches it, and an exact, closed vocabulary is what makes that true. The spec's
+metadata contract names `dietary_tags`, so one list is also the least surprising shape.
+
+**Costs:**
+
+- **Safety filters share a namespace with taste.** `nut-free` and `comfort-meal` are filtered the same
+  way, so a UI built on this has to know which tags are claims a customer may rely on. Allergen and
+  religious tags are the restaurant's word, not a guarantee, and should be shown as such.
+- **`hot` is ambiguous** (served hot, or spicy-hot?) beside `spicy`. Renaming it later orphans every
+  item already tagged, so the vocabulary should be extended, not edited.
+- **AND semantics surprise.** Asking for two cuisines at once matches only an item tagged with both;
+  clients should send one cuisine per search.
+- **The vocabulary lives in code**, shared by the Menu and AI services, so adding a tag is a deploy of
+  both — in exchange, neither can ever disagree about what a tag means.
+- **It depends on owners doing the tagging.** Untagged items simply never match a tag filter.
+
+### D61 — A menu publish is announced on Kafka and the AI Service re-reads
+
+**Decided:** after a menu publish commits (and the Redis cache entry is dropped), the Menu Service
+publishes `menu.published` — `{restaurant_id, published_at, items_count}` — to a new topic
+`sfo.menu.events.v1` (+ `.dlq`), keyed by `restaurant_id` so one restaurant's events stay ordered. The
+event is a **hint to re-read, not the data**: the ingestion worker fetches the menu from
+`GET /menus/{id}/internal` (Postgres directly, never the cache, with `menus.updated_at` as its version
+stamp) and the restaurant from `GET /restaurants/{id}/internal`, then replaces that restaurant's
+documents and records the event as processed **in one transaction**. Re-embedding is skipped when the
+stored version and model already match.
+
+Publishing is **best-effort**: a Kafka failure is logged and never fails the owner's publish. The
+worker also runs a **backfill** at startup (`python -m ai.ingestion --backfill`), walking
+`GET /menus/internal/restaurant-ids`, so a lost event or a menu published before this existed is a
+delay, not a hole. A transient failure retries with backoff (5 attempts) *inside* the handler and then
+dead-letters; a schema-invalid event goes straight to the DLQ.
+
+`KafkaGateway.publish` gained an optional `event_key`. The default event id is
+`(aggregate_id, event_type)`, which assumes an event fires once per aggregate — true of an order's
+statuses, false of a menu its owner republishes; left alone, every publish after the first would carry
+the same id and be dropped as a duplicate. The menu passes its `updated_at`, which differs per publish
+and is identical across a retry of the same one.
+
+**Instead of:** polling `menus.updated_at` — simpler, but ingestion would lag by the interval and it is
+polling where the platform already has an event bus (D38); putting the whole menu in the event —
+it would have to be versioned and could be large.
+
+**Why:** Kafka already carries facts here (D38), and a thin event means a consumer that was down for ten
+publishes reads the latest state once instead of replaying ten.
+
+**Costs:**
+
+- **The Menu Service gains a Kafka producer dependency** — and a topic that must exist (auto-create is
+  off), hence the `kafka-init` change. It never blocks a publish, but it is one more thing to run.
+- **Best-effort means a lost event delays freshness** until the next publish or a backfill. It does not
+  lose data.
+- **Retrying inside the handler is deliberate**, because the consumer loop commits offsets: letting an
+  exception propagate would commit past the unhandled message and lose it. (The analytics consumer
+  has the same weakness on a database failure; it was left unchanged.)
+- **Internal routes widen the Menu and Restaurant services' surface**, kept safe by being internal-key
+  only with no `route_permissions` row, so the gateway refuses them (D57) even to an admin's bearer.
+
+### D62 — RAG context is assembled from three stores and degrades instead of failing
+
+**Decided:** `POST /api/v1/ai/rag-context` returns, for one customer's prompt: the nearest dishes and
+restaurants (the D59 search), the customer's order history from the Analytics Service's projection
+(D44), and available-rider counts around each candidate restaurant from the Rider Service's Redis geo
+index (D49). Vector and analytics run concurrently, each under its own time budget; courier lookups
+depend on the vector result (they need coordinates), so they run after, one per restaurant, in
+parallel and capped at five.
+
+**A source that errors or runs out of time is named in `sources_failed` and contributes nothing — the
+call still returns `200` with the rest.** If the vector source fails there is nothing to anchor courier
+lookups on, so `courier` is reported failed too rather than left as an empty list.
+
+The Analytics and Rider services gained internal-key routes for this (`GET
+/analytics/internal/customers/{id}/summary`, `POST /riders/internal/nearby`). The rider route returns
+**counts and a distance only** — never a rider id or position — because the answer ends up in an LLM
+prompt. `customer_id` must be the caller's own (`require_self_or_admin`) unless the caller is an admin,
+since the response carries that customer's order history. The permission is `ai:rag_context`, granted to
+`customer`.
+
+The request **extends the spec's body** with optional `latitude`/`longitude` (both or neither): a
+`customer_id` alone has nothing to measure "near me" from. With a location, restaurants are sorted
+nearest-first *among the semantic top-K* — relevance chooses the candidates, proximity only orders them.
+
+**Instead of:** failing the whole call when any source is down — an assistant that errors whenever
+analytics is restarting is worse than one that says "I couldn't read your order history"; and returning
+an empty list for a missing source — it would read to a model as "no riders", a claim the response cannot
+make.
+
+**Why:** this response is the supply side of the Week 5 zero-hallucination contract: a dish, price or
+restaurant a model can cite is one that appears here. Making a missing source *visible* is what lets the
+generation step be honest about it.
+
+**Costs:**
+
+- **History is restaurants only.** Order projections hold no line items (`order.created` carries none),
+  so "your favourite dish" is not derivable and is deliberately not claimed.
+- **Analytics now holds the internal key and the JWT public key**, because importing `common.auth` for
+  `require_internal` requires both — the one service that previously held neither.
+- **Courier availability is a count, not a promise.** It says riders are free near a kitchen now, not
+  that one will take the order.
+- **Time budgets are guesses** (`config.RAG_*_TIMEOUT_SECONDS`) and will want tuning against real
+  latency; a source that misses its budget is reported, not retried.
 
 ## Open questions
 

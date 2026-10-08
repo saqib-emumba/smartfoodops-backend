@@ -9,14 +9,20 @@ threadpool is where both belong — an `async def` doing either would stall the 
 every other request.
 """
 
+import time
+
 from fastapi import APIRouter, Depends
+from opentelemetry import trace
 
 from common.auth import CurrentUser, require_permission
 from common.responses import Envelope, ok
 from ai import deps
+from ai.embeddings import embed_timed
+from ai.metrics import SEARCH_LATENCY_SECONDS, SEARCH_REQUESTS_TOTAL
 from ai.schemas.search import ItemMatch, RestaurantMatch, SearchRequest, SearchResponse
 
 router = APIRouter(prefix="/api/v1/ai")
+_tracer = trace.get_tracer("ai.search")
 
 
 @router.post("/search", response_model=Envelope[SearchResponse])
@@ -33,14 +39,25 @@ def search(
     An empty result is a `200` with empty lists, not a `404`: "nothing matches those filters" is
     an answer the caller can act on (relax the price), not a missing resource.
     """
-    vector = deps.embedder.embed([payload.query])[0]
-    items, restaurants = deps.vectors.search(
-        vector,
-        top_k=payload.top_k,
-        max_price=payload.max_price,
-        tags=payload.dietary_filters,
-        restaurant_id=payload.restaurant_id,
-    )
+    started = time.perf_counter()
+    try:
+        vector = embed_timed(deps.embedder, [payload.query])[0]
+        with _tracer.start_as_current_span("ai.vector_search") as span:
+            span.set_attribute("ai.search.top_k", payload.top_k)
+            span.set_attribute("ai.search.tag_filters", len(payload.dietary_filters))
+            items, restaurants = deps.vectors.search(
+                vector,
+                top_k=payload.top_k,
+                max_price=payload.max_price,
+                tags=payload.dietary_filters,
+                restaurant_id=payload.restaurant_id,
+            )
+    except Exception:
+        SEARCH_REQUESTS_TOTAL.labels(outcome="error").inc()
+        raise
+    finally:
+        SEARCH_LATENCY_SECONDS.observe(time.perf_counter() - started)
+    SEARCH_REQUESTS_TOTAL.labels(outcome="ok" if items else "empty").inc()
     body = SearchResponse(
         matches=[ItemMatch.from_row(row) for row in items],
         restaurants=[RestaurantMatch(**RestaurantMatch.row_fields(row)) for row in restaurants],

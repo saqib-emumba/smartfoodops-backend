@@ -1,10 +1,11 @@
 # SmartFoodOps — Postman Collection
 
-`smartfoodops.postman_collection.json` is every route the Nginx gateway exposes across all 7
-services (user, restaurant, menu, order, payment, rider, orchestrator), built from the same
-contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 130 requests across 9 folders,
+`smartfoodops.postman_collection.json` is every route the Nginx gateway exposes across all 8
+services (user, restaurant, menu, order, payment, rider, orchestrator, ai), built from the same
+contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 156 requests across 11 folders,
 covering the happy path, authorisation boundaries, validation edge cases, and the Temporal-driven
-order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery).
+order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery), and the Week 4 AI
+layer (dietary-tagged menus, semantic search, RAG context).
 
 The JSON is hand-maintained directly — there is no generator script in this repo despite what an
 earlier version of this doc said. When you add or change a request, check it for duplicate names
@@ -28,7 +29,7 @@ json.load(open('smartfoodops.postman_collection.json'))"`).
 
 ## Running it
 
-**Run order matters.** Folders are numbered 1–9 because later ones read collection variables
+**Run order matters.** Folders are numbered 1–10 because later ones read collection variables
 (bearer tokens, ids) that earlier ones set via `pm.collectionVariables.set(...)` in their Tests
 scripts — the same reason `scripts/smoke-test.sh` is one long script rather than independent
 pieces. Use the **Collection Runner** (Postman's GUI test runner, not the `Send` button) and run
@@ -53,6 +54,13 @@ loop doesn't hammer the gateway every few milliseconds.
 Individual folders can be re-run later in the same Postman session (e.g. iterating on the Payment
 Service folder) as long as folder 2 has already populated tokens this session — reopening Postman
 resets collection variables, so start from folder 1 again after a restart.
+
+**Folder 10 (AI Retrieval) needs folders 2–4 first** (an owner token and a published restaurant) and
+is best run after 6–8, because a *delivered* order is what gives the customer order history in the
+RAG context. Its first search waits ~2.5s in a pre-request script: the menu published just before
+is indexed asynchronously by the ingestion worker, via Kafka. The cases that need a container
+stopped (a degraded analytics or rider source) or Kafka inspected (the dead-letter queue) are in
+`scripts/smoke-test.sh` only — Postman cannot stop a container.
 
 ## Testing just the happy path
 

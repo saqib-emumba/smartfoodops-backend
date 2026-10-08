@@ -4,7 +4,7 @@ Implements §2 ("Week 4 Requirements: Data Preparation & Retrieval Layer") of
 [smartfoodops-week4-5-requirements.md](docs/smartfoodops-week4-5-requirements.md): a vector
 store, an ingestion pipeline, hybrid semantic search, and a multi-source RAG context assembler.
 
-**Status:** Phases 1 to 5 are implemented and verified. Phase 6 is planned.
+**Status:** All six phases are implemented and verified.
 
 Decision numbers D59 to D62 are cited in code comments already; the entries themselves are
 written in Phase 6 under a new `## Week 4 — semantic retrieval (AI layer)` section of
@@ -53,7 +53,7 @@ Cross-cutting rules that apply to every phase:
 | 3 | Ingestion pipeline | Done |
 | 4 | `POST /api/v1/ai/search` | Done |
 | 5 | `POST /api/v1/ai/rag-context` | Done |
-| 6 | Telemetry, tests, documentation | Planned |
+| 6 | Telemetry, tests, documentation | Done |
 
 After each phase, stop and review before starting the next.
 
@@ -236,19 +236,36 @@ Limits worth knowing: favourite *dishes* are not derivable (the projection has n
 the analytics history here was seeded directly into the projection for the test, since the earlier
 smoke customers' accounts no longer exist. Phase 6's smoke section will drive a real delivered order.
 
-### Phase 6 — Telemetry, tests, documentation (planned)
+### Phase 6 — Telemetry, tests, documentation (done)
 
-- **Metrics** (`sfo_ai_*`): search requests and latency, embedding latency, ingestion events and
-  documents indexed, RAG source failures. Spans for embed, vector query and each RAG source. A
-  small Grafana "AI retrieval" dashboard.
-- **Smoke test:** an "AI retrieval (Week 4)" section: health and index checks; publish a tagged
-  menu and poll search until it appears; price, dietary and availability filters; item removal;
-  RBAC 401 and 403; RAG context with history, riders and a degraded source; event replay.
-  Menu-tag cases belong here too.
-- **Postman:** a new "AI retrieval" folder; document `dietary_tags` on menu publish.
-- **Docs:** D59 to D62 in key-decisions; a README AI section and env vars (including
-  `VECTOR_POSTGRES_PASSWORD`, `EMBEDDING_PROVIDER`, `OPENAI_API_KEY`); architecture diagram, ERD
-  (`sfo_vector_core` partition and `menu_items.dietary_tags`), and an AI search sequence diagram.
+- **Metrics** (`sfo_ai_*`, [ai/metrics.py](../services/ai/metrics.py)): search and RAG request
+  counts by outcome and latency histograms, RAG source failures by source, embedding latency
+  (observed in one place, `embed_timed`, so search, RAG and ingestion are all covered), documents
+  indexed, ingestion events by outcome, and a last-event timestamp for spotting a wedged worker.
+  Spans cover the embed, the vector query and each RAG source. A *SmartFoodOps — AI Retrieval*
+  Grafana dashboard ([ai-retrieval.json](../grafana/provisioning/dashboards/ai-retrieval.json),
+  12 panels) is file-provisioned like the others.
+- **Smoke test:** a new "AI retrieval (Week 4)" section, runnable under `--fast` except the
+  history-dependent RAG assertions, which need a real delivered order. It covers: the pgvector
+  extension and both HNSW indexes; tag normalization and the unknown-tag 422; search by meaning,
+  `max_price`, tag filters, availability, `top_k`, empty results and validation; 401/403 for each
+  role; ingestion following a republish; backfill idempotency; dead-lettering of an invalid event;
+  RAG context with distance ordering, ownership (own, someone else's, admin), a customer with no
+  history, and a customer whose real delivered order shows up as their favourite vendor; and
+  graceful degradation with the analytics and rider services stopped. It also waits for Prometheus
+  to re-scrape the restarted services, and asserts the `sfo_ai_*` metrics reach Prometheus.
+- **Postman:** a "10. AI Retrieval (Week 4)" folder (19 requests), and `dietary_tags` documented on
+  the main publish-menu request. Cases that stop containers or inspect Kafka stay in the smoke test.
+- **Docs:** D59 to D62 in [key-decisions.md](key-decisions.md); a README section, env vars, endpoint
+  and service tables, ports and migrations; section 9 of the manual testing guide; the RBAC design
+  and auth guide tables; the architecture diagram, the ERD (an `sfo_vector_core` partition and
+  `menu_items.dietary_tags`), and a new
+  [ai_search_sequence_diagram.md](diagrams/ai_search_sequence_diagram.md).
+
+Verified: the full smoke run passed 549 of 552 (the 3 failures are the known `compensation_failed`
+timing ones), `--fast` passed 379 of 379; the ERD matches all 23 tables with no mismatches; and
+`scripts/init_bootstrap.sh` run in a scratch directory produced files identical to the repo for all
+15 mirrored files (D20).
 
 ## 5. Verification (end to end, after Phase 6)
 

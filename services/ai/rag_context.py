@@ -26,10 +26,13 @@ import time
 from logging import Logger
 from typing import Awaitable
 
+from opentelemetry import trace
+
 from ai import config
 from ai.clients.analytics import AnalyticsServiceClient
 from ai.clients.rider import RiderServiceClient
-from ai.embeddings import Embedder
+from ai.embeddings import Embedder, embed_timed
+from ai.metrics import RAG_LATENCY_SECONDS, RAG_REQUESTS_TOTAL, RAG_SOURCE_FAILURES_TOTAL
 from ai.geo import haversine_km
 from ai.repositories.vectors import VectorRepository
 from ai.schemas.rag import (
@@ -41,6 +44,9 @@ from ai.schemas.rag import (
     RagRestaurant,
 )
 from ai.schemas.search import ItemMatch, RestaurantMatch
+
+
+_tracer = trace.get_tracer("ai.rag")
 
 
 class RagContextAssembler:
@@ -60,6 +66,20 @@ class RagContextAssembler:
         self._logger = logger
 
     async def assemble(self, request: RagContextRequest) -> RagContextResponse:
+        started = time.perf_counter()
+        try:
+            response = await self._assemble(request)
+        except Exception:
+            RAG_REQUESTS_TOTAL.labels(outcome="error").inc()
+            raise
+        finally:
+            RAG_LATENCY_SECONDS.observe(time.perf_counter() - started)
+        RAG_REQUESTS_TOTAL.labels(outcome="degraded" if response.sources_failed else "complete").inc()
+        for source in response.sources_failed:
+            RAG_SOURCE_FAILURES_TOTAL.labels(source=source).inc()
+        return response
+
+    async def _assemble(self, request: RagContextRequest) -> RagContextResponse:
         (found, vector_failed), (profile, analytics_failed) = await asyncio.gather(
             self._source("vector", self._search(request), config.RAG_VECTOR_TIMEOUT_SECONDS),
             self._source(
@@ -98,14 +118,17 @@ class RagContextAssembler:
     async def _source(self, name: str, work: Awaitable, timeout: float):
         """Run one source under its budget. Returns `(value, failed)`; never raises."""
         started = time.perf_counter()
-        try:
-            return await asyncio.wait_for(work, timeout=timeout), False
-        except asyncio.TimeoutError:
-            self._logger.warning("RAG source %s timed out after %.1fs", name, timeout)
-        except Exception as exc:  # noqa: BLE001 - a source failing must degrade, not fail, the call
-            self._logger.warning(
-                "RAG source %s failed after %.2fs: %s", name, time.perf_counter() - started, exc
-            )
+        with _tracer.start_as_current_span(f"ai.rag.{name}") as span:
+            try:
+                return await asyncio.wait_for(work, timeout=timeout), False
+            except asyncio.TimeoutError:
+                self._logger.warning("RAG source %s timed out after %.1fs", name, timeout)
+                span.set_attribute("ai.rag.failure", "timeout")
+            except Exception as exc:  # noqa: BLE001 - a source failing must degrade, not fail, the call
+                self._logger.warning(
+                    "RAG source %s failed after %.2fs: %s", name, time.perf_counter() - started, exc
+                )
+                span.set_attribute("ai.rag.failure", type(exc).__name__)
         return None, True
 
     # --- vector ----------------------------------------------------------------------------------
@@ -115,7 +138,7 @@ class RagContextAssembler:
 
     def _search_sync(self, request: RagContextRequest):
         """Embed the prompt and run the hybrid search — CPU-bound and blocking, so off the loop."""
-        vector = self._embedder.embed([request.prompt_query])[0]
+        vector = embed_timed(self._embedder, [request.prompt_query])[0]
         return self._vectors.search(
             vector,
             top_k=request.top_k,

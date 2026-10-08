@@ -7,10 +7,12 @@ is not a nicety: vectors from two models are not comparable, and a mismatch does
 it just returns nonsense.
 """
 
+import time
 from typing import Protocol
 
 import httpx
 import numpy as np
+from opentelemetry import trace
 
 from common.config import required
 from ai import config
@@ -81,6 +83,27 @@ def build_embedder() -> Embedder:
     raise RuntimeError(
         f"EMBEDDING_PROVIDER={config.EMBEDDING_PROVIDER!r} is not supported; use 'local' or 'openai'."
     )
+
+
+_tracer = trace.get_tracer("ai.embeddings")
+
+
+def embed_timed(embedder: Embedder, texts: list[str]) -> list[list[float]]:
+    """`embedder.embed` with its latency recorded and a span around it.
+
+    One place every caller embeds through (ingestion, search, RAG), so the histogram covers the
+    whole service rather than whichever path remembered to time itself, and a trace shows how
+    much of a slow request was the model.
+    """
+    from ai.metrics import EMBEDDING_LATENCY_SECONDS  # local: metrics imports nothing from here
+
+    with _tracer.start_as_current_span("ai.embed") as span:
+        span.set_attribute("ai.embed.texts", len(texts))
+        span.set_attribute("ai.embed.model", embedder.name)
+        started = time.perf_counter()
+        vectors = embedder.embed(texts)
+        EMBEDDING_LATENCY_SECONDS.observe(time.perf_counter() - started)
+    return vectors
 
 
 def as_vector(values: list[float]) -> np.ndarray:

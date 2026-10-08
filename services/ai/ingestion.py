@@ -19,7 +19,6 @@ a menu published before this existed a delay rather than a hole.
 import argparse
 import asyncio
 import json
-import time
 from datetime import datetime
 from logging import Logger
 
@@ -35,13 +34,8 @@ from ai import config
 from ai.chunking import item_chunk, restaurant_chunk
 from ai.clients.menu import MenuServiceClient
 from ai.clients.restaurant import RestaurantServiceClient
-from ai.embeddings import Embedder
-from ai.metrics import (
-    DOCUMENTS_INDEXED,
-    EMBEDDING_LATENCY_SECONDS,
-    INGESTION_EVENTS_TOTAL,
-    INGESTION_LAST_EVENT_SECONDS,
-)
+from ai.embeddings import Embedder, embed_timed
+from ai.metrics import DOCUMENTS_INDEXED, INGESTION_EVENTS_TOTAL, INGESTION_LAST_EVENT_SECONDS
 from ai.repositories.documents import DocumentRepository
 
 _DLQ_SUFFIX = ".dlq"
@@ -124,9 +118,7 @@ class IngestionService:
         restaurant_text = restaurant_chunk(restaurant, menu["categories"])
 
         # One batch for the whole restaurant: the dishes and the restaurant document together.
-        started = time.perf_counter()
-        vectors = self._embedder.embed(texts + [restaurant_text])
-        EMBEDDING_LATENCY_SECONDS.observe(time.perf_counter() - started)
+        vectors = embed_timed(self._embedder, texts + [restaurant_text])
         for row, vector in zip(item_rows, vectors):
             row["embedding"] = vector
 

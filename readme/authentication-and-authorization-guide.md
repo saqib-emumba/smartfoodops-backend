@@ -215,7 +215,9 @@ gateway, from the policy tables, and once in the handler:
 | Payment | `POST /payments`, `GET /payments/{id}` | `require_permission("payment:create")` / `require_permission("payment:read")` (ownership settled by reading the order, §4.2) |
 | Payment | `POST /payments/authorize`, `POST /payments/refund` | `require_internal` |
 | Rider | `POST /riders`, `GET /riders/me`, `PATCH /riders/me/location`, `PATCH /riders/me/availability`, `POST /riders/me/orders/{id}/picked-up`, `/delivered` | `require_permission("rider:profile")` / `require_permission("delivery:report")` |
-| Rider | `POST /riders/dispatch`, `POST /riders/release` | `require_internal` |
+| Rider | `POST /riders/dispatch`, `POST /riders/release`, `POST /riders/internal/nearby` | `require_internal` |
+| AI | `POST /ai/search`, `POST /ai/rag-context` | `require_permission("ai:search")` / `require_permission("ai:rag_context")`; the latter also `require_self_or_admin` on the body's `customer_id` (Week 4, D59/D62) |
+| Menu, Restaurant, Analytics | `GET /menus/{id}/internal`, `GET /menus/internal/restaurant-ids`, `GET /restaurants/{id}/internal`, `GET /analytics/internal/customers/{id}/summary` | `require_internal` — for the AI Service's ingestion worker and RAG assembler, which hold no user token (D61/D62) |
 
 Every health endpoint (`GET /api/v1/{service}/health`) is deliberately unguarded — a probe
 must not need a credential.
