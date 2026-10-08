@@ -636,7 +636,7 @@ if have_container sfo-user-db; then
             (SELECT count(*) FROM role_permissions)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NOT NULL)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NULL);" 2>/dev/null | tr -d '[:space:]')
-  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "10|19|15|8"
+  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "11|21|16|8"
 
   # system_admin must hold every permission, or the seed's CROSS JOIN has regressed and the
   # table stops telling the whole story (db/user/init.sql section 1e).

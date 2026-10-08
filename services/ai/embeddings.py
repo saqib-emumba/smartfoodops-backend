@@ -10,6 +10,7 @@ it just returns nonsense.
 from typing import Protocol
 
 import httpx
+import numpy as np
 
 from common.config import required
 from ai import config
@@ -82,11 +83,12 @@ def build_embedder() -> Embedder:
     )
 
 
-def to_vector_literal(vector: list[float]) -> str:
-    """pgvector's text form, `[0.1,0.2,...]`.
+def as_vector(values: list[float]) -> np.ndarray:
+    """An embedding as the float32 array pgvector's adapter turns into a `vector` parameter.
 
-    Passed as a parameter and cast with `%s::vector` in SQL, which avoids registering a type
-    adapter on every pooled connection (the pool lives in `common`, and this is the only
-    service that needs one).
+    The `Embedder` interface stays plain lists — a provider should not have to know what the
+    database driver wants — and conversion happens once, at the point a value is handed to SQL.
+    float32 because that is what the `vector` type stores; sending float64 only to have the
+    server narrow it would double the bytes on the wire for nothing.
     """
-    return "[" + ",".join(f"{value:.7g}" for value in vector) + "]"
+    return np.asarray(values, dtype=np.float32)

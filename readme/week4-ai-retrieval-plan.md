@@ -4,7 +4,7 @@ Implements §2 ("Week 4 Requirements: Data Preparation & Retrieval Layer") of
 [smartfoodops-week4-5-requirements.md](docs/smartfoodops-week4-5-requirements.md): a vector
 store, an ingestion pipeline, hybrid semantic search, and a multi-source RAG context assembler.
 
-**Status:** Phases 1 to 3 are implemented and verified. Phases 4 to 6 are planned.
+**Status:** Phases 1 to 4 are implemented and verified. Phases 5 and 6 are planned.
 
 Decision numbers D59 to D62 are cited in code comments already; the entries themselves are
 written in Phase 6 under a new `## Week 4 — semantic retrieval (AI layer)` section of
@@ -35,7 +35,7 @@ Exploration found five gaps the spec assumes away:
 | Change feed | Kafka `menu.published` event, re-read over internal HTTP | Matches D38 (Kafka carries facts); the event is a hint to re-read, not the data |
 | Tags | One owner-declared `menu_items.dietary_tags` list from a fixed vocabulary covering diets, allergens, cuisines, formats, dish types and meal styles | Filters are exact; nothing is inferred, which matters for the Week 5 zero-hallucination goal. Mixing groups was a deliberate choice (the alternative was separate cuisine and meal-style fields); a filter requires every tag asked for, so clients send one cuisine per search. |
 | Vector search scope | Items and restaurants first; order history comes from analytics in the RAG step | Projections have no line items |
-| pgvector client | No Python package; vectors are passed as text and cast with `::vector` | Avoids registering a type adapter on every pooled connection |
+| pgvector client | The `pgvector` Python package, registered once per process with `register_vector(..., globally=True)` | Embeddings travel as float32 numpy arrays instead of hand-built strings. Global registration needs no change to the shared connection pool in `common`. (Phases 1 to 3 first used text literals; switched in Phase 4.) |
 
 Cross-cutting rules that apply to every phase:
 - **D20:** every edit to compose, nginx, Prometheus, a topic list or an `init.sql` is mirrored
@@ -51,7 +51,7 @@ Cross-cutting rules that apply to every phase:
 | 1 | Infrastructure and service skeleton | Done |
 | 2 | Source-data changes in menu, restaurant, rider, analytics | Done |
 | 3 | Ingestion pipeline | Done |
-| 4 | `POST /api/v1/ai/search` | Planned |
+| 4 | `POST /api/v1/ai/search` | Done |
 | 5 | `POST /api/v1/ai/rag-context` | Planned |
 | 6 | Telemetry, tests, documentation | Planned |
 
@@ -147,22 +147,45 @@ Verified:
   `Index Scan using idx_menu_item_documents_embedding`.
 - Prometheus has 15 healthy targets; `--fast` smoke passed 294/294.
 
-### Phase 4 — Semantic search (planned): `POST /api/v1/ai/search`
+### Phase 4 — Semantic search (done): `POST /api/v1/ai/search`
 
-- Request: `query`, `top_k` (1 to 20, default 5), `max_price`, `dietary_filters[]`, optional
-  `restaurant_id`. Response: `matches[]` (item, restaurant, price, tags, `similarity_score`) and
-  `restaurants[]`.
-- One SQL statement: `WHERE is_available AND base_price <= … AND dietary_tags @> … ORDER BY
-  embedding <=> … LIMIT k`; `similarity_score = 1 - distance`. Inactive restaurants are excluded.
-- **Filtered HNSW pitfall:** an HNSW scan stops after `ef_search` candidates, so a heavy filter
-  can return fewer than `k` rows. Set `hnsw.iterative_scan = relaxed_order` and
-  `hnsw.ef_search = 100` per query (`SET LOCAL`), and assert the count in tests.
-- RBAC: new `ai:search` permission granted to `customer` (and `system_admin` via the existing
-  cross join), a `route_permissions` row, and `require_permission("ai:search")` in the handler.
-  Shipped as `db/user/add_ai_permissions.sql` plus the `init.sql` and bootstrap mirrors.
+- **Request:** `query` (2 to 500 chars, whitespace-trimmed), `top_k` (1 to 20, default 5),
+  `max_price`, `dietary_filters[]` (validated against the shared tag vocabulary), optional
+  `restaurant_id`. **Response:** `matches[]` (`item_id`, `item_name`, `restaurant_id`,
+  `restaurant_name`, `category_name`, `price`, `dietary_tags`, `similarity_score`) and
+  `restaurants[]`, in the D35 envelope with `Retrieved N matching item(s)`.
+- **One statement per result kind** in [repositories/vectors.py](../services/ai/repositories/vectors.py):
+  a cosine ordering (`<=>`, served by the HNSW index) beside ordinary WHERE clauses, so `top_k`
+  applies to rows that already satisfy the filters. Items must be available, within `max_price`,
+  carry every requested tag, and belong to an active restaurant. Restaurants must be active and
+  have at least one item passing the same constraints.
+- **Filtered HNSW:** `SET LOCAL hnsw.iterative_scan = relaxed_order` and `hnsw.ef_search = 100`
+  per request (pgvector 0.8.7), so a selective filter still returns every match up to `top_k`.
+  `SET LOCAL` keeps the settings from leaking to another request on the same pooled connection.
+- **Tag semantics:** a filter requires every tag listed (array containment).
+- **RBAC:** new `ai:search` permission granted to `customer` (and `system_admin` through the
+  existing cross join), a `route_permissions` row, and `require_permission("ai:search")` in the
+  handler. Added to [db/user/init.sql](../db/user/init.sql), mirrored into bootstrap, and shipped
+  as [db/user/add_ai_permissions.sql](../db/user/add_ai_permissions.sql) (idempotent; applied to
+  the running database).
+- An empty result is a 200 with empty lists, not a 404.
 
-Exit check: "spicy dishes under $15" returns only available, tagged items at or under 15; a
-customer gets 200, a rider 403 at the gateway, no token 401.
+Verified on the running stack:
+- A customer gets 200, a rider and a restaurant_admin get 403 at the gateway, no token 401.
+- "Spicy dishes under $15" returns only available items at or under 15; a vegan filter returns
+  only vegan items; a sold-out item is never returned.
+- A selective tag filter returns exactly the rows that have it (kosher 2/2, pasta 1/1,
+  light-meal 1/1), which is what the iterative scan is for.
+- A deactivated restaurant disappears from both lists, scoped and global.
+- Unknown tag, blank query, `top_k` of 0 and `top_k` of 50 are all 422.
+- Semantic checks: "a cold sweet drink" returns Mango Lassi first; "italian vegetarian dinner"
+  returns the three Italian dishes.
+- `--fast` smoke passed.
+
+Open point for Week 5: a semantic search always returns its nearest rows, however weak, so an
+off-topic query still gets low-scoring matches. A minimum similarity threshold (or a
+`min_score` parameter) would let the assistant say "nothing matches" instead of presenting a
+poor match; it is not in the spec and not built.
 
 ### Phase 5 — RAG context (planned): `POST /api/v1/ai/rag-context`
 

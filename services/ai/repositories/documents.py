@@ -6,14 +6,15 @@ A diff against the existing rows would have to reason about renamed, re-keyed an
 replacing sidesteps all three, and the cost — re-embedding every item of a restaurant — is small
 at a menu's size and only paid when its `source_version` actually changed.
 
-Embeddings travel as pgvector's text form (`[0.1,0.2,...]`) cast with `::vector`, so no type
-adapter has to be registered on the shared pool's connections.
+Embeddings go in as numpy arrays: `ai.deps.register_vector_types` registers pgvector's psycopg2
+adapter once at startup, after which an array is a valid `vector` parameter. The `::vector` casts
+below are kept as explicit documentation of the column type, not as a workaround.
 """
 
 from psycopg2.extras import execute_values
 
 from common.repository import Repository
-from ai.embeddings import to_vector_literal
+from ai.embeddings import as_vector
 
 _EVENT_PROCESSED = """
     SELECT 1 AS seen FROM processed_events
@@ -117,7 +118,7 @@ class DocumentRepository(Repository):
                             doc["is_available"],
                             doc["dietary_tags"],
                             doc["chunk_text"],
-                            to_vector_literal(doc["embedding"]),
+                            as_vector(doc["embedding"]),
                             doc["embedding_model"],
                             doc["source_version"],
                         )
@@ -127,7 +128,7 @@ class DocumentRepository(Repository):
                 )
             cur.execute(
                 _UPSERT_RESTAURANT,
-                {**restaurant, "embedding": to_vector_literal(restaurant["embedding"])},
+                {**restaurant, "embedding": as_vector(restaurant["embedding"])},
             )
             if event is not None:
                 group, event_id, event_type = event

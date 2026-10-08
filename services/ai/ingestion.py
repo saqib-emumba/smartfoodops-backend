@@ -340,6 +340,8 @@ async def main(backfill_only: bool) -> None:
     )
 
     async with deps.db.lifespan(None):
+        # Same registration the API does at startup: this process writes embeddings too.
+        deps.register_vector_types()
         if backfill_only:
             outcomes = await asyncio.to_thread(service.backfill)
             logger.info("Backfill complete: %s", outcomes or "no published menus")

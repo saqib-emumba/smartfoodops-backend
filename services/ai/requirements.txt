@@ -5,6 +5,12 @@
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
 
+# pgvector: the psycopg2 adapter for the `vector` type. It is only a client-side convenience —
+# the extension in the database does the actual work — but it lets an embedding travel as a
+# numpy array instead of a hand-built string, and come back as one. Registered once per process
+# (`ai.deps.register_vector_types`), not per connection. numpy arrives with fastembed already.
+pgvector==0.5.0
+
 # fastembed: runs all-MiniLM-L6-v2 on onnxruntime instead of PyTorch. The same model and the
 # same 384-dim output as sentence-transformers, in a ~150MB layer rather than ~1.5GB with torch
 # — and no GPU or CUDA code path the container will never use (D59).
