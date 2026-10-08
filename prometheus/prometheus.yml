@@ -15,7 +15,7 @@ scrape_configs:
     static_configs:
       - targets: ["temporal-server:9233"]
 
-  # The seven FastAPI services, each exposing /metrics via common/telemetry.py.
+  # The nine FastAPI services, each exposing /metrics via common/telemetry.py.
   - job_name: "user-service"
     static_configs:
       - targets: ["user-service:8001"]
@@ -54,6 +54,11 @@ scrape_configs:
   - job_name: "analytics-service"
     static_configs:
       - targets: ["analytics-service:8008"]
+
+  # Semantic retrieval (Week 4, D59) — same /metrics wiring as every other FastAPI service.
+  - job_name: "ai-service"
+    static_configs:
+      - targets: ["ai-service:8009"]
 
   # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
   # HTTP server started in notification/consumer.py::main (Week 3, D45).

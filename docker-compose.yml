@@ -15,6 +15,7 @@ volumes:
   grafana_data:
   kafka_data:
   analytics_postgres_data:
+  vector_postgres_data:
   rabbitmq_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
@@ -54,6 +55,12 @@ x-rider-db-env: &rider-db-env
 # holds even for a service whose "facts" are all rebuildable from a topic.
 x-analytics-db-env: &analytics-db-env
   DATABASE_URL: postgresql://sfo_analytics_admin:${ANALYTICS_POSTGRES_PASSWORD:?set ANALYTICS_POSTGRES_PASSWORD in the root .env}@db-analytics-postgres:5432/sfo_analytics_core
+
+# The AI Service's own database (Week 4, D59): vector embeddings only, all rebuildable from
+# the menus. Separate from sfo_menu_core so the menu's write path never depends on a vector
+# index, and so the one database that needs the pgvector extension is the one that runs it.
+x-vector-db-env: &vector-db-env
+  DATABASE_URL: postgresql://sfo_vector_admin:${VECTOR_POSTGRES_PASSWORD:?set VECTOR_POSTGRES_PASSWORD in the root .env}@db-vector-postgres:5432/sfo_vector_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -177,6 +184,23 @@ services:
     volumes:
       - analytics_postgres_data:/var/lib/postgresql/data
       - ./db/analytics/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  # Week 4 (D59): the AI Service's vector store. pgvector/pgvector instead of the plain
+  # postgres:15-alpine every other database uses, because the extension has to be present in
+  # the server — it is the one container here that cannot run from `*postgres-base`'s image.
+  db-vector-postgres:
+    <<: *postgres-base
+    image: pgvector/pgvector:pg15
+    container_name: sfo-vector-db
+    environment:
+      POSTGRES_DB: sfo_vector_core
+      POSTGRES_USER: sfo_vector_admin
+      POSTGRES_PASSWORD: ${VECTOR_POSTGRES_PASSWORD}
+    ports:
+      - "5439:5432" # Maps host 5439 to container 5432
+    volumes:
+      - vector_postgres_data:/var/lib/postgresql/data
+      - ./db/vector/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   cache-redis:
     image: redis:7.0-alpine
@@ -430,6 +454,7 @@ services:
       - payment-service
       - rider-service
       - orchestrator-service
+      - ai-service
     networks:
       - smartfoodops-network
 
@@ -593,6 +618,32 @@ services:
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-analytics-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3b'. AI SERVICE (Week 4, D59) ---
+  # Semantic search and RAG context. Verifies tokens like every request-path service (the
+  # gateway forwards identity headers; D52), reads the menu, restaurant, rider and analytics
+  # services over their internal routes (D01 — it never touches their databases), and keeps its
+  # own vectors in sfo_vector_core. The embedding model is baked into the image, so this
+  # container needs no outbound network to start.
+  ai-service:
+    build:
+      context: ./services
+      dockerfile: ai/Dockerfile
+    container_name: sfo-ai-service
+    restart: always
+    environment:
+      <<: [*vector-db-env, *jwt-env]
+      MENU_SERVICE_URL: http://menu-service:8003
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      RIDER_SERVICE_URL: http://rider-service:8006
+      ANALYTICS_SERVICE_URL: http://analytics-service:8008
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db-vector-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network

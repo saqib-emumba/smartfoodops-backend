@@ -232,7 +232,9 @@ wait_for_stack() {
     # Orchestrator's path doesn't fit the plural-resource pattern above, so it's checked
     # on its own — the gateway routes only this one path of it (D36).
     [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/orchestrator/health")" == "200" ]] && up=$((up + 1))
-    if [[ $up -eq 7 ]]; then printf ' ready.\n'; return 0; fi
+    # The AI Service (Week 4, D59) is public at /health only, like the others.
+    [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/ai/health")" == "200" ]] && up=$((up + 1))
+    if [[ $up -eq 8 ]]; then printf ' ready.\n'; return 0; fi
     printf '.'; sleep 2
   done
   printf '\n%sServices did not become ready.%s Try: docker compose ps\n' "$RED" "$RESET"
@@ -287,6 +289,9 @@ done
 # Order Service holds no Temporal client of its own to ask, so this checks the
 # Orchestrator Service directly — the gateway routes only its health probe, on purpose
 # (api-gateway/nginx.conf), so this is the one orchestrator route reachable from outside.
+expect "ai service health" 200 GET /api/v1/ai/health
+assert "  embedding model loaded" "$(jfield "['embedding_model']")" "sentence-transformers/all-MiniLM-L6-v2"
+assert "  vector database reachable" "$(jfield "['database_reachable']")" "True"
 expect "orchestrator service reports Temporal" 200 GET /api/v1/orchestrator/health
 assert "  temporal reachable" "$(jfield "['temporal_reachable']")" "True"
 

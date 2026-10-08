@@ -1,0 +1,15 @@
+-r ../common/requirements.txt
+
+# httpx: sibling HTTP calls (menu / restaurant / rider / analytics internal routes) and
+# common.kafka.SchemaRegistryValidator, which registers and validates schemas over HTTP.
+httpx==0.28.1
+opentelemetry-instrumentation-httpx==0.65b0
+
+# fastembed: runs all-MiniLM-L6-v2 on onnxruntime instead of PyTorch. The same model and the
+# same 384-dim output as sentence-transformers, in a ~150MB layer rather than ~1.5GB with torch
+# — and no GPU or CUDA code path the container will never use (D59).
+fastembed==0.9.0
+
+# The ingestion worker consumes menu.published (common.kafka + the DLQ producer).
+aiokafka==0.14.0
+fastjsonschema==2.22.2
