@@ -19,10 +19,15 @@ _UPSERT_MENU_ANCHOR = """
     INSERT INTO menus (restaurant_id)
     VALUES (%(restaurant_id)s)
     ON CONFLICT (restaurant_id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-    RETURNING id
+    RETURNING id, updated_at
 """
 
-_SELECT_MENU_BY_RESTAURANT = "SELECT id FROM menus WHERE restaurant_id = %s"
+_SELECT_MENU_BY_RESTAURANT = "SELECT id, updated_at FROM menus WHERE restaurant_id = %s"
+
+# Every restaurant with a published menu, oldest first — what a full re-ingest by the AI
+# Service walks (D59). `updated_at` rides along so it can skip a menu it already embedded.
+_SELECT_PUBLISHED_MENUS = "SELECT restaurant_id, updated_at FROM menus ORDER BY updated_at"
+
 
 # Cascades through menu_items -> menu_item_customization_groups ->
 # menu_item_customization_options via their own ON DELETE CASCADE foreign keys — one
@@ -37,9 +42,9 @@ _INSERT_CATEGORY = """
 
 _INSERT_ITEM = """
     INSERT INTO menu_items
-        (category_id, item_key, name, description, base_price, is_available)
+        (category_id, item_key, name, description, base_price, is_available, dietary_tags)
     VALUES (%(category_id)s, %(item_key)s, %(name)s, %(description)s, %(base_price)s,
-            %(is_available)s)
+            %(is_available)s, %(dietary_tags)s)
     RETURNING id
 """
 
@@ -62,7 +67,8 @@ _SELECT_CATEGORIES_FOR_MENU = """
 """
 
 _SELECT_ITEMS_FOR_CATEGORIES = """
-    SELECT id, category_id, item_key, name, description, base_price, is_available
+    SELECT id, category_id, item_key, name, description, base_price, is_available,
+           dietary_tags
       FROM menu_items
      WHERE category_id = ANY(%(category_ids)s::uuid[])
 """
@@ -88,7 +94,12 @@ class MenuRepository(Repository):
         return {
             "restaurant_id": restaurant_id,
             "categories": self._load_categories(menu["id"]),
+            "updated_at": menu["updated_at"],
         }
+
+    def list_published(self) -> list[dict]:
+        """`[{restaurant_id, updated_at}]` for every restaurant that has a menu."""
+        return self.all(_SELECT_PUBLISHED_MENUS)
 
     def _load_categories(self, menu_id) -> list[dict]:
         """Reassemble the nested category/item/group/option tree for one menu.
@@ -146,6 +157,7 @@ class MenuRepository(Repository):
                     "description": row["description"],
                     "base_price": float(row["base_price"]),
                     "is_available": row["is_available"],
+                    "dietary_tags": list(row["dietary_tags"] or []),
                     "customization_groups": groups_by_item.get(str(row["id"]), []),
                 }
             )
@@ -174,7 +186,8 @@ class MenuRepository(Repository):
         """
         with self._db.cursor(commit=True) as cur:
             cur.execute(_UPSERT_MENU_ANCHOR, {"restaurant_id": str(restaurant_id)})
-            menu_id = cur.fetchone()["id"]
+            menu_row = cur.fetchone()
+            menu_id = menu_row["id"]
 
             cur.execute(_DELETE_CATEGORIES_FOR_MENU, {"menu_id": menu_id})
 
@@ -200,6 +213,7 @@ class MenuRepository(Repository):
                             "description": item["description"],
                             "base_price": item["base_price"],
                             "is_available": item["is_available"],
+                            "dietary_tags": item.get("dietary_tags", []),
                         },
                     )
                     item_id = cur.fetchone()["id"]
@@ -227,4 +241,8 @@ class MenuRepository(Repository):
                                 },
                             )
 
-        return {"restaurant_id": restaurant_id, "categories": categories}
+        return {
+            "restaurant_id": restaurant_id,
+            "categories": categories,
+            "updated_at": menu_row["updated_at"],
+        }

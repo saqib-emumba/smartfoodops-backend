@@ -11,7 +11,15 @@ instead of forwarding the bearer token, D53 the transactional outbox tables are 
 favour of a Temporal-activity publish, D55 payment/rider/compensation become child
 workflows, D57 RBAC moves into the database and is enforced at the gateway, D58 checkout
 starts `OrderWorkflow` and answers after payment, with the post-payment work in an abandoned
-`FulfillmentWorkflow`).
+`FulfillmentWorkflow`, and — for Part B — D59 the AI Service with its own pgvector database, D60
+owner-declared menu tags, D61 `menu.published` feeding an ingestion worker, D62 the RAG context
+assembler).
+
+The AI layer (pink) is two containers from one image: `ai-service` answers search and RAG-context
+requests (gated at the gateway like every other route, `ai:search` / `ai:rag_context`), and
+`ai-ingestion-worker` consumes `menu.published`, re-reads the menu and restaurant over internal-key
+routes, and keeps `sfo_vector_core` in step. RAG context also reads the Analytics and Rider services,
+and degrades — naming the failed source — rather than failing when one is down.
 
 Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
 Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
@@ -44,6 +52,11 @@ flowchart TB
         RiderSvc["Rider Service<br/>8006"]
         OrchestratorAPI["Orchestrator Service<br/>8007 health only"]
         AnalyticsSvc["Analytics Service<br/>8008"]
+        AISvc["AI Service<br/>8009<br/>search + RAG context"]
+    end
+
+    subgraph AI ["AI retrieval (Part B, D59-D62)"]
+        AIWorker["AI Ingestion Worker<br/>menu.published consumer<br/>metrics 9111"]
     end
 
     subgraph Saga ["Orchestration (Temporal)"]
@@ -70,6 +83,7 @@ flowchart TB
         MenuDB["sfo_menu_core<br/>5436"]
         RiderDB["sfo_rider_core<br/>5437"]
         AnalyticsDB["sfo_analytics_core<br/>5438"]
+        VectorDB["sfo_vector_core<br/>5439<br/>pgvector, HNSW"]
         Redis["Redis<br/>6379"]
     end
 
@@ -82,7 +96,7 @@ flowchart TB
     %% -- request entry --
     Client --> Gateway
     Gateway -.->|auth_request verify + authorize, D51/D57| UserSvc
-    Gateway --> UserSvc & RestaurantSvc & MenuSvc & OrderSvc & PaymentSvc & RiderSvc
+    Gateway --> UserSvc & RestaurantSvc & MenuSvc & OrderSvc & PaymentSvc & RiderSvc & AISvc
     Gateway -->|health only| OrchestratorAPI
 
     %% -- synchronous service-to-service calls: identity headers, not a forwarded token (D52) --
@@ -102,6 +116,13 @@ flowchart TB
     OrchestratorWorker -->|create, transitions, kitchen decision,<br/>internal reads, publish| OrderSvc
     OrchestratorWorker -->|dispatch / release| RiderSvc
 
+    %% -- Part B: the AI layer. All reads of other services' data go over internal-key routes
+    %% (D01), never their databases; the vectors are derived state in the AI Service's own --
+    AIWorker -->|internal reads: menu + restaurant, D61| MenuSvc
+    AIWorker -->|internal read: restaurant| RestaurantSvc
+    AISvc -->|RAG: customer order history, internal, D62| AnalyticsSvc
+    AISvc -->|RAG: courier availability counts, internal, D62| RiderSvc
+
     %% -- each service owns one database --
     UserSvc --> UserDB
     RestaurantSvc --> RestaurantDB
@@ -110,6 +131,8 @@ flowchart TB
     PaymentSvc --> PaymentDB
     RiderSvc --> RiderDB
     AnalyticsSvc --> AnalyticsDB
+    AISvc -->|search + RAG vectors| VectorDB
+    AIWorker -->|replace a restaurant's documents| VectorDB
     MenuSvc -.->|menu cache, db 0| Redis
     UserSvc -.->|refresh tokens, db 1| Redis
     %% D49: rider live location moved from a Postgres column to this Redis GEO index.
@@ -119,11 +142,15 @@ flowchart TB
     %% called synchronously from an internal endpoint a Temporal activity invokes --
     OrderSvc -->|publish, via KafkaGateway, D53| Kafka
     PaymentSvc -->|publish, via KafkaGateway, D53| Kafka
+    MenuSvc -->|publish menu.published, best-effort, D61| Kafka
+    Kafka -->|consume menu.published, D61| AIWorker
     Kafka -->|consume| AnalyticsSvc
     Kafka -->|consume| NotifConsumer
     OrderSvc -.->|schema| SchemaRegistry
     PaymentSvc -.->|schema| SchemaRegistry
     AnalyticsSvc -.->|schema| SchemaRegistry
+    MenuSvc -.->|schema| SchemaRegistry
+    AIWorker -.->|schema| SchemaRegistry
     NotifConsumer -.->|schema| SchemaRegistry
 
     %% -- notifications: Kafka to Celery bridge --
@@ -135,9 +162,11 @@ flowchart TB
     AppServices -.-> Jaeger
     OrchestratorWorker -.-> Jaeger
     NotifConsumer -.-> Jaeger
+    AIWorker -.-> Jaeger
     AppServices -.-> Prometheus
     OrchestratorWorker -.-> Prometheus
     NotifConsumer -.-> Prometheus
+    AIWorker -.-> Prometheus
     TemporalServer -.-> Prometheus
     RabbitMQ -.-> Prometheus
     Grafana -->|query| Prometheus
@@ -148,13 +177,15 @@ flowchart TB
     classDef notify fill:#ccfbf1,stroke:#0d9488,color:#134e4a;
     classDef data fill:#dcfce7,stroke:#16a34a,color:#14532d;
     classDef obs fill:#f3f4f6,stroke:#6b7280,color:#1f2937;
+    classDef ai fill:#fce7f3,stroke:#db2777,color:#831843;
     classDef edge fill:#fff,stroke:#111827,color:#111827;
 
     class UserSvc,RestaurantSvc,MenuSvc,OrderSvc,PaymentSvc,RiderSvc,OrchestratorAPI,AnalyticsSvc app;
+    class AISvc,AIWorker ai;
     class TemporalServer,OrchestratorWorker saga;
     class Kafka,SchemaRegistry evt;
     class NotifConsumer,RabbitMQ,NotifWorker notify;
-    class UserDB,RestaurantDB,OrderDB,PaymentDB,MenuDB,RiderDB,AnalyticsDB,Redis data;
+    class UserDB,RestaurantDB,OrderDB,PaymentDB,MenuDB,RiderDB,AnalyticsDB,VectorDB,Redis data;
     class Jaeger,Prometheus,Grafana obs;
     class Client,Gateway edge;
 
@@ -164,6 +195,7 @@ flowchart TB
     style Saga fill:#f5f3ff,stroke:#7c3aed,stroke-width:1px;
     style Eventing fill:#fff7ed,stroke:#ea580c,stroke-width:1px;
     style Notify fill:#f0fdfa,stroke:#0d9488,stroke-width:1px;
+    style AI fill:#fdf2f8,stroke:#db2777,stroke-width:1px;
     style Data fill:#f0fdf4,stroke:#16a34a,stroke-width:1px;
     style Observability fill:#f9fafb,stroke:#6b7280,stroke-width:1px;
 ```

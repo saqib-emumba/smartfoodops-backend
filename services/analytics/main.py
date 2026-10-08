@@ -15,7 +15,7 @@ from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from analytics import deps
-from analytics.apis import health
+from analytics.apis import health, internal
 
 app = FastAPI(
     title="SmartFoodOps Analytics Service",
@@ -25,6 +25,7 @@ install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
+app.include_router(internal.router)
 
 
 if __name__ == "__main__":

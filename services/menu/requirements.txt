@@ -5,3 +5,7 @@
 httpx==0.28.1
 opentelemetry-instrumentation-httpx==0.65b0
 redis==5.2.1
+
+# Publishes menu.published (D61) through common.kafka.KafkaGateway.
+aiokafka==0.14.0
+fastjsonschema==2.22.2

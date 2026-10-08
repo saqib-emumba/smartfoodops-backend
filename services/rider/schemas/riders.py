@@ -89,6 +89,25 @@ class DispatchResponse(BaseModel):
     reason: Optional[str] = None
 
 
+class NearbyRequest(BaseModel):
+    """Sent by the AI Service's RAG assembler (D62): how many riders could take an order from
+    here. A *question*, not a claim — nothing is reserved and no rider is identified."""
+
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+    radius_km: Optional[float] = Field(None, gt=0)
+
+
+class NearbyResponse(BaseModel):
+    """Aggregate courier availability around a point. Deliberately carries counts and a
+    distance, never a rider id or a position: the consumer is a language model's context, and
+    a rider's identity or location has no business in a prompt."""
+
+    available_riders: int
+    nearest_available_km: Optional[float] = None
+    radius_km: float
+
+
 class ReleaseRequest(BaseModel):
     order_id: UUID
 

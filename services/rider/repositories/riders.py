@@ -80,6 +80,16 @@ _CLAIM_NEAREST = f"""
     RETURNING {_COLUMNS}
 """
 
+# Which of these user ids are free to take an order right now — the availability half of
+# "nearby", since Redis only knows where riders are (D49).
+_SELECT_AVAILABLE_AMONG = """
+    SELECT user_id
+      FROM riders
+     WHERE is_available
+       AND current_order_id IS NULL
+       AND user_id = ANY(%(user_ids)s::uuid[])
+"""
+
 _RELEASE = f"""
     UPDATE riders
        SET is_available = TRUE,
@@ -91,6 +101,13 @@ _RELEASE = f"""
 
 
 class RiderRepository(Repository):
+    def available_among(self, user_ids: list[str]) -> set[str]:
+        """The subset of `user_ids` that is available and not holding an order."""
+        if not user_ids:
+            return set()
+        rows = self.all(_SELECT_AVAILABLE_AMONG, {"user_ids": user_ids})
+        return {str(row["user_id"]) for row in rows}
+
     def find(self, rider_id: UUID) -> dict | None:
         return self.one(_SELECT_BY_ID, (str(rider_id),))
 

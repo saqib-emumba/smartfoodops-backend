@@ -185,7 +185,7 @@ sequenceDiagram
         Worker-->>Temporal: OrderWorkflow completes with the order
         Temporal-->>OrderSvc: workflow result (order)
         OrderSvc-->>Customer: 201 Created (200 if this was a replay)
-        Note right of Worker: the API's answer is OrderWorkflow's completion. order-{id} is<br/>checkout only; the rest of the order's life is fulfillment-{id} and below
+        Note right of Worker: the API's answer is OrderWorkflow's completion. order-{id} is<br/>checkout only, and the rest of the order's life is fulfillment-{id} and below
     end
 
     rect rgb(240, 240, 240)
