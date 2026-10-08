@@ -9,10 +9,11 @@ so both get the same pool, embedder and sibling clients.
 """
 
 from common.bootstrap import bootstrap
+from ai import config
 from ai.embeddings import build_embedder
 
 runtime = bootstrap(
-    "ai-service",
+    config.PROCESS_NAME,
     exhausted_detail="Database connection pool exhausted",
 )
 

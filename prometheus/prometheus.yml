@@ -60,6 +60,11 @@ scrape_configs:
     static_configs:
       - targets: ["ai-service:8009"]
 
+  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion.py::main (Week 4).
+  - job_name: "ai-ingestion-worker"
+    static_configs:
+      - targets: ["ai-ingestion-worker:9111"]
+
   # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
   # HTTP server started in notification/consumer.py::main (Week 3, D45).
   - job_name: "notification-consumer"

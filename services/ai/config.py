@@ -8,6 +8,10 @@ provider never needs one.
 
 import os
 
+# The FastAPI app and the ingestion worker share this package and `deps.py`; each names itself
+# so logs, traces and the Prometheus `job` label tell the two processes apart.
+PROCESS_NAME = os.getenv("AI_PROCESS_NAME", "ai-service")
+
 # "local" runs all-MiniLM-L6-v2 in-process (no network, no key, no per-call cost); "openai"
 # calls the embeddings API. Selected by env so switching is a deploy, not a code change.
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")

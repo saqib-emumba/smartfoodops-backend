@@ -4,7 +4,7 @@ Implements §2 ("Week 4 Requirements: Data Preparation & Retrieval Layer") of
 [smartfoodops-week4-5-requirements.md](docs/smartfoodops-week4-5-requirements.md): a vector
 store, an ingestion pipeline, hybrid semantic search, and a multi-source RAG context assembler.
 
-**Status:** Phases 1 and 2 are implemented and verified. Phases 3 to 6 are planned.
+**Status:** Phases 1 to 3 are implemented and verified. Phases 4 to 6 are planned.
 
 Decision numbers D59 to D62 are cited in code comments already; the entries themselves are
 written in Phase 6 under a new `## Week 4 — semantic retrieval (AI layer)` section of
@@ -50,7 +50,7 @@ Cross-cutting rules that apply to every phase:
 |---|---|---|
 | 1 | Infrastructure and service skeleton | Done |
 | 2 | Source-data changes in menu, restaurant, rider, analytics | Done |
-| 3 | Ingestion pipeline | Planned |
+| 3 | Ingestion pipeline | Done |
 | 4 | `POST /api/v1/ai/search` | Planned |
 | 5 | `POST /api/v1/ai/rag-context` | Planned |
 | 6 | Telemetry, tests, documentation | Planned |
@@ -105,25 +105,47 @@ Verified: tags round-trip and normalize; one event lands on the topic per publis
 internal route is 401 without the key and 403 through the gateway with a bearer token;
 `--fast` smoke passed 294/294.
 
-### Phase 3 — Ingestion pipeline (planned): `services/ai/ingestion.py`
+### Phase 3 — Ingestion pipeline (done): `services/ai/ingestion.py`
 
 A menu publish becomes up-to-date vectors within seconds, idempotently.
 
-- A separate container `ai-ingestion-worker` from the same image (`python -m ai.ingestion`) with
-  its own metrics server on port 9111, so a slow embedding job never stalls the API.
-- Consumes `sfo.menu.events.v1` as group `ai-ingestion`: manual commit, `read_committed`, DLQ,
-  schema-registry validation. The pattern is copied from
-  [analytics/consumer.py](../services/analytics/consumer.py). Dedup uses `processed_events`.
-- Per event: fetch the menu and restaurant over internal HTTP; build chunks
-  (`ai/chunking.py`); embed in batch; replace that restaurant's documents in one transaction;
-  skip if `source_version` is unchanged.
-- Item chunk format: `Dish: {name} at {restaurant} (${price}) | Category: {category} |
-  Description: … | Options: {group: option(+price)} | Dietary: … | Availability: In Stock`.
-- `python -m ai.ingestion --backfill` walks `menus/internal/restaurant-ids`; it also runs once at
-  worker startup, so menus published before this existed and lost events are reconciled.
+- **Two layers.** `IngestionService` is synchronous and Kafka-free ("make this restaurant's vectors
+  match its menu now"); `IngestionConsumer` is the Kafka side (read, validate, retry, dead-letter).
+  Backfill, an event and a person at a shell all go through the same service.
+- **Own container.** `ai-ingestion-worker` runs the AI image with `python -m ai.ingestion`
+  and a metrics server on port 9111, so an embedding job never competes with a search request.
+  `AI_PROCESS_NAME` gives each process its own name for logs, traces and the Prometheus job.
+- **Per event:** fetch the menu and restaurant over the internal routes; build chunks
+  ([ai/chunking.py](../services/ai/chunking.py)); embed the dishes and the restaurant in one batch;
+  replace the restaurant's documents and record the event as processed in one transaction.
+  Re-ingesting is skipped when the stored `source_version` and embedding model both match.
+- **Chunk format:** `Dish: … at … ($…) | Category: … | Description: … | Options: … | Tags: … |
+  Availability: In Stock`. Segments with nothing to say are omitted rather than filled with a
+  placeholder, so nothing is asserted that the data does not hold. The label is `Tags:`, not the
+  spec's `Dietary:`, because the list now holds more than diets.
+- **Restaurant document:** name, address, menu sections, a few dish names, the union of its items'
+  tags, and open/closed status.
+- **Failure handling:** a transient failure retries with backoff (5 attempts) and then
+  dead-letters. Retrying inside the handler is deliberate: the loop commits offsets, so letting an
+  exception propagate would commit past the unhandled message and lose it. A schema-invalid
+  event goes straight to the DLQ; an unknown event type is skipped.
+- **Backfill.** `python -m ai.ingestion --backfill` ingests every published menu once and prints
+  outcome counts. The worker also does this at startup (retrying while the menu service comes up),
+  so a lost event or a menu published before this existed is a delay, not a hole. One restaurant
+  failing is logged and counted, not fatal.
+- **Metrics:** `sfo_ai_ingestion_events_total{outcome}`, `sfo_ai_documents_indexed{kind}`,
+  `sfo_ai_embedding_latency_seconds`, `sfo_ai_ingestion_last_event_timestamp_seconds`.
 
-Exit check: a publish produces one row per item with a 384-dim embedding and correct metadata;
-removing an item deletes its row; replaying an event does no work.
+Verified:
+- A publish is indexed in about 0.25 s; republishing with an item removed and a price changed
+  updates the rows and deletes the removed one.
+- Replaying an event does nothing; a new event for an unchanged menu is skipped; a restaurant with
+  no menu is removed; a backfill rerun skips all 33.
+- With the menu service stopped, an event retries with backoff and completes once it is back; an
+  invalid payload lands on the DLQ with its reason.
+- The query "spicy beef burger with cheese" returns the burger first, and `EXPLAIN` shows
+  `Index Scan using idx_menu_item_documents_embedding`.
+- Prometheus has 15 healthy targets; `--fast` smoke passed 294/294.
 
 ### Phase 4 — Semantic search (planned): `POST /api/v1/ai/search`
 

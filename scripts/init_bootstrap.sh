@@ -1476,6 +1476,35 @@ services:
     networks:
       - smartfoodops-network
 
+  # The ingestion worker (Week 4, D59/D61): the same image as ai-service with a different command,
+  # the way notification-consumer shares notification-worker's. Consumes menu.published, re-reads
+  # the menu and restaurant over their internal routes, and keeps sfo_vector_core in step. A
+  # separate container so an embedding job never competes with a search request for CPU. No
+  # `depends_on: kafka` — its reconnect loop handles the broker not being ready, like the other
+  # consumers; it does need the menu and restaurant services eventually, which its startup
+  # backfill retries for.
+  ai-ingestion-worker:
+    build:
+      context: ./services
+      dockerfile: ai/Dockerfile
+    container_name: sfo-ai-ingestion-worker
+    restart: always
+    command: ["python", "-m", "ai.ingestion"]
+    environment:
+      <<: [*vector-db-env, *jwt-env]
+      AI_PROCESS_NAME: ai-ingestion-worker
+      MENU_SERVICE_URL: http://menu-service:8003
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db-vector-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
   # --- 3c. NOTIFICATIONS (Week 3, D45) ---
   # Two containers, one image — see services/notification/__init__.py for why the split is
   # what makes the Celery hop real rather than decorative. Neither depends on kafka or
@@ -1635,6 +1664,11 @@ scrape_configs:
   - job_name: "ai-service"
     static_configs:
       - targets: ["ai-service:8009"]
+
+  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion.py::main (Week 4).
+  - job_name: "ai-ingestion-worker"
+    static_configs:
+      - targets: ["ai-ingestion-worker:9111"]
 
   # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
   # HTTP server started in notification/consumer.py::main (Week 3, D45).
