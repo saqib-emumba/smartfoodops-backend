@@ -12,7 +12,10 @@ from pgvector.psycopg2 import register_vector
 
 from common.bootstrap import bootstrap
 from ai import config
+from ai.clients.analytics import AnalyticsServiceClient
+from ai.clients.rider import RiderServiceClient
 from ai.embeddings import build_embedder
+from ai.rag_context import RagContextAssembler
 from ai.repositories.vectors import VectorRepository
 
 runtime = bootstrap(
@@ -29,6 +32,13 @@ db = runtime.db
 embedder = build_embedder()
 
 vectors = VectorRepository(db, logger=logger)
+rag = RagContextAssembler(
+    vectors,
+    embedder,
+    AnalyticsServiceClient(logger),
+    RiderServiceClient(logger),
+    logger=logger,
+)
 
 
 def register_vector_types() -> None:

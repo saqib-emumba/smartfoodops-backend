@@ -42,28 +42,8 @@ def search(
         restaurant_id=payload.restaurant_id,
     )
     body = SearchResponse(
-        matches=[
-            ItemMatch(
-                item_id=row["item_key"],
-                item_name=row["item_name"],
-                restaurant_id=row["restaurant_id"],
-                restaurant_name=row["restaurant_name"],
-                category_name=row["category_name"],
-                price=float(row["base_price"]),
-                dietary_tags=list(row["dietary_tags"]),
-                similarity_score=round(float(row["score"]), 3),
-            )
-            for row in items
-        ],
-        restaurants=[
-            RestaurantMatch(
-                restaurant_id=row["restaurant_id"],
-                name=row["name"],
-                address=row["address"],
-                similarity_score=round(float(row["score"]), 3),
-            )
-            for row in restaurants
-        ],
+        matches=[ItemMatch.from_row(row) for row in items],
+        restaurants=[RestaurantMatch(**RestaurantMatch.row_fields(row)) for row in restaurants],
     )
     count = len(body.matches)
     return ok(body, message=f"Retrieved {count} matching item{'' if count == 1 else 's'}")

@@ -4,7 +4,7 @@ Implements §2 ("Week 4 Requirements: Data Preparation & Retrieval Layer") of
 [smartfoodops-week4-5-requirements.md](docs/smartfoodops-week4-5-requirements.md): a vector
 store, an ingestion pipeline, hybrid semantic search, and a multi-source RAG context assembler.
 
-**Status:** Phases 1 to 4 are implemented and verified. Phases 5 and 6 are planned.
+**Status:** Phases 1 to 5 are implemented and verified. Phase 6 is planned.
 
 Decision numbers D59 to D62 are cited in code comments already; the entries themselves are
 written in Phase 6 under a new `## Week 4 — semantic retrieval (AI layer)` section of
@@ -52,7 +52,7 @@ Cross-cutting rules that apply to every phase:
 | 2 | Source-data changes in menu, restaurant, rider, analytics | Done |
 | 3 | Ingestion pipeline | Done |
 | 4 | `POST /api/v1/ai/search` | Done |
-| 5 | `POST /api/v1/ai/rag-context` | Planned |
+| 5 | `POST /api/v1/ai/rag-context` | Done |
 | 6 | Telemetry, tests, documentation | Planned |
 
 After each phase, stop and review before starting the next.
@@ -187,28 +187,54 @@ off-topic query still gets low-scoring matches. A minimum similarity threshold (
 `min_score` parameter) would let the assistant say "nothing matches" instead of presenting a
 poor match; it is not in the spec and not built.
 
-### Phase 5 — RAG context (planned): `POST /api/v1/ai/rag-context`
+### Phase 5 — RAG context (done): `POST /api/v1/ai/rag-context`
 
-`services/ai/rag_context.py` runs three sources concurrently, each with its own timeout:
-1. **Vector:** top-K items and restaurants for `prompt_query` (reuses Phase 4).
-2. **Analytics:** the customer summary (favourite vendors).
-3. **Riders:** available-rider count and nearest distance around each candidate restaurant, or
-   around the caller's `latitude`/`longitude` when supplied.
+[services/ai/rag_context.py](../services/ai/rag_context.py) gathers three sources, each under its own
+time budget (`config.RAG_*_TIMEOUT_SECONDS`):
+1. **Vector:** top-K items and restaurants for `prompt_query`, constrained by optional
+   `max_price` and `dietary_filters` (the same search as Phase 4, plus restaurant coordinates).
+2. **Analytics:** the customer summary from Phase 2, with restaurant names resolved from the
+   vector store (the projection keeps only ids).
+3. **Courier:** available-rider count and nearest distance around each candidate restaurant, from
+   the rider internal route (capped at 5 lookups).
 
-Returns `{query, items[], restaurants[], customer_profile{}, courier_availability[],
-sources_failed[]}`.
+Vector and analytics run concurrently. Courier depends on the vector result (it needs the
+candidates' coordinates), so it runs after, with one lookup per restaurant in parallel.
 
-- **Partial failure degrades:** a source that times out is listed in `sources_failed` instead of
-  failing the call, so Week 5 can say "courier data unavailable" rather than invent it.
-- **Ownership:** `customer_id` must be the caller unless the caller is an admin
-  (`require_self_or_admin`).
-- **Location:** optional `latitude`/`longitude` extend the spec's request body, which has no
-  location. Record this in D62.
-- RBAC: new `ai:rag_context` permission granted to `customer`.
+- **Request:** `customer_id`, `prompt_query`, optional `latitude`/`longitude` (both or neither),
+  `top_k`, `max_price`, `dietary_filters`. The location fields extend the spec's body: a
+  `customer_id` alone has nothing to measure "near me" from.
+- **Response:** `query`, `items[]`, `restaurants[]` (with `distance_km`), `customer_profile`,
+  `courier_availability[]`, and `sources_failed[]`.
+- **Partial failure degrades.** A source that errors or runs out of time is named in
+  `sources_failed` and contributes nothing; the call still returns 200 with everything else. This
+  is deliberate: a source silently missing would read to the model as "no riders", a claim the
+  response cannot make. If the vector source fails there is nothing to anchor courier lookups on,
+  so `courier` is reported failed too.
+- **Ordering:** relevance picks the candidates; proximity only orders them. With a location,
+  restaurants are sorted nearest-first among the semantic top-K, not re-ranked across the index.
+- **Ownership:** `customer_id` must be the caller's own (`require_self_or_admin`), because the
+  response carries that customer's order history. An admin may ask for anyone's.
+- **RBAC:** new `ai:rag_context` permission granted to `customer`, a route row, and
+  `require_permission` in the handler; added to `init.sql` and the same idempotent
+  [add_ai_permissions.sql](../db/user/add_ai_permissions.sql), already applied. The smoke
+  assertion on policy counts is now 12|23|17|8.
+- **Courier privacy:** the rider route returns counts and a distance only, never a rider id or
+  position, because the result ends up in an LLM prompt.
 
-Exit check: a customer with delivered orders sees their top restaurant; a rider near a
-restaurant shows `available_riders >= 1`; stopping analytics returns 200 with
-`sources_failed: ["analytics"]`; another customer's id returns 403.
+Verified on the running stack:
+- A customer with history gets their order counts, a favourite restaurant resolved to its name
+  (3 delivered orders ranks above 1), restaurants nearest-first, and 34 available riders around
+  each candidate; a customer with no history gets zeros and an empty list.
+- No token is 401; a rider and a restaurant_admin are 403; someone else's `customer_id` is 403;
+  an admin may ask for another customer; a latitude without a longitude, or an unknown tag, is 422.
+- With the analytics service stopped: 200, `sources_failed: ["analytics"]`, items and courier
+  data intact. With the rider service stopped: 200, `sources_failed: ["courier"]`, profile intact.
+- `--fast` smoke passed.
+
+Limits worth knowing: favourite *dishes* are not derivable (the projection has no line items), and
+the analytics history here was seeded directly into the projection for the test, since the earlier
+smoke customers' accounts no longer exist. Phase 6's smoke section will drive a real delivered order.
 
 ### Phase 6 — Telemetry, tests, documentation (planned)
 

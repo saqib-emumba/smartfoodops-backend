@@ -89,7 +89,8 @@ INSERT INTO permissions (name, description) VALUES
 ('kitchen:decide',     'Accept or reject an order on behalf of a restaurant'),
 ('rider:profile',      'Join the fleet and maintain own rider profile, location, availability'),
 ('delivery:report',    'Report pickup and delivery of an assigned order'),
-('ai:search',          'Semantic search over dishes and restaurants (Week 4, D59)')
+('ai:search',          'Semantic search over dishes and restaurants (Week 4, D59)'),
+('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)')
 ON CONFLICT (name) DO NOTHING;
 
 -- 1e. Role <-> permission grants. Composite PK for the same reason as user_roles (1c):
@@ -110,6 +111,7 @@ FROM (VALUES
     ('customer',         'payment:create'),
     ('customer',         'payment:read'),
     ('customer',         'ai:search'),
+    ('customer',         'ai:rag_context'),
     ('restaurant_admin', 'restaurant:onboard'),
     ('restaurant_admin', 'menu:write'),
     ('restaurant_admin', 'kitchen:read'),
@@ -175,7 +177,8 @@ FROM (VALUES
     ('PATCH', '/api/v1/riders/me/availability',            'rider:profile',      'Own availability'),
     ('POST',  '/api/v1/riders/me/orders/{order_id}/picked-up', 'delivery:report', 'Report pickup'),
     ('POST',  '/api/v1/riders/me/orders/{order_id}/delivered',  'delivery:report', 'Report delivery'),
-    ('POST',  '/api/v1/ai/search',                         'ai:search',          'Hybrid semantic search over dishes and restaurants')
+    ('POST',  '/api/v1/ai/search',                         'ai:search',          'Hybrid semantic search over dishes and restaurants'),
+    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler')
 ) AS route(method, path_pattern, permission_name, description)
 JOIN permissions p ON p.name = route.permission_name
 ON CONFLICT (method, path_pattern) DO NOTHING;

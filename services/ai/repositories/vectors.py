@@ -66,17 +66,18 @@ class VectorRepository(Repository):
         items_sql = f"""
             SELECT d.item_key, d.item_name, d.restaurant_id, d.restaurant_name,
                    d.category_name, d.base_price, d.dietary_tags,
+                   r.latitude, r.longitude,
                    1 - (d.embedding <=> %(vector)s::vector) AS score
               FROM menu_item_documents d
+              JOIN restaurant_documents r
+                ON r.restaurant_id = d.restaurant_id AND r.is_active
              WHERE {item_where} {item_scope}
-               AND EXISTS (SELECT 1 FROM restaurant_documents r
-                            WHERE r.restaurant_id = d.restaurant_id AND r.is_active)
              ORDER BY d.embedding <=> %(vector)s::vector
              LIMIT %(top_k)s
         """
         match_where, _ = _item_predicates("m", max_price=max_price, tags=tags)
         restaurants_sql = f"""
-            SELECT r.restaurant_id, r.name, r.address,
+            SELECT r.restaurant_id, r.name, r.address, r.latitude, r.longitude,
                    1 - (r.embedding <=> %(vector)s::vector) AS score
               FROM restaurant_documents r
              WHERE r.is_active {restaurant_scope}
@@ -93,3 +94,18 @@ class VectorRepository(Repository):
             cur.execute(restaurants_sql, params)
             restaurants = [dict(row) for row in cur.fetchall()]
         return items, restaurants
+
+    def restaurant_names(self, restaurant_ids: list[str]) -> dict[str, dict]:
+        """`{restaurant_id: {name, is_active}}` for whichever of these are indexed.
+
+        Used to put names on the analytics service's favourite-restaurant ids: the projection
+        keeps only ids, and the vector store is where this service already holds names.
+        """
+        if not restaurant_ids:
+            return {}
+        rows = self.all(
+            "SELECT restaurant_id, name, is_active FROM restaurant_documents"
+            " WHERE restaurant_id = ANY(%(ids)s::uuid[])",
+            {"ids": restaurant_ids},
+        )
+        return {str(row["restaurant_id"]): {"name": row["name"], "is_active": row["is_active"]} for row in rows}

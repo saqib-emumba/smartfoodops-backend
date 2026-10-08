@@ -39,12 +39,36 @@ class ItemMatch(BaseModel):
     dietary_tags: List[str]
     similarity_score: float
 
+    @classmethod
+    def from_row(cls, row: dict) -> "ItemMatch":
+        """Build from a `VectorRepository.search` item row (shared with the RAG assembler)."""
+        return cls(
+            item_id=row["item_key"],
+            item_name=row["item_name"],
+            restaurant_id=row["restaurant_id"],
+            restaurant_name=row["restaurant_name"],
+            category_name=row["category_name"],
+            price=float(row["base_price"]),
+            dietary_tags=list(row["dietary_tags"]),
+            similarity_score=round(float(row["score"]), 3),
+        )
+
 
 class RestaurantMatch(BaseModel):
     restaurant_id: UUID
     name: str
     address: Optional[str] = None
     similarity_score: float
+
+    @classmethod
+    def row_fields(cls, row: dict) -> dict:
+        """The constructor arguments for a `VectorRepository.search` restaurant row."""
+        return {
+            "restaurant_id": row["restaurant_id"],
+            "name": row["name"],
+            "address": row["address"],
+            "similarity_score": round(float(row["score"]), 3),
+        }
 
 
 class SearchResponse(BaseModel):

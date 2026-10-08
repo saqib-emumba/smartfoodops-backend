@@ -16,7 +16,7 @@ from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from ai import deps
-from ai.apis import health, search
+from ai.apis import health, rag, search
 
 @asynccontextmanager
 async def _vector_lifespan(_: FastAPI):
@@ -35,6 +35,7 @@ instrument_app(app, deps.SERVICE_NAME)
 
 app.include_router(health.router)
 app.include_router(search.router)
+app.include_router(rag.router)
 
 
 if __name__ == "__main__":
