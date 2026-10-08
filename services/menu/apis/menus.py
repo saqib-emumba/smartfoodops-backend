@@ -10,11 +10,17 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from pydantic import ValidationError
 
-from common.auth import CurrentUser, get_current_user, require_permission
+from common.auth import CurrentUser, get_current_user, require_internal, require_permission
 from common.errors import forbidden, not_found
+from common.events.topics import MENU_EVENTS_TOPIC
 from common.responses import Envelope, ok
 from menu import deps
-from menu.schemas.menus import MenuResponse, MenuUpsertRequest
+from menu.schemas.menus import (
+    InternalMenuResponse,
+    MenuResponse,
+    MenuUpsertRequest,
+    PublishedMenuRef,
+)
 
 router = APIRouter(prefix="/api/v1/menus")
 
@@ -51,7 +57,74 @@ async def upsert_menu(
     # concurrent reader repopulate the cache from the old row and leave the stale copy
     # behind the write that was supposed to replace it.
     deps.cache.invalidate(payload.restaurant_id)
+    await _announce_published(payload.restaurant_id, row)
     return ok(_as_response(row), message="Menu published")
+
+
+async def _announce_published(restaurant_id: UUID, row: dict) -> None:
+    """Tell the AI Service's ingestion worker this restaurant's menu changed (D61).
+
+    After the commit and the cache invalidation, and swallowing every failure: the owner's
+    publish has already succeeded and must not turn into a 5xx because a broker was down.
+    The event is a hint to re-read, not the data, so a lost one costs freshness only — the
+    worker's startup backfill closes the gap.
+    """
+    try:
+        items_count = sum(len(category["items"]) for category in row["categories"])
+        await deps.kafka.publish(
+            MENU_EVENTS_TOPIC,
+            aggregate_type="menu",
+            aggregate_id=str(restaurant_id),
+            event_type="menu.published",
+            payload={
+                "restaurant_id": str(restaurant_id),
+                "published_at": row["updated_at"].isoformat(),
+                "items_count": items_count,
+            },
+            event_key=row["updated_at"].isoformat(),
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring: a publish must not fail on Kafka
+        deps.logger.warning("menu.published for %s was not announced: %s", restaurant_id, exc)
+
+
+@router.get(
+    "/internal/restaurant-ids",
+    response_model=Envelope[list[PublishedMenuRef]],
+    dependencies=[Depends(require_internal)],
+)
+def list_published_menus() -> Envelope[list[PublishedMenuRef]]:
+    """Every restaurant with a published menu — what the AI Service's backfill walks.
+
+    Internal-key only, and unreachable through the gateway: it has no `route_permissions` row,
+    so the gateway refuses it (D57) however privileged the bearer token.
+    """
+    rows = deps.menus.list_published()
+    return ok([PublishedMenuRef(**row) for row in rows], message="Published menus")
+
+
+@router.get(
+    "/{restaurant_id}/internal",
+    response_model=Envelope[InternalMenuResponse],
+    dependencies=[Depends(require_internal)],
+)
+def get_menu_internally(restaurant_id: UUID) -> Envelope[InternalMenuResponse]:
+    """The menu with its version stamp, for the AI Service's ingestion worker.
+
+    Reads Postgres directly and never the cache: the cache holds the public `MenuResponse`
+    shape without `updated_at`, and an ingestion triggered by a publish must see that publish,
+    not a copy that may predate it.
+    """
+    row = deps.menus.find(restaurant_id)
+    if row is None:
+        raise not_found(f"No menu published for restaurant {restaurant_id}")
+    return ok(
+        InternalMenuResponse(
+            restaurant_id=row["restaurant_id"],
+            categories=row["categories"],
+            updated_at=row["updated_at"],
+        ),
+        message="Menu found",
+    )
 
 
 @router.get("/{restaurant_id}", response_model=Envelope[MenuResponse])

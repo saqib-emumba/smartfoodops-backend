@@ -578,6 +578,11 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description TEXT,
     base_price DECIMAL(10, 2) NOT NULL CHECK (base_price > 0),
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Owner-declared tags (Week 4, D60): diets, allergens, cuisines, formats, dish types and meal
+    -- styles, drawn from common/dietary.py's vocabulary and validated by the API, not here —
+    -- the list lives in code so the Menu and AI services share one definition. Never inferred:
+    -- an item with no tags matches no tag filter.
+    dietary_tags TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -1326,6 +1331,10 @@ services:
       # this service starts and serves with Redis down — just without the shortcut.
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      # menu.published (Week 4, D61). Deliberately no `depends_on: kafka`: publishing a menu
+      # never waits on the broker — the announce is best-effort and a failure is only logged.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-menu-postgres:
         condition: service_healthy
@@ -1419,9 +1428,10 @@ services:
       - smartfoodops-network
 
   # --- 3b. ANALYTICS (Week 3, D40) ---
-  # A Kafka read-model, not a request-path service — no sibling calls, no JWT keys (the
-  # first service in the platform that needs none: it never verifies a token, because
-  # nothing it serves is user-facing). No `depends_on: kafka`, matching order-service's
+  # A Kafka read-model, not a request-path service — no sibling calls, and it verifies no
+  # user token (nothing it serves is user-facing). It does hold the shared internal key since
+  # Week 4 (D62): the AI Service reads customer history over an internal route, and importing
+  # `common.auth` for `require_internal` also requires the public key to be set. No `depends_on: kafka`, matching order-service's
   # and payment-service's own comment: the consumer's reconnect loop is what handles Kafka
   # not being ready yet.
   analytics-service:
@@ -1431,7 +1441,7 @@ services:
     container_name: sfo-analytics-service
     restart: always
     environment:
-      <<: *analytics-db-env
+      <<: [*analytics-db-env, *jwt-env]
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
@@ -1704,6 +1714,9 @@ create_topic() {
 
 create_topic "sfo.order.events.v1"
 create_topic "sfo.order.events.v1.dlq"
+# Week 4 (D61): the menu's own topic, keyed by restaurant_id.
+create_topic "sfo.menu.events.v1"
+create_topic "sfo.menu.events.v1.dlq"
 
 echo "topics ready"
 EOF

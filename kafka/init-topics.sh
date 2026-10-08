@@ -26,5 +26,8 @@ create_topic() {
 
 create_topic "sfo.order.events.v1"
 create_topic "sfo.order.events.v1.dlq"
+# Week 4 (D61): the menu's own topic, keyed by restaurant_id.
+create_topic "sfo.menu.events.v1"
+create_topic "sfo.menu.events.v1.dlq"
 
 echo "topics ready"

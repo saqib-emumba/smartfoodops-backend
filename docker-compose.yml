@@ -508,6 +508,10 @@ services:
       # this service starts and serves with Redis down — just without the shortcut.
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      # menu.published (Week 4, D61). Deliberately no `depends_on: kafka`: publishing a menu
+      # never waits on the broker — the announce is best-effort and a failure is only logged.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-menu-postgres:
         condition: service_healthy
@@ -601,9 +605,10 @@ services:
       - smartfoodops-network
 
   # --- 3b. ANALYTICS (Week 3, D40) ---
-  # A Kafka read-model, not a request-path service — no sibling calls, no JWT keys (the
-  # first service in the platform that needs none: it never verifies a token, because
-  # nothing it serves is user-facing). No `depends_on: kafka`, matching order-service's
+  # A Kafka read-model, not a request-path service — no sibling calls, and it verifies no
+  # user token (nothing it serves is user-facing). It does hold the shared internal key since
+  # Week 4 (D62): the AI Service reads customer history over an internal route, and importing
+  # `common.auth` for `require_internal` also requires the public key to be set. No `depends_on: kafka`, matching order-service's
   # and payment-service's own comment: the consumer's reconnect loop is what handles Kafka
   # not being ready yet.
   analytics-service:
@@ -613,7 +618,7 @@ services:
     container_name: sfo-analytics-service
     restart: always
     environment:
-      <<: *analytics-db-env
+      <<: [*analytics-db-env, *jwt-env]
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
