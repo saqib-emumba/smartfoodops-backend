@@ -1030,6 +1030,9 @@ if have_container sfo-payment-service; then
     "$([[ "$BODY" == *"not authorised"* ]] && echo yes)" "yes"
 
   docker start sfo-payment-service >/dev/null 2>&1
+  # The restarted container may come back on a new IP; nginx resolves `payment-service` once
+  # at start, so without this the gateway keeps answering 502 for payments.
+  docker restart sfo-api-gateway >/dev/null 2>&1
   for _ in $(seq 1 30); do
     [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/payments/health")" == "200" ]] && break
     sleep 2
@@ -1246,11 +1249,17 @@ if have_container sfo-payment-service; then
     "" "${OWNER_AUTH[@]}"
   assert "  decision recorded as rejected" "$(jfield "['decision']")" "rejected"
 
-  # COMPENSATION_POLICY: initial_interval=2s, backoff x2, 5 attempts -> ~30s of retries
-  # before the activity gives up; allow a wide margin for scheduling overhead.
-  poll_status "$CF_ORDER" compensation_failed 90 "${CUST_AUTH[@]}"
+  # COMPENSATION_POLICY: initial_interval=2s, backoff x2, maximum_interval=60s, 10 attempts
+  # -> waits of 2+4+8+16+32+60+60+60+60 = ~302s before the activity gives up. Keep this
+  # window in step with services/orchestrator/utils/policies.py: payment-service is restarted
+  # right after this poll, so a window shorter than the retry budget lets the refund succeed
+  # and the order ends 'cancelled' instead.
+  poll_status "$CF_ORDER" compensation_failed 360 "${CUST_AUTH[@]}"
 
   docker start sfo-payment-service >/dev/null 2>&1
+  # The restarted container may come back on a new IP; nginx resolves `payment-service` once
+  # at start, so without this the gateway keeps answering 502 for payments.
+  docker restart sfo-api-gateway >/dev/null 2>&1
   for _ in $(seq 1 30); do
     [[ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$BASE_URL/api/v1/payments/health")" == "200" ]] && break
     sleep 2
