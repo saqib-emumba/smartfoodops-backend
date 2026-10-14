@@ -250,6 +250,10 @@
     {
       "key": "cap1_order_id",
       "value": ""
+    },
+    {
+      "key": "ai_rest_id",
+      "value": ""
     }
   ],
   "item": [
@@ -1824,7 +1828,7 @@
             "url": "{{base_url}}/api/v1/menus",
             "body": {
               "mode": "raw",
-              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Mains\",\"display_order\":1,\"items\":[{\"item_id\":\"burger\",\"name\":\"Burger\",\"description\":\"Beef burger\",\"base_price\":10.00,\"is_available\":true,\"dietary_tags\":[\"american\",\"burger\"],\"customization_groups\":[{\"group_id\":\"cheese\",\"group_name\":\"Cheese\",\"min_selection\":1,\"max_selection\":1,\"options\":[{\"name\":\"cheddar\",\"extra_price\":1.50},{\"name\":\"none\",\"extra_price\":0.0}]},{\"group_id\":\"extras\",\"group_name\":\"Extras\",\"min_selection\":0,\"max_selection\":2,\"options\":[{\"name\":\"bacon\",\"extra_price\":2.00},{\"name\":\"egg\",\"extra_price\":1.00}]}]},{\"item_id\":\"soldout\",\"name\":\"Sold Out Dish\",\"description\":\"Unavailable\",\"base_price\":5.00,\"is_available\":false}]}]}",
               "options": {
                 "raw": {
                   "language": "json"
@@ -5132,6 +5136,832 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "4142e5d1-79e0-422a-a54d-f11897562de1",
+      "name": "10. AI Retrieval (Week 4)",
+      "description": "Semantic search and RAG context (D59-D62). Depends on folders 2-4 (tokens, an owner) and 6-8 (a delivered order gives the customer history). Ingestion is asynchronous, so the first search waits briefly. The race-prone and container-stopping cases (a failing analytics or rider service, the dead-letter queue) live in scripts/smoke-test.sh only.",
+      "item": [
+        {
+          "id": "d00be51f-e9d5-4ea7-9686-2cc532d5912b",
+          "name": "Onboard a restaurant for the AI tests",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/onboard",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"AI Test Kitchen\",\"address\":\"7 Vector Lane\",\"latitude\":33.7,\"longitude\":73.0,\"capacity\":20}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.collectionVariables.set(\"ai_rest_id\", pm.response.json().body.id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "0e362100-98c8-43ce-a906-edec648b2495",
+          "name": "Publish a menu with dietary tags",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Menu\",\"display_order\":1,\"items\":[{\"item_id\":\"karahi\",\"name\":\"Zesty Chicken Karahi\",\"description\":\"Spicy wok cooked chicken with tomatoes and green chillies\",\"base_price\":12.5,\"is_available\":true,\"dietary_tags\":[\"Halal\",\"pakistani\",\"spicy\",\"halal\"]},{\"item_id\":\"salad\",\"name\":\"Garden Quinoa Salad\",\"description\":\"Light crisp salad with quinoa, cucumber and lemon\",\"base_price\":8.0,\"is_available\":true,\"dietary_tags\":[\"vegan\",\"light-meal\"]},{\"item_id\":\"lassi\",\"name\":\"Sweet Mango Lassi\",\"description\":\"Cold sweet yogurt drink\",\"base_price\":4.0,\"is_available\":true,\"dietary_tags\":[\"pakistani\"]},{\"item_id\":\"biryani\",\"name\":\"Sold Out Biryani\",\"description\":\"Fragrant spiced rice\",\"base_price\":9.0,\"is_available\":false,\"dietary_tags\":[\"halal\",\"biryani\"]},{\"item_id\":\"wagyu\",\"name\":\"Wagyu Steak\",\"description\":\"Grilled wagyu beef steak\",\"base_price\":40.0,\"is_available\":true,\"dietary_tags\":[\"steak\"]}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Tags come from a fixed vocabulary (common/dietary.py) and are normalized on publish. The Menu Service announces the publish on Kafka and the AI Service's ingestion worker indexes it within a second or so."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"tags are normalized (case, duplicates, first-seen order)\", () => pm.expect(b.categories[0].items[0].dietary_tags).to.eql([\"halal\",\"pakistani\",\"spicy\"]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "20f41d93-b7b2-4312-819e-bf20fde47213",
+          "name": "An unknown dietary tag is refused -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/menus",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Menu\",\"display_order\":1,\"items\":[{\"item_id\":\"x\",\"name\":\"X\",\"description\":\"x\",\"base_price\":5,\"is_available\":true,\"dietary_tags\":[\"street food\"]}]}]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4dc4d1bc-a06f-4686-9af1-a589b93de020",
+          "name": "Search finds a dish by meaning",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"a spicy chicken dish\",\"restaurant_id\":\"{{ai_rest_id}}\",\"top_k\":3}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Ingestion is asynchronous (Kafka), so the pre-request script waits a couple of seconds after the publish before searching."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Give the ingestion worker time to index the menu published just before this request.",
+                  "setTimeout(function () {}, 2500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"the closest match is the karahi\", () => pm.expect(b.matches[0].item_name).to.eql(\"Zesty Chicken Karahi\"));",
+                  "const b = pm.response.json().body; pm.test(\"each match carries a price, tags and a similarity score\", () => pm.expect(b.matches[0]).to.include.all.keys(\"price\",\"dietary_tags\",\"similarity_score\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "cdfdf45d-cab8-479b-a0a3-ffd316120786",
+          "name": "max_price is a hard constraint",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"something to eat\",\"restaurant_id\":\"{{ai_rest_id}}\",\"max_price\":15,\"top_k\":10}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"nothing above the price is returned\", () => pm.expect(b.matches.every(m => m.price <= 15)).to.eql(true));",
+                  "const b = pm.response.json().body; pm.test(\"the expensive steak is excluded\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Wagyu Steak\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "53d915ce-0540-4c08-a7b5-3233692aba2d",
+          "name": "A dietary filter keeps only matching dishes",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"something to eat\",\"restaurant_id\":\"{{ai_rest_id}}\",\"dietary_filters\":[\"vegan\"],\"top_k\":10}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"only the vegan dish remains\", () => pm.expect(b.matches.map(m => m.item_name)).to.eql([\"Garden Quinoa Salad\"]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ee192837-a7b6-41fc-ae95-178942cad66e",
+          "name": "An unavailable dish is never returned",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"fragrant spiced biryani rice\",\"restaurant_id\":\"{{ai_rest_id}}\",\"top_k\":10}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"the sold-out biryani is absent\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Sold Out Biryani\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "41e85f82-90c1-43e1-93dc-405fa691f2fd",
+          "name": "Filters that match nothing -> 200 with empty lists",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"anything\",\"restaurant_id\":\"{{ai_rest_id}}\",\"max_price\":0.5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"empty lists, not a 404\", () => pm.expect(b.matches).to.eql([]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "9b3abd5b-d9ad-433e-98bb-903873ad4650",
+          "name": "An unknown filter tag -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"pizza\",\"dietary_filters\":[\"street food\"]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "e703c6b8-d54b-4c6b-b395-9225f886e901",
+          "name": "A blank query -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"   \"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "11d9003e-1b7c-4730-9b3c-435e36925433",
+          "name": "Search without a token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"pizza\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "71fb17d6-5b51-4e71-8d09-a422a1996b61",
+          "name": "A rider cannot search -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"pizza\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "c87a49b8-8a4e-46cd-b8ce-995d1029aa21",
+          "name": "A restaurant admin cannot search -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"pizza\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "262b3035-a70b-48f8-a181-10041e63a4d1",
+          "name": "RAG context for the caller's own account",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{cust_id}}\",\"prompt_query\":\"Suggest lunch options available near me\",\"latitude\":33.68,\"longitude\":73.04,\"top_k\":4}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "Assembles dishes, restaurants, order history (Analytics Service) and courier availability (Rider Service). A source that cannot be read is named in sources_failed instead of failing the call."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"every source answered\", () => pm.expect(b.sources_failed).to.eql([]));",
+                  "const b = pm.response.json().body; pm.test(\"restaurants carry a distance, nearest first\", () => { const d = b.restaurants.map(r => r.distance_km); pm.expect(d).to.eql([...d].sort((a, c) => a - c)); });",
+                  "const b = pm.response.json().body; pm.test(\"courier availability was looked up\", () => pm.expect(b.courier_availability.length).to.be.above(0));",
+                  "const b = pm.response.json().body; pm.test(\"the customer profile is present\", () => pm.expect(b.customer_profile).to.include.all.keys(\"total_orders\",\"delivered_orders\",\"favourite_vendors\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5ef55f74-e3a8-469e-9777-c79a12259d7a",
+          "name": "Another customer's context -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{other_id}}\",\"prompt_query\":\"lunch\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "41fba1f9-9478-4f5a-b443-a2400adf35e2",
+          "name": "An admin may ask for any customer's context",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{other_id}}\",\"prompt_query\":\"lunch\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "1f8f9567-e371-464c-9dc6-d75ec548afa5",
+          "name": "A latitude without a longitude -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{cust_id}}\",\"prompt_query\":\"lunch\",\"latitude\":33.7}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "9b34eda1-df50-468c-b92c-723142b3e245",
+          "name": "A customer with no orders gets an empty history",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{other_id}}\",\"prompt_query\":\"something spicy\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"zero orders and no favourites\", () => { pm.expect(b.customer_profile.total_orders).to.eql(0); pm.expect(b.customer_profile.favourite_vendors).to.eql([]); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ffe77d85-b5fb-4062-8099-1f797f9ccd4f",
+          "name": "RAG context without a token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{cust_id}}\",\"prompt_query\":\"lunch\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "fb33249a-1b77-4374-a371-5843e96786a7",
+          "name": "A rider cannot ask for RAG context -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/rag-context",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customer_id\":\"{{cust_id}}\",\"prompt_query\":\"lunch\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
                 ]
               }

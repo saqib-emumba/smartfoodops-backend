@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 
-from common.auth import CurrentUser, get_current_user, require_permission
+from common.auth import CurrentUser, get_current_user, require_internal, require_permission
 from common.errors import not_found
 from common.responses import Envelope, ok
 from restaurant import deps
@@ -45,6 +45,21 @@ def get_restaurant(
     Any authenticated caller: customers browsing and the Order and Menu Services checking
     a restaurant all read the same non-sensitive record.
     """
+    row = deps.restaurants.find(restaurant_id)
+    if row is None:
+        raise not_found(f"Restaurant {restaurant_id} not found")
+    return ok(RestaurantResponse(**row), message="Restaurant found")
+
+
+@router.get(
+    "/{restaurant_id}/internal",
+    response_model=Envelope[RestaurantResponse],
+    dependencies=[Depends(require_internal)],
+)
+def get_restaurant_internally(restaurant_id: UUID) -> Envelope[RestaurantResponse]:
+    """The same record, for callers with no user behind them — the AI Service's ingestion
+    worker, which holds only the internal key (D15). Internal-key only, and with no
+    `route_permissions` row, so unreachable through the gateway."""
     row = deps.restaurants.find(restaurant_id)
     if row is None:
         raise not_found(f"Restaurant {restaurant_id} not found")

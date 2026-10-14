@@ -4,8 +4,8 @@ share, and W3C trace-context helpers for carrying a trace across the async bound
 
 Imported on demand only, never from `common/__init__.py` — `aiokafka` and `fastjsonschema`
 are not chassis dependencies (see `common/requirements.txt`'s "deliberately NOT here" list),
-only order, payment, analytics and notification install them. A service that never touches
-Kafka never imports this module and pays nothing for it.
+only order, payment, analytics, notification, menu and ai install them. A service that never
+touches Kafka never imports this module and pays nothing for it.
 """
 
 import asyncio
@@ -25,6 +25,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 
 from common.errors import service_unavailable
 from common.events.envelope import EventEnvelope
+from common.events.menu import EVENT_DATA_MODELS as MENU_EVENT_MODELS
 from common.events.order import EVENT_DATA_MODELS as ORDER_EVENT_MODELS
 from common.events.payment import EVENT_DATA_MODELS as PAYMENT_EVENT_MODELS
 
@@ -41,7 +42,11 @@ EVENT_ID_NAMESPACE = uuid.UUID("7e2f8c3d-4a5b-4c6d-9e0f-1a2b3c4d5e6f")
 def deterministic_event_id(aggregate_id: str, event_type: str) -> uuid.UUID:
     return uuid.uuid5(EVENT_ID_NAMESPACE, f"{aggregate_id}:{event_type}")
 
-_ALL_EVENT_MODELS: dict[str, tuple[type, int]] = {**ORDER_EVENT_MODELS, **PAYMENT_EVENT_MODELS}
+_ALL_EVENT_MODELS: dict[str, tuple[type, int]] = {
+    **ORDER_EVENT_MODELS,
+    **PAYMENT_EVENT_MODELS,
+    **MENU_EVENT_MODELS,
+}
 
 _propagator = TraceContextTextMapPropagator()
 
@@ -277,16 +282,29 @@ class KafkaGateway:
         event_type: str,
         payload: dict,
         event_version: int = 1,
+        event_key: str | None = None,
     ) -> None:
         """Validate and produce one event, blocking until the broker acks it.
 
         `event_id` is derived, never generated — see `deterministic_event_id` above — so a
         Temporal retry of the activity that calls this produces the identical event a
         consumer may have already seen, rather than a new one it double-counts.
+
+        `event_key` is for an event type that legitimately recurs per aggregate. The default
+        id is `(aggregate_id, event_type)`, which assumes each fires at most once — true of an
+        order's statuses, false of a menu, which its owner republishes. Left to the default, the
+        second `menu.published` for a restaurant would carry the first one's id and every
+        consumer would drop it as a duplicate. Passing a value that differs per occurrence (the
+        menu's `updated_at`) keeps ids distinct across publishes yet identical across a retry
+        of the same one.
         """
         self._schema_validator.validate(event_type, event_version, payload)
         envelope = {
-            "event_id": str(deterministic_event_id(aggregate_id, event_type)),
+            "event_id": str(
+                deterministic_event_id(
+                    aggregate_id, event_type if event_key is None else f"{event_type}:{event_key}"
+                )
+            ),
             "event_type": event_type,
             "event_version": event_version,
             "aggregate_type": aggregate_type,

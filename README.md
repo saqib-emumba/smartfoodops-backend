@@ -1,17 +1,20 @@
 # SmartFoodOps — Backend (Weeks 1–3)
 
-A containerised, eight-FastAPI-service food-ordering backend fronted by an Nginx API
+A containerised, nine-FastAPI-service food-ordering backend fronted by an Nginx API
 gateway, with the order lifecycle driven by a durable Temporal workflow that runs in its own
 deployable — the Orchestrator Service and its worker (D36), sharing neither image nor
 database with any other service. Since Week 3, every state change an order goes through is
 also published to Kafka through a transactional outbox (D39), read by an independent
 Analytics read-model and a Notification pipeline that dispatches simulated SMS/email over
 Celery — and the whole platform is traced end to end with OpenTelemetry into Jaeger, and
-scraped by Prometheus into Grafana dashboards. Everything runs locally through Docker
-Compose: seven PostgreSQL databases, Redis, the Temporal dev server, Kafka, Schema Registry,
-RabbitMQ, Jaeger, Prometheus, Grafana, the gateway, eight FastAPI services and four
-background workers (the saga worker, two notification processes and a one-shot topic-init
-job) — 27 containers in total.
+scraped by Prometheus into Grafana dashboards. Part B adds a semantic retrieval layer: an AI
+Service with its own pgvector database, an ingestion worker fed by a `menu.published` event,
+hybrid semantic search, and a multi-source RAG context for the Week 5 assistant (D59–D62).
+Everything runs locally through Docker Compose: eight PostgreSQL databases, Redis, the
+Temporal dev server, Kafka, Schema Registry, RabbitMQ, Jaeger, Prometheus, Grafana, the
+gateway, nine FastAPI services and five background workers (the saga worker, two
+notification processes, the AI ingestion worker and a one-shot topic-init job) — 31
+containers in total.
 
 ---
 
@@ -91,13 +94,15 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 |---|---|---|---|---|
 | `user-service` | 8001 | `roles`, `users`, and the RBAC policy (`permissions`, `role_permissions`, `route_permissions` — D57) | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
-| `menu-service` | 8003 | `menus` | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check) |
+| `menu-service` | 8003 | `menus` and its item tree, including each item's owner-declared `dietary_tags` (D60) | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check); publishes `menu.published` to Kafka (D61, best-effort) |
 | `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal (starts the saga, signals the kitchen's decision — D47) |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
-| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (records the pickup/delivery stage), Temporal (signals the saga — D47) |
+| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (records the pickup/delivery stage), Temporal (signals the saga — D47); answers the AI Service's courier-availability reads (D62) |
 | `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; health and `/metrics` alone since D47, and the gateway proxies just its `/health` |
 | `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
-| `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls, no JWT keys (D44) |
+| `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls (D44); since D62 it also serves an internal-key customer-history read, so it now holds the internal key |
+| `ai-service` | 8009 | the vector documents (`menu_item_documents`, `restaurant_documents`) | `sfo_vector_core` @ `sfo-vector-db` (5439, pgvector) | Analytics + Rider Services (internal routes, for RAG context); embeds queries with a local model (D59–D62) |
+| `ai-ingestion-worker` | — | the same vector database | `sfo_vector_core` (5439) | Kafka (`menu.published`), Menu + Restaurant Services (internal routes) — keeps the vectors in step with the menus (D61) |
 | `notification-consumer` | — | nothing — no database | — | Kafka (reads), User Service (resolves contact details, D45), RabbitMQ (enqueues) |
 | `notification-worker` | — | nothing — no database | — | RabbitMQ only — no sibling calls, no JWT keys |
 
@@ -262,6 +267,56 @@ checkout and the saga would not notice; only the outbox tables would grow unread
 
 Full reasoning: D38–D45 in [readme/key-decisions.md](readme/key-decisions.md).
 
+### The AI retrieval layer (Part B, Week 4)
+
+A menu publish becomes searchable vectors within a second or so:
+
+```
+owner publishes a menu ─▶ menu-service ─▶ menu.published (Kafka, best-effort)
+                                              │
+                    ai-ingestion-worker ◀─────┘  re-reads the menu + restaurant over internal routes,
+                          │                      chunks it, embeds it (local all-MiniLM-L6-v2, 384-dim)
+                          ▼
+              sfo_vector_core (pgvector, HNSW cosine)
+                          ▲
+   POST /api/v1/ai/search │ POST /api/v1/ai/rag-context  ◀── customer (via the gateway)
+                          └── RAG context also reads: Analytics (order history) + Rider (courier counts)
+```
+
+```bash
+# Hybrid search: meaning from the vector, hard constraints from SQL. Customers only (ai:search).
+curl -s -X POST http://localhost/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"something spicy and light","max_price":15,"dietary_filters":["halal"],"top_k":5}'
+
+# Everything an assistant needs to answer one question, grounded in three stores. The
+# customer_id must be your own (or you an admin); latitude/longitude are optional ("near me").
+curl -s -X POST http://localhost/api/v1/ai/rag-context -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' \
+  -d "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch near me\",\"latitude\":33.68,\"longitude\":73.04}"
+```
+
+- **Tags.** Menu items carry owner-declared `dietary_tags` from a fixed vocabulary of 40
+  (diets, religious, allergens, cuisines, formats, dish types, meal styles —
+  [services/common/dietary.py](services/common/dietary.py)); nothing is inferred. An unknown tag is a
+  `422` on publish and on search. A filter requires **every** tag asked for, so send one
+  cuisine per search. Allergen tags are the restaurant's claim, not a guarantee.
+- **Grounded by construction.** Search only returns available dishes of active restaurants, and a
+  RAG context that could not read a source (analytics, courier, vector) names it in
+  `sources_failed` and still returns the rest — silence would read to a model as "none".
+- **Embeddings.** The model is baked into the image, so the container needs no network and no key.
+  `EMBEDDING_PROVIDER=openai` (with `OPENAI_API_KEY`) switches to OpenAI; the vector columns are
+  `vector(384)`, so a different model means re-ingesting (`python -m ai.ingestion --backfill`
+  after truncating the document tables).
+- **Re-index everything:** `docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill`
+  (all current menus are skipped, so it is safe to re-run). The worker also does this at startup.
+- **Observability.** `sfo_ai_*` metrics (search/RAG latency and outcomes, RAG source failures,
+  documents indexed, ingestion events) are scraped from `ai-service:8009` and
+  `ai-ingestion-worker:9111` and shown on the *SmartFoodOps — AI Retrieval* Grafana dashboard.
+
+Full reasoning: D59–D62 in [readme/key-decisions.md](readme/key-decisions.md); the phased build in
+[readme/week4-ai-retrieval-plan.md](readme/week4-ai-retrieval-plan.md).
+
 ### References that cross a database boundary
 
 A foreign key cannot span two physical databases, so a column pointing at another service's
@@ -298,7 +353,7 @@ problem, not solving it.
 
 - Docker Desktop (Compose v2) — `docker compose version`
 - `curl` and `python3` for the smoke tests below
-- Ports free on the host: **80** (gateway), **5432–5438** (seven Postgres), **6379** (Redis),
+- Ports free on the host: **80** (gateway), **5432–5439** (eight Postgres), **6379** (Redis),
   **7233 / 8233 / 9233** (Temporal gRPC / UI / metrics), **16686 / 4317 / 4318** (Jaeger UI /
   OTLP gRPC / OTLP HTTP), **9090** (Prometheus), **3000** (Grafana), **9092** (Kafka),
   **8081** (Schema Registry), **5672 / 15672 / 15692** (RabbitMQ AMQP / management UI /
@@ -323,6 +378,7 @@ PAYMENT_POSTGRES_PASSWORD=<choose one>
 MENU_POSTGRES_PASSWORD=<choose one>
 RIDER_POSTGRES_PASSWORD=<choose one>
 ANALYTICS_POSTGRES_PASSWORD=<choose one>
+VECTOR_POSTGRES_PASSWORD=<choose one>
 
 REDIS_URL=redis://cache-redis:6379/0
 
@@ -372,8 +428,9 @@ service talks to which database.
 
 | Key | Required | Notes |
 |---|---|---|
-| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD`, `RIDER_POSTGRES_PASSWORD`, `ANALYTICS_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
+| `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD`, `RIDER_POSTGRES_PASSWORD`, `ANALYTICS_POSTGRES_PASSWORD`, `VECTOR_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
 | `GRAFANA_ADMIN_PASSWORD` | yes | Grafana's own admin login, not a database password |
+| `EMBEDDING_PROVIDER`, `OPENAI_API_KEY` | no | `local` (default) embeds in-container with no key; `openai` calls the API and needs the key. Compose passes both through (Week 4, D59) |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | yes | Celery's broker credentials (Week 3, D45) — required even though Kafka, not RabbitMQ, is the durable ledger |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
@@ -388,10 +445,10 @@ config **including passwords**, so redirect it rather than pasting the output an
 docker compose config | grep DATABASE_URL
 ```
 
-Seven DSNs must come back, each naming a different host and database.
+Eight DSNs must come back, each naming a different host and database.
 
 Host names like `db-user-postgres` are **Docker DNS names**, reachable only from inside the
-Compose network. From your host the same databases are `localhost:5432` through `:5438` —
+Compose network. From your host the same databases are `localhost:5432` through `:5439` —
 which is why the host-run section below builds `DATABASE_URL` by hand. The `*_SERVICE_URL`
 values have the same constraint.
 
@@ -415,7 +472,8 @@ First boot takes a few minutes while the Python images build. Each Postgres cont
 its own schema — [db/user/init.sql](db/user/init.sql),
 [db/restaurant/init.sql](db/restaurant/init.sql), [db/order/init.sql](db/order/init.sql),
 [db/payment/init.sql](db/payment/init.sql), [db/menu/init.sql](db/menu/init.sql),
-[db/rider/init.sql](db/rider/init.sql), [db/analytics/init.sql](db/analytics/init.sql) —
+[db/rider/init.sql](db/rider/init.sql), [db/analytics/init.sql](db/analytics/init.sql),
+[db/vector/init.sql](db/vector/init.sql) —
 automatically on the **first** boot of its volume. See
 [Resetting the databases](#resetting-the-databases) if you change one.
 
@@ -455,12 +513,12 @@ than intended.
 
 ```bash
 for p in /health /api/v1/users/health /api/v1/restaurants/health /api/v1/menus/health \
-         /api/v1/orders/health /api/v1/payments/health /api/v1/riders/health; do
+         /api/v1/orders/health /api/v1/payments/health /api/v1/riders/health /api/v1/ai/health; do
   printf '%-32s ' "$p"; curl -s -w ' [%{http_code}]\n' "http://localhost$p"
 done
 ```
 
-All seven must return `200`. The service health endpoints also report whether their backing
+All eight must return `200`. The service health endpoints also report whether their backing
 stores actually round-trip (`database_reachable`, `cache_reachable`, `temporal_reachable`) —
 a `200` with `"database_reachable": false` means the app is up but the DB is not.
 
@@ -484,14 +542,14 @@ Kafka consumer, the other a Celery worker); `docker compose ps` and
 
 ### Run the test suite
 
-[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all seven services through the gateway
+[scripts/smoke-test.sh](scripts/smoke-test.sh) drives all nine services through the gateway
 exactly as a client would — the full checkout chain, the whole order lifecycle, and every
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 456 assertions against http://localhost
+./scripts/smoke-test.sh            # 552 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 289 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 379 assertions, skips the saga sections and the policy-TTL wait
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
@@ -868,7 +926,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | Method | Path | Who may call it | Notes |
 |---|---|---|---|
 | `GET` | `/health` | anyone | Gateway only, does not touch services |
-| `GET` | `/api/v1/{users,restaurants,menus,orders,payments,riders}/health` | anyone | Per-service + backing store |
+| `GET` | `/api/v1/{users,restaurants,menus,orders,payments,riders,ai}/health` | anyone | Per-service + backing store |
 | `POST` | `/api/v1/users/register` | anyone | `201`; bcrypt hash, role resolved via DB |
 | `POST` | `/api/v1/users/login` | anyone | Access + refresh pair; one message for every failure |
 | `POST` | `/api/v1/users/refresh` | anyone holding a refresh token | Rotates: the presented token is consumed |
@@ -876,7 +934,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/users/{user_id}` | the subject, or `system_admin` | Joins `roles`, returns the role **name** |
 | `POST` | `/api/v1/restaurants/onboard` | `restaurant_admin` | `201`; owner taken from the token, verified over HTTP |
 | `GET` | `/api/v1/restaurants/{restaurant_id}` | any signed-in user | Exposes `is_active` to other services |
-| `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree |
+| `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree; items may carry `dietary_tags` (D60), and a successful publish is announced to the AI Service (D61) |
 | `GET` | `/api/v1/menus/{restaurant_id}` | any signed-in user | Used by the Order Service to price a cart |
 | `POST` | `/api/v1/orders` | `customer` | `201` new / `200` idempotent replay; customer taken from the token |
 | `GET` | `/api/v1/orders/{order_id}` | the order's customer, or `system_admin` | Exposes the recalculated `total_amount` to the Payment Service |
@@ -893,6 +951,8 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `PATCH` | `/api/v1/riders/me/availability` | `rider` | `409` while carrying an order |
 | `POST` | `/api/v1/riders/me/orders/{order_id}/picked-up` | the rider carrying it | `204`; signals the saga |
 | `POST` | `/api/v1/riders/me/orders/{order_id}/delivered` | the rider carrying it | `204`; signals the saga, which then releases the rider |
+| `POST` | `/api/v1/ai/search` | `customer` | Hybrid semantic search: nearest dishes and restaurants by meaning, with `max_price`, `dietary_filters` and availability as hard SQL constraints (D59). `200` with empty lists when nothing matches |
+| `POST` | `/api/v1/ai/rag-context` | `customer` for their own `customer_id` (or `system_admin`) | Dishes, restaurants, order history and courier availability in one call; a source that fails is named in `sources_failed`, never silently dropped (D62) |
 
 **Service-to-service only** (`X-Internal-Key`, never reachable with a user token — D26):
 
@@ -906,6 +966,10 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `POST` | `/api/v1/riders/dispatch` | worker | Claims the nearest rider; `{"assigned": false}` is a `200`, not an error |
 | `POST` | `/api/v1/riders/release` | worker | Compensation; releasing an unheld order is success |
 | `GET` | `/api/v1/users/{user_id}/internal` | Notification Consumer | Resolves `phone`/`email` for a Kafka consumer with no user token to forward (Week 3, D45) |
+| `GET` | `/api/v1/menus/{restaurant_id}/internal`, `/api/v1/menus/internal/restaurant-ids` | AI ingestion worker | The menu with its `updated_at` version stamp (never the cache), and every restaurant that has a menu (D61) |
+| `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | AI ingestion worker | The restaurant record, for a caller with no user |
+| `POST` | `/api/v1/riders/internal/nearby` | AI Service | Available-rider count and nearest distance around a point — aggregates only, never a rider id or position (D62) |
+| `GET` | `/api/v1/analytics/internal/customers/{customer_id}/summary` | AI Service | Order counts and favourite restaurants; zeros for a customer with no history (D62). Not routed by the gateway |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -918,7 +982,7 @@ Interactive docs per service, once you expose a port (see below): `http://localh
 | `403` | Authenticated, but not allowed: the caller's roles don't carry the permission the route demands (refused **at the gateway**, D57), a path with no policy row (fail-closed), or someone else's user / order / payment (refused by the service). Also what a downstream refusal becomes when identity headers are rejected |
 | `404` | Unknown restaurant / menu / order / payment; inactive restaurant. **Not** an unknown user id — that is a `403`, since the ownership check runs before the lookup and must not reveal which ids exist |
 | `409` | Duplicate email (case-insensitive) or phone; an order that already has a payment |
-| `422` | Pydantic validation; `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown restaurant; payment naming an unknown order or not settling it exactly |
+| `422` | Pydantic validation (including an unknown dietary tag on a menu publish or a search filter); `min_selection > max_selection`; unavailable or off-menu item; total mismatch; order naming an unknown restaurant; payment naming an unknown order or not settling it exactly |
 | `500` | Postgres connection pool starved |
 | `502` | Unexpected response from an upstream service |
 | `503` | Upstream service unreachable |
@@ -1105,10 +1169,17 @@ docker exec -it sfo-analytics-db psql -U sfo_analytics_admin -d sfo_analytics_co
 #   SELECT event_type, count(*) FROM processed_events GROUP BY event_type;
 #   -- if this database were dropped entirely, resetting the "analytics" consumer group's
 #   -- Kafka offset and replaying the topic would rebuild both tables exactly.
+
+# Vector database — the AI Service's embeddings of the menus (Week 4, D59). Derived state:
+# dropping it loses nothing a menu publish or `--backfill` cannot rebuild.
+docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core
+#   SELECT restaurant_name, item_name, base_price, dietary_tags FROM menu_item_documents LIMIT 5;
+#   SELECT vector_dims(embedding), embedding_model, count(*) FROM menu_item_documents GROUP BY 1, 2;
+#   \di *embedding*          -- the two HNSW indexes
 ```
 
 `psql` inside the container needs no password (local trust); from a GUI client on your host,
-connect to `localhost:5432` through `:5438` with the matching role and `.env` password.
+connect to `localhost:5432` through `:5439` with the matching role and `.env` password.
 
 Joining across services is deliberately impossible now. To follow an order to its customer,
 read `customer_id` and call `GET /api/v1/users/{id}` — the same path the services take.
@@ -1121,7 +1192,7 @@ A schema file runs **only** when its own Postgres volume is empty. After editing
 docker compose down -v && docker compose up --build -d
 ```
 
-This wipes all seven Postgres volumes plus Redis, Kafka and Grafana's own storage. To reset
+This wipes all eight Postgres volumes plus Redis, Kafka and Grafana's own storage. To reset
 a single database, target its volume — the others keep their data:
 
 ```bash
@@ -1139,6 +1210,19 @@ docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add
 
 That one needs `roles.id` to already be `uuid` and says so if it isn't — a user database
 created before that change has to be reset with the single-volume recipe above instead.
+
+Week 4 added two more of the same kind, both idempotent, to run once against an existing
+volume (a fresh volume gets them from `init.sql`):
+
+```bash
+# the `dietary_tags` column on menu items (D60) — run BEFORE the new menu-service build
+docker exec -i sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core < db/menu/add_dietary_tags.sql
+# the `ai:search` / `ai:rag_context` permissions, grants and routes (D59, D62); live within 30s
+docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_ai_permissions.sql
+```
+
+The new `kafka/init-topics.sh` topics (`sfo.menu.events.v1` and its DLQ) are created by the
+one-shot `kafka-init` container: on an existing broker, `docker compose run --rm kafka-init`.
 
 ### Adding a dependency
 
@@ -1168,13 +1252,16 @@ smartfoodops-backend/
 │   ├── user/init.sql          # roles (+ seed data), users, user_roles, permissions, role_permissions,
 │   │                          #   route_permissions (the RBAC policy, D57)
 │   ├── user/add_rbac_permissions.sql  # hand-run migration for an already-initialised user DB
+│   ├── user/add_ai_permissions.sql    # hand-run: ai:search / ai:rag_context (Week 4)
 │   ├── restaurant/init.sql    # restaurants
 │   ├── menu/init.sql          # menus (category tree as JSONB)
+│   ├── menu/add_dietary_tags.sql  # hand-run: menu_items.dietary_tags (Week 4, D60)
 │   ├── order/init.sql         # order_status enum, orders (+ outbox + rider report columns,
 │   │                          #   Week 3), order_tracking_logs, order_outbox
 │   ├── payment/init.sql       # payment_status enum, payments, payment_outbox
 │   ├── rider/init.sql         # riders
-│   └── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
+│   ├── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
+│   └── vector/init.sql        # pgvector: menu_item_documents, restaurant_documents (HNSW) — Week 4
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
 │   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_permission, require_self_or_admin
@@ -1236,9 +1323,13 @@ smartfoodops-backend/
 │   │                            #   repositories/projections.py
 │   │                            #   A pure Kafka read-model, its own database, no sibling
 │   │                            #   calls, no JWT keys (Week 3, D44)               (:8008)
-│   └── notification/            # worker.py (Celery app + tasks), consumer.py (the
-│                                 #   Kafka-to-Celery bridge), tasks.py, clients/user.py
-│                                 #   Two containers, one image (Week 3, D45) — see below
+│   ├── notification/            # worker.py (Celery app + tasks), consumer.py (the
+│   │                            #   Kafka-to-Celery bridge), tasks.py, clients/user.py
+│   │                            #   Two containers, one image (Week 3, D45) — see below
+│   └── ai/                      # main.py, deps.py, ingestion.py (the worker), chunking.py,
+│                                #   embeddings.py, rag_context.py, apis/{search,rag,health}.py,
+│                                #   repositories/{vectors,documents}.py, clients/
+│                                #   Two containers, one image (Week 4, D59-D62)     (:8009)
 ├── scripts/
 │   ├── smoke-test.sh           # End-to-end assertions across the whole stack
 │   ├── saga-resilience-test.sh # Concurrency, durability and lost-signal recovery

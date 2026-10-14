@@ -6,6 +6,12 @@ topic-partition and every consumer here depends on seeing one order's events in 
 ORDER_EVENTS_TOPIC = "sfo.order.events.v1"
 ORDER_EVENTS_DLQ_TOPIC = "sfo.order.events.v1.dlq"
 
+# Menu publishes (Week 4, D61). A separate topic from the order aggregate's: a menu event has a
+# different key (`restaurant_id`), a different producer and different consumers, and nothing
+# about order ordering depends on it.
+MENU_EVENTS_TOPIC = "sfo.menu.events.v1"
+MENU_EVENTS_DLQ_TOPIC = "sfo.menu.events.v1.dlq"
+
 # 3 partitions: enough for a consumer group of up to 3 without ever breaking per-order
 # ordering (replication 1 is the ceiling on a single-broker dev cluster).
 PARTITION_COUNT = 3

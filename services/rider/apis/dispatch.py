@@ -15,6 +15,8 @@ from rider.eta import eta_minutes
 from rider.schemas.riders import (
     DispatchRequest,
     DispatchResponse,
+    NearbyRequest,
+    NearbyResponse,
     ReleaseRequest,
     ReleaseResponse,
 )
@@ -83,6 +85,32 @@ def dispatch_rider(payload: DispatchRequest) -> Envelope[DispatchResponse]:
             eta_minutes=eta_minutes(distance),
         ),
         message="Rider assigned",
+    )
+
+
+@router.post("/internal/nearby", response_model=Envelope[NearbyResponse])
+def nearby_riders(payload: NearbyRequest) -> Envelope[NearbyResponse]:
+    """How many riders are free around a point — the AI Service's courier-availability read.
+
+    Same two steps as `dispatch` (Redis for who is near, Postgres for who is free), but it
+    claims nothing and returns aggregates only: a count and the nearest free rider's distance.
+    The AI layer feeds this into an LLM prompt, so no rider id or position leaves this service.
+    Redis being down is a `503` (from `deps.geo.nearby`), not "zero riders" — an outage that read
+    as an empty fleet would have the assistant tell customers nobody can deliver.
+    """
+    radius = payload.radius_km or RIDER_MAX_DISTANCE_KM
+    candidates = deps.geo.nearby(
+        payload.latitude, payload.longitude, radius, RIDER_DISPATCH_CANDIDATE_CAP
+    )
+    free = deps.riders.available_among([user_id for user_id, _ in candidates])
+    free_distances = [distance for user_id, distance in candidates if user_id in free]
+    return ok(
+        NearbyResponse(
+            available_riders=len(free_distances),
+            nearest_available_km=round(min(free_distances), 2) if free_distances else None,
+            radius_km=radius,
+        ),
+        message="Courier availability",
     )
 
 

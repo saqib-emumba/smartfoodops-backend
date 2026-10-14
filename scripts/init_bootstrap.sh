@@ -7,7 +7,7 @@ echo "🚀 Bootstrapping SmartFoodOps Local Environment..."
 
 # 1. Create the modular directory structure
 echo "📂 Creating services, gateway and per-service database directories..."
-mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu,rider,analytics},services/{common,user,restaurant,menu,order,payment,rider,analytics,notification}}
+mkdir -p smartfoodops-backend/{api-gateway,db/{user,restaurant,order,payment,menu,rider,analytics,vector},services/{common,user,restaurant,menu,order,payment,rider,analytics,notification,ai}}
 cd smartfoodops-backend
 
 # 2. Write out the environment variables configuration
@@ -24,6 +24,7 @@ PAYMENT_POSTGRES_PASSWORD=sfo_payment_password_123
 MENU_POSTGRES_PASSWORD=sfo_menu_password_123
 RIDER_POSTGRES_PASSWORD=sfo_rider_password_123
 ANALYTICS_POSTGRES_PASSWORD=sfo_analytics_password_123
+VECTOR_POSTGRES_PASSWORD=sfo_vector_password_123
 
 # Redis. docker-compose.yml sets the per-service URL literally (database 0 for the Menu
 # Service's cache, database 1 for the User Service's sessions), so this is only read by
@@ -178,7 +179,9 @@ INSERT INTO permissions (name, description) VALUES
 ('kitchen:read',       'Read a restaurant kitchen queue'),
 ('kitchen:decide',     'Accept or reject an order on behalf of a restaurant'),
 ('rider:profile',      'Join the fleet and maintain own rider profile, location, availability'),
-('delivery:report',    'Report pickup and delivery of an assigned order')
+('delivery:report',    'Report pickup and delivery of an assigned order'),
+('ai:search',          'Semantic search over dishes and restaurants (Week 4, D59)'),
+('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)')
 ON CONFLICT (name) DO NOTHING;
 
 -- 1e. Role <-> permission grants. Composite PK for the same reason as user_roles (1c):
@@ -198,6 +201,8 @@ FROM (VALUES
     ('customer',         'order:create'),
     ('customer',         'payment:create'),
     ('customer',         'payment:read'),
+    ('customer',         'ai:search'),
+    ('customer',         'ai:rag_context'),
     ('restaurant_admin', 'restaurant:onboard'),
     ('restaurant_admin', 'menu:write'),
     ('restaurant_admin', 'kitchen:read'),
@@ -262,7 +267,9 @@ FROM (VALUES
     ('PATCH', '/api/v1/riders/me/location',                'rider:profile',      'Own location'),
     ('PATCH', '/api/v1/riders/me/availability',            'rider:profile',      'Own availability'),
     ('POST',  '/api/v1/riders/me/orders/{order_id}/picked-up', 'delivery:report', 'Report pickup'),
-    ('POST',  '/api/v1/riders/me/orders/{order_id}/delivered',  'delivery:report', 'Report delivery')
+    ('POST',  '/api/v1/riders/me/orders/{order_id}/delivered',  'delivery:report', 'Report delivery'),
+    ('POST',  '/api/v1/ai/search',                         'ai:search',          'Hybrid semantic search over dishes and restaurants'),
+    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler')
 ) AS route(method, path_pattern, permission_name, description)
 JOIN permissions p ON p.name = route.permission_name
 ON CONFLICT (method, path_pattern) DO NOTHING;
@@ -577,6 +584,11 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description TEXT,
     base_price DECIMAL(10, 2) NOT NULL CHECK (base_price > 0),
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Owner-declared tags (Week 4, D60): diets, allergens, cuisines, formats, dish types and meal
+    -- styles, drawn from common/dietary.py's vocabulary and validated by the API, not here —
+    -- the list lives in code so the Menu and AI services share one definition. Never inferred:
+    -- an item with no tags matches no tag filter.
+    dietary_tags TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -720,6 +732,98 @@ CREATE TABLE IF NOT EXISTS order_projections (
 CREATE INDEX IF NOT EXISTS idx_order_projections_status ON order_projections(status);
 EOF
 
+cat << 'EOF' > db/vector/init.sql
+-- ============================================================================
+-- AI Service database — sfo_vector_core (container sfo-vector-db, host port 5439)
+--
+-- The retrieval layer for the GenAI features (Week 4, D59). Holds vector embeddings of the
+-- Menu and Restaurant Services' data, and nothing else of anyone's: like the Analytics
+-- database, everything here is *derived* state, rebuildable by re-ingesting the menus
+-- (`python -m ai.ingestion --backfill`), so dropping this database loses no fact that any
+-- other service owns. That is also why it is a separate physical database (D01) rather than
+-- a schema inside sfo_menu_core — the menu's write path never depends on a vector index.
+--
+-- Requires the pgvector extension, which is why docker-compose.yml runs this container from
+-- pgvector/pgvector:pg15 instead of the plain postgres:15-alpine every other database uses.
+-- ============================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Ingestion-side dedup, the same shape as sfo_analytics_core.processed_events: the topic is
+-- at-least-once, so "have I already applied this menu.published" has to be a real check.
+CREATE TABLE IF NOT EXISTS processed_events (
+    consumer_group VARCHAR(64) NOT NULL,
+    event_id UUID NOT NULL,
+    event_type VARCHAR(64) NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (consumer_group, event_id)
+);
+
+-- One row per menu item: the natural-language chunk, its embedding, and the structured
+-- metadata a search filters on. `vector(384)` is all-MiniLM-L6-v2's output width; switching
+-- to a model of another width (OpenAI's text-embedding-3-small is 1536) means changing this
+-- column and re-ingesting, which is deliberate rather than automatic.
+--
+-- `item_key` / `category_key` are the client-supplied keys the Menu Service stores and the
+-- order API accepts (`item_id` on the wire) — the internal UUIDs it generates are rewritten
+-- on every menu publish (a publish is a full replace), so they are useless as a stable id.
+-- `source_version` is `menus.updated_at` of the menu this row was built from, which is how
+-- ingestion skips a menu it has already embedded.
+CREATE TABLE IF NOT EXISTS menu_item_documents (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    restaurant_id UUID NOT NULL,
+    item_key VARCHAR(255) NOT NULL,
+    category_key VARCHAR(255) NOT NULL,
+    category_name VARCHAR(255) NOT NULL,
+    item_name VARCHAR(255) NOT NULL,
+    restaurant_name VARCHAR(255) NOT NULL,
+    base_price NUMERIC(10, 2) NOT NULL,
+    is_available BOOLEAN NOT NULL,
+    dietary_tags TEXT[] NOT NULL DEFAULT '{}',
+    chunk_text TEXT NOT NULL,
+    embedding vector(384) NOT NULL,
+    embedding_model VARCHAR(128) NOT NULL,
+    source_version TIMESTAMPTZ NOT NULL,
+    embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (restaurant_id, item_key)
+);
+
+-- One row per restaurant, so a query like "a quiet Italian place" can match a restaurant
+-- directly instead of only through its dishes. `is_active` rides along so a deactivated
+-- restaurant stops appearing without waiting for its menu to be re-published.
+CREATE TABLE IF NOT EXISTS restaurant_documents (
+    restaurant_id UUID PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    address TEXT,
+    latitude NUMERIC(9, 6),
+    longitude NUMERIC(9, 6),
+    is_active BOOLEAN NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding vector(384) NOT NULL,
+    embedding_model VARCHAR(128) NOT NULL,
+    source_version TIMESTAMPTZ NOT NULL,
+    embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Approximate nearest neighbour search by cosine distance (`<=>`). HNSW rather than IVFFlat:
+-- it needs no training step on existing data, so it works on an empty table and stays
+-- accurate as rows arrive. m / ef_construction are pgvector's defaults, written out so the
+-- trade-off (build time and size against recall) is visible and tunable in one place.
+CREATE INDEX IF NOT EXISTS idx_menu_item_documents_embedding
+    ON menu_item_documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX IF NOT EXISTS idx_restaurant_documents_embedding
+    ON restaurant_documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- The structured half of a hybrid query: price and availability constraints, tag containment
+-- (`dietary_tags @> ARRAY[...]`) and per-restaurant replacement during ingestion.
+CREATE INDEX IF NOT EXISTS idx_menu_item_documents_restaurant ON menu_item_documents(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_menu_item_documents_filter ON menu_item_documents(is_available, base_price);
+CREATE INDEX IF NOT EXISTS idx_menu_item_documents_tags ON menu_item_documents USING gin (dietary_tags);
+EOF
+
 # 4. Write out the Docker Compose orchestration configuration
 echo "🐳 Generating docker-compose.yml..."
 cat << 'EOF' > docker-compose.yml
@@ -740,6 +844,7 @@ volumes:
   grafana_data:
   kafka_data:
   analytics_postgres_data:
+  vector_postgres_data:
   rabbitmq_data:
 
 # Database-per-service: each Postgres-backed service gets its own physical database, with
@@ -779,6 +884,12 @@ x-rider-db-env: &rider-db-env
 # holds even for a service whose "facts" are all rebuildable from a topic.
 x-analytics-db-env: &analytics-db-env
   DATABASE_URL: postgresql://sfo_analytics_admin:${ANALYTICS_POSTGRES_PASSWORD:?set ANALYTICS_POSTGRES_PASSWORD in the root .env}@db-analytics-postgres:5432/sfo_analytics_core
+
+# The AI Service's own database (Week 4, D59): vector embeddings only, all rebuildable from
+# the menus. Separate from sfo_menu_core so the menu's write path never depends on a vector
+# index, and so the one database that needs the pgvector extension is the one that runs it.
+x-vector-db-env: &vector-db-env
+  DATABASE_URL: postgresql://sfo_vector_admin:${VECTOR_POSTGRES_PASSWORD:?set VECTOR_POSTGRES_PASSWORD in the root .env}@db-vector-postgres:5432/sfo_vector_core
 
 # Every service verifies access tokens, so every service gets the public key. Only the User
 # Service gets the private key, further down: a service that cannot sign cannot mint an
@@ -902,6 +1013,23 @@ services:
     volumes:
       - analytics_postgres_data:/var/lib/postgresql/data
       - ./db/analytics/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  # Week 4 (D59): the AI Service's vector store. pgvector/pgvector instead of the plain
+  # postgres:15-alpine every other database uses, because the extension has to be present in
+  # the server — it is the one container here that cannot run from `*postgres-base`'s image.
+  db-vector-postgres:
+    <<: *postgres-base
+    image: pgvector/pgvector:pg15
+    container_name: sfo-vector-db
+    environment:
+      POSTGRES_DB: sfo_vector_core
+      POSTGRES_USER: sfo_vector_admin
+      POSTGRES_PASSWORD: ${VECTOR_POSTGRES_PASSWORD}
+    ports:
+      - "5439:5432" # Maps host 5439 to container 5432
+    volumes:
+      - vector_postgres_data:/var/lib/postgresql/data
+      - ./db/vector/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   cache-redis:
     image: redis:7.0-alpine
@@ -1155,6 +1283,7 @@ services:
       - payment-service
       - rider-service
       - orchestrator-service
+      - ai-service
     networks:
       - smartfoodops-network
 
@@ -1208,6 +1337,10 @@ services:
       # this service starts and serves with Redis down — just without the shortcut.
       REDIS_URL: redis://cache-redis:6379/0
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      # menu.published (Week 4, D61). Deliberately no `depends_on: kafka`: publishing a menu
+      # never waits on the broker — the announce is best-effort and a failure is only logged.
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-menu-postgres:
         condition: service_healthy
@@ -1301,9 +1434,10 @@ services:
       - smartfoodops-network
 
   # --- 3b. ANALYTICS (Week 3, D40) ---
-  # A Kafka read-model, not a request-path service — no sibling calls, no JWT keys (the
-  # first service in the platform that needs none: it never verifies a token, because
-  # nothing it serves is user-facing). No `depends_on: kafka`, matching order-service's
+  # A Kafka read-model, not a request-path service — no sibling calls, and it verifies no
+  # user token (nothing it serves is user-facing). It does hold the shared internal key since
+  # Week 4 (D62): the AI Service reads customer history over an internal route, and importing
+  # `common.auth` for `require_internal` also requires the public key to be set. No `depends_on: kafka`, matching order-service's
   # and payment-service's own comment: the consumer's reconnect loop is what handles Kafka
   # not being ready yet.
   analytics-service:
@@ -1313,11 +1447,66 @@ services:
     container_name: sfo-analytics-service
     restart: always
     environment:
-      <<: *analytics-db-env
+      <<: [*analytics-db-env, *jwt-env]
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SCHEMA_REGISTRY_URL: http://schema-registry:8081
     depends_on:
       db-analytics-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # --- 3b'. AI SERVICE (Week 4, D59) ---
+  # Semantic search and RAG context. Verifies tokens like every request-path service (the
+  # gateway forwards identity headers; D52), reads the menu, restaurant, rider and analytics
+  # services over their internal routes (D01 — it never touches their databases), and keeps its
+  # own vectors in sfo_vector_core. The embedding model is baked into the image, so this
+  # container needs no outbound network to start.
+  ai-service:
+    build:
+      context: ./services
+      dockerfile: ai/Dockerfile
+    container_name: sfo-ai-service
+    restart: always
+    environment:
+      <<: [*vector-db-env, *jwt-env]
+      MENU_SERVICE_URL: http://menu-service:8003
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      RIDER_SERVICE_URL: http://rider-service:8006
+      ANALYTICS_SERVICE_URL: http://analytics-service:8008
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db-vector-postgres:
+        condition: service_healthy
+    networks:
+      - smartfoodops-network
+
+  # The ingestion worker (Week 4, D59/D61): the same image as ai-service with a different command,
+  # the way notification-consumer shares notification-worker's. Consumes menu.published, re-reads
+  # the menu and restaurant over their internal routes, and keeps sfo_vector_core in step. A
+  # separate container so an embedding job never competes with a search request for CPU. No
+  # `depends_on: kafka` — its reconnect loop handles the broker not being ready, like the other
+  # consumers; it does need the menu and restaurant services eventually, which its startup
+  # backfill retries for.
+  ai-ingestion-worker:
+    build:
+      context: ./services
+      dockerfile: ai/Dockerfile
+    container_name: sfo-ai-ingestion-worker
+    restart: always
+    command: ["python", "-m", "ai.ingestion"]
+    environment:
+      <<: [*vector-db-env, *jwt-env]
+      AI_PROCESS_NAME: ai-ingestion-worker
+      MENU_SERVICE_URL: http://menu-service:8003
+      RESTAURANT_SERVICE_URL: http://restaurant-service:8002
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      db-vector-postgres:
         condition: service_healthy
     networks:
       - smartfoodops-network
@@ -1437,7 +1626,7 @@ scrape_configs:
     static_configs:
       - targets: ["temporal-server:9233"]
 
-  # The seven FastAPI services, each exposing /metrics via common/telemetry.py.
+  # The nine FastAPI services, each exposing /metrics via common/telemetry.py.
   - job_name: "user-service"
     static_configs:
       - targets: ["user-service:8001"]
@@ -1476,6 +1665,16 @@ scrape_configs:
   - job_name: "analytics-service"
     static_configs:
       - targets: ["analytics-service:8008"]
+
+  # Semantic retrieval (Week 4, D59) — same /metrics wiring as every other FastAPI service.
+  - job_name: "ai-service"
+    static_configs:
+      - targets: ["ai-service:8009"]
+
+  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion.py::main (Week 4).
+  - job_name: "ai-ingestion-worker"
+    static_configs:
+      - targets: ["ai-ingestion-worker:9111"]
 
   # Not a FastAPI process, same reasoning as orchestrator-worker: a bare prometheus_client
   # HTTP server started in notification/consumer.py::main (Week 3, D45).
@@ -1555,6 +1754,9 @@ create_topic() {
 
 create_topic "sfo.order.events.v1"
 create_topic "sfo.order.events.v1.dlq"
+# Week 4 (D61): the menu's own topic, keyed by restaurant_id.
+create_topic "sfo.menu.events.v1"
+create_topic "sfo.menu.events.v1.dlq"
 
 echo "topics ready"
 EOF
@@ -1706,6 +1908,13 @@ http {
 
         location = /api/v1/riders/health {
             proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        }
+
+        location = /api/v1/ai/health {
+            proxy_pass http://ai-service:8009;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -1926,6 +2135,30 @@ http {
             auth_request_set $auth_user_permissions $upstream_http_x_user_permissions;
 
             proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-User-Id $auth_user_id;
+            proxy_set_header X-User-Roles $auth_user_roles;
+            proxy_set_header X-User-Permissions $auth_user_permissions;
+        }
+
+        # 🤖 Route AI service requests — gated (D51/D57). Every route here needs a
+        # `route_permissions` row: an unmapped path is refused, so a new AI endpoint is a 403
+        # until its row lands rather than an open endpoint. `proxy_read_timeout` is generous
+        # because a request embeds its query and, for rag-context, fans out to three sources.
+        location /api/v1/ai {
+            set $original_method $request_method;
+            set $original_path $uri;
+
+            auth_request /_gateway/verify;
+            auth_request_set $auth_user_id $upstream_http_x_user_id;
+            auth_request_set $auth_user_roles $upstream_http_x_user_roles;
+            auth_request_set $auth_user_permissions $upstream_http_x_user_permissions;
+
+            proxy_read_timeout 60s;
+
+            proxy_pass http://ai-service:8009;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

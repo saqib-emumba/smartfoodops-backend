@@ -16,7 +16,7 @@ gateway would publish every workflow's history.
 
 Sections 1–7 are Week 1: one request at a time. **Section 8 is the order saga**, where the
 lifecycle is driven by a durable workflow rather than by the caller — which is also where the
-Week 1 payment flow changed (see the note at section 5).
+Week 1 payment flow changed (see the note at section 5). **Section 9 is the AI Service** (Week 4): semantic search and RAG context over the menus.
 
 ---
 
@@ -1099,6 +1099,85 @@ docker exec sfo-temporal-server temporal workflow query \
 docker exec sfo-temporal-server temporal workflow show \
   --address 127.0.0.1:7233 --workflow-id "fulfillment-$ORDER_ID"
 ```
+
+---
+
+## 9. The AI Service (Week 4)
+
+Semantic search and RAG context over the menus. Needs a **customer** token (`$CUSTOMER`, from
+section 1) and a restaurant with a published menu — the examples publish their own, tagged,
+so they work on an empty stack. `$OWNER` is the restaurant owner's token (section 2).
+
+```bash
+# An owner-declared tag vocabulary: tags are lower-cased and de-duplicated on publish, and an
+# unknown tag is a 422 — a filter for a tag no menu can carry would just return nothing.
+AI_REST=$(curl -s -X POST $BASE/api/v1/restaurants/onboard -H "Authorization: Bearer $OWNER" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"AI Test Kitchen","address":"7 Vector Lane","latitude":33.70,"longitude":73.00,"capacity":20}' | field "['id']")
+
+curl -s -X POST $BASE/api/v1/menus -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d "{\"restaurant_id\":\"$AI_REST\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Menu\",\"display_order\":1,\"items\":[
+        {\"item_id\":\"karahi\",\"name\":\"Zesty Chicken Karahi\",\"description\":\"Spicy wok cooked chicken with tomatoes and green chillies\",\"base_price\":12.5,\"is_available\":true,\"dietary_tags\":[\"Halal\",\"pakistani\",\"spicy\"]},
+        {\"item_id\":\"salad\",\"name\":\"Garden Quinoa Salad\",\"description\":\"Light crisp salad with quinoa and lemon\",\"base_price\":8.0,\"is_available\":true,\"dietary_tags\":[\"vegan\",\"light-meal\"]},
+        {\"item_id\":\"biryani\",\"name\":\"Sold Out Biryani\",\"description\":\"Fragrant spiced rice\",\"base_price\":9.0,\"is_available\":false,\"dietary_tags\":[\"halal\"]}]}]}"
+# -> 200, with "dietary_tags": ["halal","pakistani","spicy"] on the karahi
+
+# Ingestion is asynchronous (the Menu Service announces the publish on Kafka and the ingestion
+# worker indexes it) — usually well under a second. Watch it happen:
+docker compose logs --tail 5 ai-ingestion-worker | grep Indexed
+
+# Search by meaning. Scoped to the restaurant here so other test data does not crowd the result.
+curl -s -X POST $BASE/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' \
+  -d "{\"query\":\"a spicy chicken dish\",\"restaurant_id\":\"$AI_REST\",\"top_k\":3}"
+# -> matches[0] is the karahi, with price, dietary_tags and a similarity_score; the sold-out
+#    biryani is never returned
+
+# Hard constraints are SQL, not hints: only dishes at or under $10, only vegan ones.
+curl -s -X POST $BASE/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' \
+  -d "{\"query\":\"something to eat\",\"restaurant_id\":\"$AI_REST\",\"max_price\":10,\"dietary_filters\":[\"vegan\"]}"
+# -> only the quinoa salad
+
+# Nothing matches -> 200 with empty lists, not a 404
+curl -s -X POST $BASE/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' \
+  -d "{\"query\":\"anything\",\"restaurant_id\":\"$AI_REST\",\"max_price\":0.5}"
+
+# Unknown tag -> 422; a rider or restaurant admin -> 403 at the gateway; no token -> 401
+curl -s -w '\n[%{http_code}]\n' -X POST $BASE/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' -d '{"query":"pizza","dietary_filters":["street food"]}'
+curl -s -w '\n[%{http_code}]\n' -X POST $BASE/api/v1/ai/search -H "Authorization: Bearer $OWNER" \
+  -H 'Content-Type: application/json' -d '{"query":"pizza"}'
+
+# RAG context: dishes + restaurants + your order history + courier availability, in one call.
+# customer_id must be your own (someone else's is a 403) — $CUST_ID, exported in section 1.
+# Location is optional ("near me").
+curl -s -X POST $BASE/api/v1/ai/rag-context -H "Authorization: Bearer $CUSTOMER" -H 'Content-Type: application/json' \
+  -d "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"Suggest lunch options near me\",\"latitude\":33.68,\"longitude\":73.04,\"top_k\":4}"
+# -> items, restaurants (nearest first, with distance_km), customer_profile, courier_availability,
+#    sources_failed. "sources_failed": [] means every source answered.
+```
+
+**See a source degrade.** Stop one dependency and ask again — the call still returns `200`, and the
+response names what it could not read instead of pretending it is empty:
+
+```bash
+docker stop sfo-analytics-service
+# ... the same rag-context call ...  -> "sources_failed": ["analytics"], "customer_profile": null
+docker start sfo-analytics-service
+
+docker stop sfo-rider-service
+# ... again ...                      -> "sources_failed": ["courier"],   "courier_availability": []
+docker start sfo-rider-service
+```
+
+Re-index everything (safe to repeat; menus already current are skipped), and look at the store:
+
+```bash
+docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill     # prints outcome counts
+docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core \
+  -c "SELECT restaurant_name, item_name, base_price, dietary_tags FROM menu_item_documents LIMIT 5;"
+```
+
+Metrics are on the *SmartFoodOps — AI Retrieval* Grafana dashboard (<http://localhost:3000>).
 
 ---
 

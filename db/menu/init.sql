@@ -51,6 +51,11 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description TEXT,
     base_price DECIMAL(10, 2) NOT NULL CHECK (base_price > 0),
     is_available BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Owner-declared tags (Week 4, D60): diets, allergens, cuisines, formats, dish types and meal
+    -- styles, drawn from common/dietary.py's vocabulary and validated by the API, not here —
+    -- the list lives in code so the Menu and AI services share one definition. Never inferred:
+    -- an item with no tags matches no tag filter.
+    dietary_tags TEXT[] NOT NULL DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

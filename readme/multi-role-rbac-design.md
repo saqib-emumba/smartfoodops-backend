@@ -248,6 +248,8 @@ SELECT r.name AS role, p.name AS permission
 | `kitchen:decide` | `restaurant_admin` | Accepting or rejecting an order |
 | `rider:profile` | `rider` | Joining the fleet; own profile, location, availability |
 | `delivery:report` | `rider` | Reporting pickup and delivery |
+| `ai:search` | `customer` | Semantic search over dishes and restaurants (Week 4, D59) |
+| `ai:rag_context` | `customer` | Assembling RAG context for the caller's own account (Week 4, D62) |
 
 **Which permission each route demands** (`route_permissions`). Ownership checks are unchanged
 and still in the handlers — they need the resource row, so they can never move to the gateway:
@@ -274,7 +276,9 @@ and still in the handlers — they need the resource row, so they can never move
 | `POST /api/v1/riders` | `rider:profile` | self-scoped by construction | |
 | `GET /api/v1/riders/me`, `PATCH /me/location`, `/me/availability` | `rider:profile` | self-scoped by construction | |
 | `POST /api/v1/riders/me/orders/{id}/picked-up` \| `/delivered` | `delivery:report` | self-scoped by construction | |
-| `/api/v1/payments/authorize` \| `/refund` \| `/manual`, `/api/v1/orders/*/internal*`, `/transitions`, `/rider-report`, `/logs`, `/api/v1/riders/dispatch` \| `/release` | *absent from the table* | — | `require_internal` only (D15); nginx exempts them |
+| `POST /api/v1/ai/search` | `ai:search` | — (reads only published, available dishes) | D59 |
+| `POST /api/v1/ai/rag-context` | `ai:rag_context` | `require_self_or_admin` on the body's `customer_id` | D62 |
+| `/api/v1/payments/authorize` \| `/refund` \| `/manual`, `/api/v1/orders/*/internal*`, `/transitions`, `/rider-report`, `/logs`, `/api/v1/riders/dispatch` \| `/release` \| `/internal/nearby`, `/api/v1/menus/*/internal` \| `/internal/restaurant-ids`, `/api/v1/restaurants/*/internal`, `/api/v1/analytics/internal/*` | *absent from the table* | — | `require_internal` only (D15); the gateway refuses them (no row, or no route at all) |
 
 Three things to read carefully in that table:
 

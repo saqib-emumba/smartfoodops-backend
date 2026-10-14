@@ -11,7 +11,7 @@ foreign key against the order it describes. This service no longer takes audit w
 Restaurant existence and active state live in the Restaurant Service's database, so they
 are resolved over HTTP rather than joined.
 
-This module is the composition root: it builds the app, composes the two lifespans, and
+This module is the composition root: it builds the app, composes the three lifespans, and
 mounts the router. Singletons live in deps.py and routes in apis/.
 """
 
@@ -38,7 +38,7 @@ async def _cache_lifespan(_: FastAPI):
 
 app = FastAPI(
     title="SmartFoodOps Menu Service",
-    lifespan=compose_lifespan(deps.db.lifespan, _cache_lifespan),
+    lifespan=compose_lifespan(deps.db.lifespan, _cache_lifespan, deps.kafka.lifespan),
 )
 install_error_handlers(app)
 instrument_app(app, deps.SERVICE_NAME)

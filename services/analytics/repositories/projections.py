@@ -54,6 +54,29 @@ _UPDATE_ORDER_CANCELLED = """
      WHERE order_id = %(order_id)s
 """
 
+# A customer's history in one pass (D62). FILTER keeps it a single scan of the customer's rows.
+_CUSTOMER_TOTALS = """
+    SELECT count(*)                                      AS total_orders,
+           count(*) FILTER (WHERE status = 'delivered')  AS delivered_orders,
+           count(*) FILTER (WHERE status = 'cancelled')  AS cancelled_orders,
+           max(placed_at)                                AS last_order_at
+      FROM order_projections
+     WHERE customer_id = %s
+"""
+
+# Favourite = most *delivered* orders: an order that was cancelled or never arrived says nothing
+# about taste. Ties break on recency, so a restaurant ordered from lately outranks a stale one.
+_CUSTOMER_FAVOURITES = """
+    SELECT restaurant_id,
+           count(*)       AS delivered_orders,
+           max(placed_at) AS last_ordered_at
+      FROM order_projections
+     WHERE customer_id = %s AND status = 'delivered' AND restaurant_id IS NOT NULL
+     GROUP BY restaurant_id
+     ORDER BY delivered_orders DESC, last_ordered_at DESC
+     LIMIT %s
+"""
+
 # Historical totals, queried once at startup to seed the process-local Prometheus Counters
 # — see consumer.py's own comment on why a Counter needs this and a Gauge would not.
 _COUNT_BY_STATUS = "SELECT status, count(*) AS n FROM order_projections GROUP BY status"
@@ -133,6 +156,19 @@ class ProjectionsRepository(Repository):
                 return False  # ON CONFLICT matched nothing new: already processed
             cur.execute(statement, params)
             return True
+
+    def customer_summary(self, customer_id: UUID, *, top: int = 3) -> dict:
+        """Counts and favourite restaurants for one customer; zeros for an unknown one."""
+        totals = self.one(_CUSTOMER_TOTALS, (str(customer_id),))
+        favourites = self.all(_CUSTOMER_FAVOURITES, (str(customer_id), top))
+        return {
+            "customer_id": customer_id,
+            "total_orders": totals["total_orders"],
+            "delivered_orders": totals["delivered_orders"],
+            "cancelled_orders": totals["cancelled_orders"],
+            "last_order_at": totals["last_order_at"],
+            "favourite_restaurants": favourites,
+        }
 
     def status_counts(self) -> dict[str, int]:
         rows = self.all(_COUNT_BY_STATUS)
