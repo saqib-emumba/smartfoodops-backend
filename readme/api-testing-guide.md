@@ -1183,6 +1183,8 @@ Metrics are on the *SmartFoodOps — AI Retrieval* Grafana dashboard (<http://lo
 
 ## 10. The AI assistant (Week 5)
 
+> For how the pipeline works and a fuller, ordered test script (choosing a model, memory, order explanations, the guardrail markers, metrics), see [ai-pipeline-guide.md](ai-pipeline-guide.md).
+
 A streaming conversational assistant, order explanations, order reviews and the restaurant-admin
 authoring tools. The assistant needs a chat model: put `ANTHROPIC_API_KEY` in the root `.env` and
 recreate the service (`docker compose up -d ai-service`), or run it with `LLM_PROVIDER=ollama`. For a

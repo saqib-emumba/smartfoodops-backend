@@ -403,7 +403,8 @@ curl -s -X POST http://localhost/api/v1/ai/partner/review-summary -H "Authorizat
   dedicated `location = /api/v1/ai/assistant/stream` for it. A stream the gateway buffered would arrive all
   at once, which is exactly the lag streaming exists to remove.
 
-Full reasoning: D63–D65 in [readme/key-decisions.md](readme/key-decisions.md); the phased build in
+How the whole pipeline works, file by file, with diagrams and a step-by-step test script:
+[readme/ai-pipeline-guide.md](readme/ai-pipeline-guide.md). Full reasoning: D63–D65 in [readme/key-decisions.md](readme/key-decisions.md); the phased build in
 [readme/week5-ai-assistant-plan.md](readme/week5-ai-assistant-plan.md); the request flow in
 [readme/diagrams/ai_assistant_sequence_diagram.md](readme/diagrams/ai_assistant_sequence_diagram.md).
 

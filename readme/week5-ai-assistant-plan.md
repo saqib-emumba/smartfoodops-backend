@@ -11,6 +11,9 @@ assertions about what the assistant *says* run against the deterministic test do
 a real model's wording varies. The assistant was also run by hand on a real local model (`llama3.2:3b` through
 Ollama) and on Claude (`claude-sonnet-5-5`); each found real problems that are fixed and recorded in §5.
 
+For how the pipeline works end to end, with diagrams, the files involved and a test script, see
+[ai-pipeline-guide.md](ai-pipeline-guide.md).
+
 Decisions D63 to D65 are written in
 [key-decisions.md](key-decisions.md) under *Part B — semantic retrieval (the AI layer)*.
 
