@@ -55,8 +55,8 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 
-# Low on purpose: the assistant restates retrieved menu data, it does not write fiction. The
-# partner copywriting tools (Phase 5) may pass their own value per call.
+# Low on purpose for Ollama: the assistant restates retrieved menu data, it does not write fiction. Not sent to
+# Anthropic, whose current model rejects a non-default temperature (see llm.py).
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
@@ -70,9 +70,12 @@ CONVERSATION_TTL_SECONDS = 3600
 # Messages kept per conversation (a question and its answer are two).
 CONVERSATION_MAX_MESSAGES = 12
 
-# Candidates handed to the model per question. Fewer than the search API's ceiling: every dish is
+# Distinct dishes handed to the model per question. Fewer than the search API's ceiling: every dish is
 # prompt tokens, and a recommendation list nobody reads past five is not worth the latency.
 ASSISTANT_TOP_K = 6
+# How many candidates retrieval fetches before identical-looking ones are dropped and the best ASSISTANT_TOP_K
+# distinct ones kept: duplicates would otherwise crowd the context (agents/context.py `_distinct`).
+ASSISTANT_CANDIDATES = 18
 # Cosine floor below which a match is treated as "nothing matches" (the Phase 4 open point). A
 # guess calibrated on the seed menus with all-MiniLM-L6-v2, where on-topic queries score well
 # above it; revisit if the embedding model changes (D59).

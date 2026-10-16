@@ -188,7 +188,7 @@ class Assistant:
             prompt_query=query[: config.ASSISTANT_MAX_QUESTION_CHARS],
             latitude=state.get("latitude"),
             longitude=state.get("longitude"),
-            top_k=config.ASSISTANT_TOP_K,
+            top_k=config.ASSISTANT_CANDIDATES,
             max_price=state.get("max_price"),
             dietary_filters=state.get("dietary_filters") or [],
             min_score=config.ASSISTANT_MIN_SCORE,
@@ -258,7 +258,9 @@ class Assistant:
             catalogue = None
         else:
             food = state["food"]
-            verdict = verify_food_answer(draft, names=food.names, prices=food.prices)
+            verdict = verify_food_answer(
+                draft, names=food.names, prices=food.prices, offers=food.offers, budget=food.budget
+            )
             fallback = render_food_fallback(food)
             catalogue = food
 

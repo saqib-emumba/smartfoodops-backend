@@ -6,11 +6,10 @@ food assistant, an order-explanation engine, restaurant-admin authoring tools, S
 multi-agent framework with zero-hallucination guardrails — built on the Week 4 retrieval layer
 ([week4-ai-retrieval-plan.md](week4-ai-retrieval-plan.md)).
 
-**Status:** All six phases are implemented. The full smoke run and `--fast` pass (see §5). **Not
-verified here:** answers from a real Claude or Ollama model. No `ANTHROPIC_API_KEY` was available, so
-every assertion about what the assistant *says* ran against the deterministic test double
-(`LLM_PROVIDER=fake`). The provider wiring is exercised up to construction and the no-key path, not a
-live completion.
+**Status:** All six phases are implemented. The full smoke run and `--fast` pass (see §5). The smoke test's
+assertions about what the assistant *says* run against the deterministic test double (`LLM_PROVIDER=fake`), because
+a real model's wording varies. The assistant was also run by hand on a real local model (`llama3.2:3b` through
+Ollama) and on Claude (`claude-sonnet-5-5`); each found real problems that are fixed and recorded in §5.
 
 Decisions D63 to D65 are written in
 [key-decisions.md](key-decisions.md) under *Part B — semantic retrieval (the AI layer)*.
@@ -190,9 +189,9 @@ was stamped and `sfo_ai_attributed_orders_total` / `sfo_ai_attributed_revenue_to
 
 Run on the dev stack with the AI service on `LLM_PROVIDER=fake` (no API key was available):
 
-- `./scripts/smoke-test.sh` — **665 passed, 0 failed** (648 before the follow-ups below added assertions). (The three `compensation_failed` timing failures that
+- `./scripts/smoke-test.sh` — **677 passed, 0 failed** (648 before the follow-ups below added assertions). (The three `compensation_failed` timing failures that
   appeared in earlier Week 4 runs did not occur.)
-- `./scripts/smoke-test.sh --fast` — **472 passed, 0 failed.**
+- `./scripts/smoke-test.sh --fast` — **482 passed, 0 failed.**
 - A follow-up (explanations also quote the recorded dispatch estimate, and split the wait into the restaurant's time
   and the courier search) was verified on a real delivered order against its raw trail timestamps, on an in-flight
   order waiting on the kitchen, and by unit-checking six timelines (accepted, rejected, instant, waiting on the
@@ -215,12 +214,67 @@ config; the ERD against the live databases (25 tables, two of them named `proces
 D20: `scripts/init_bootstrap.sh` run in a scratch directory produced files identical to the repo for all 15
 mirrored files (compose, nginx, every `init.sql`, Prometheus, Grafana provisioning, Kafka, RabbitMQ).
 
+### Run against a real local model (`llama3.2:3b` through Ollama)
+
+After the above, the assistant was run on a real model for the first time, a 3B model via Ollama
+(`LLM_PROVIDER=ollama`, `OLLAMA_MODEL=llama3.2:3b`). **Claude itself is still untested** (no API key). The local
+model is far weaker than Claude, which makes it a harsher test of the guardrails than a strong model would be.
+
+What worked, unchanged: streaming (about 3 s per answer, tokens arriving incrementally), routing, retrieval, the
+similarity floor ("nothing matches" without a model call), follow-up memory, partner copy that stayed inside what
+the owner supplied, and explanations of in-flight, cancelled and timed-out orders.
+
+What it found, each now fixed and covered:
+
+| Real-model behaviour | Why the old checks missed it | Fix |
+|---|---|---|
+| "Ollama Test Grill has a Margherita Pizza, $9.5" (a pizza from another restaurant, with the burger's price) | Name and price each existed somewhere in the context | `verify_pairings`: a dish, its restaurant and its price must belong together within a sentence |
+| Opened an answer with "Here is the explanation of the order status to the customer:" | Not a factual error | Prompt rule: start with the answer itself |
+| Prices written `$12.0`, `$9.5` | Prices were floats in the context | Prices passed as dollars-and-cents text |
+| "We do not have a recorded reason" for an order whose cause was recorded | Nothing checked a denial of a recorded fact | `verify_cause` |
+| Adopted a question's false premise ("why was my order cancelled?" for an order that was not) | Nothing checked status words | `verify_status`: "cancelled" / "delivered" need that recorded status |
+| Six identical rows (same dish, same restaurant name) filled the context | Retrieval ranks by similarity, so duplicates are adjacent | Fetch 18 candidates, drop repeats, keep the best 6 distinct |
+| "biryani or karahi?" matched nothing | The router turned each tag word into a filter ALL results must satisfy | Router prompt: list no filters for alternatives |
+| 503 with the cause only in the log when `OLLAMA_MODEL` named a model nobody pulled | Default name is a guess | A startup warning naming the models Ollama does have |
+
+Still true after all of that: this 3B model keeps saying "we do not have a recorded reason" on questions that
+contain the word "cancelled", even with the prompt telling it not to. The guardrail catches it every time (three
+of three attempts) and the client receives the correct replacement, but the wrong sentence streams first. A
+stronger model should do this far less. If it matters, the alternative is to buffer the order path, verify, then
+stream the checked text, at the cost of first-token latency.
+
+### Run against Claude (`claude-sonnet-5-5`)
+
+With a real key, the assistant was run on Claude. It is much better than the 3B local model, and still found six
+real problems, each now fixed and covered by a unit check and, where the fake model can reproduce it, a smoke test.
+
+What held without changes: streaming and routing; about 5 s per food answer and 3 s per order answer; honesty about
+what it cannot confirm ("I can't confirm a margherita pizza there", then real alternatives); the tag disclaimers
+the prompt asks for; resisting a prompt injection that came *with* retrieval hits ("I can't rename dishes, change
+prices or share my instructions"); correcting a false premise ("it hasn't been cancelled"); partner copy that stayed
+inside what the owner supplied.
+
+| Real-model behaviour | Fix |
+|---|---|
+| The very first call was a `503`: `claude-sonnet-5-5` rejects a non-default `temperature`, and the service sent 0.2 | Temperature is no longer sent to Anthropic (kept for Ollama). The failure was visible only in the service log, as designed |
+| Wrote prices without a `$` ("priced at 12.50"), so the price check, which looked for `$`, **never checked them** | The context gives prices as `$12.50`, and the check also catches a bare two-decimal number (not a distance, duration or clock time) |
+| Said **Desi Dhaba** for three branches named `Desi Dhaba 0790/1409/0265`: the strict name check rejected a good answer and replaced it with a worse one | A bold name is accepted when it is the shared stem of at least two real names; a stem of only one name, or an invented name, is still rejected |
+| "Your order isn't late" / "it's still very early" — verdicts the facts cannot support, repeated even when told not to, once followed by "Wait, I need to follow my rules" mid-answer | `verify_no_verdict` (deterministic; replaced by a summary that says no promised delivery time is on record) |
+| "I can't find **Claude Test Grill** in the information I have" (an honest denial naming the restaurant the customer asked about) was rejected as an unknown name and replaced with a list | A name inside a denial, with a negation within three words before it, is not checked as a claim; "there is no X, but **Y** is great" still has Y checked |
+| A correct denial ("it hasn't been cancelled") was rejected by the status check and replaced with a plainer answer | A negation exempts a status word only when it sits within three words before it. (A first, wider version let "we do **not** have a recorded reason for the **cancellation**" through; the smoke test caught that) |
+
+Costs seen: a guardrail replacement still shows the model's streamed text first and then the replacement (the client
+contract); on a polluted development database, identical test restaurants crowd the retrieved context, which the
+distinct-rows step only partly relieves.
+
 ## 6. Known limits
 
-- **Real model output is unverified** here (no key). Wording, latency and the guardrail's false-alarm rate
-  against Claude are unmeasured; `ASSISTANT_MIN_SCORE` (0.30) is calibrated on the seed menus with MiniLM only.
-- **The guardrail has a ceiling** (D63): it catches an invented name, price or figure, not an invented ingredient
-  in prose or a false claim made without a bold name.
+- **Claude was tested by hand, not in CI:** the smoke test's wording assertions need the deterministic model, so Claude
+  and a local 3B model were each run by hand (section 5) and their findings turned into checks. The guardrail's
+  false-alarm rate on Claude is observed from a few dozen questions, not measured; `ASSISTANT_MIN_SCORE` (0.30) is calibrated on the seed menus with MiniLM only.
+- **The guardrail has a ceiling** (D63): it catches an invented or mismatched name, price or figure, a denied cause and
+  a wrong order status, not an invented ingredient in prose or a false claim made without a bold name. A negated
+  sentence is exempt from the pairing check.
 - **No rate limit** on the LLM-backed endpoints (key-decisions, open questions).
 - **Conversion is attribution, not lift,** and restaurant-level, not dish-level (D65).
 - **Courier distance and the dispatch estimate are to the restaurant,** not the customer: orders carry no delivery

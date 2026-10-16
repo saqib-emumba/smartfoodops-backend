@@ -274,6 +274,10 @@ def render_summary(facts: dict) -> str:
         parts.append(f"It is currently waiting for {facts['waiting_on']}{so_far}.")
     if facts.get("placed_minutes_ago") is not None:
         parts.append(f"It was placed {_span(facts['placed_minutes_ago'])} ago.")
+    if facts["status"] not in TERMINAL:
+        # Honest about why no verdict is given — and worded without any word `verify_no_verdict` rejects,
+        # so this fallback can never fail its own check.
+        parts.append("No promised delivery time is on record to compare this against.")
     estimate = facts.get("estimate_at_assignment")
     if estimate:
         minutes = f"{estimate['courier_minutes']:g}"
@@ -291,17 +295,23 @@ def render_summary(facts: dict) -> str:
 
 def check_explanation(text: str, facts: dict):
     """Hold an explanation against its facts: every figure must be one the facts carry, and a claim about
-    the customer's money (refunded, not charged) must be one the facts support.
+    the customer's money (refunded, not charged) or how the order ended (cancelled, delivered) must be one the
+    facts support.
 
     The one check both `explain` and the assistant's order path run, so the two cannot disagree about what
     counts as grounded.
     """
-    from ai.guardrails import verify_money, verify_quantities
+    from ai.guardrails import verify_cause, verify_money, verify_no_verdict, verify_quantities, verify_status
 
     verdict = verify_quantities(text, quantities=quantities_in(facts))
-    money = verify_money(text, money=facts.get("money"))
-    verdict.ok = verdict.ok and money.ok
-    verdict.violations += money.violations
+    for extra in (
+        verify_money(text, money=facts.get("money")),
+        verify_status(text, status=facts["status"]),
+        verify_cause(text, cause=facts.get("cause")),
+        verify_no_verdict(text),
+    ):
+        verdict.ok = verdict.ok and extra.ok
+        verdict.violations += extra.violations
     return verdict
 
 

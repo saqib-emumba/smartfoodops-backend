@@ -7,8 +7,10 @@ message. That is enough to drive every branch of the graph — routing, retrieva
 the guardrail's replacement path — repeatably, which a real model cannot be asked to do.
 
 Its deliberate misbehaviours: a question containing `[force-ungrounded]` makes the assistant reply with a
-dish and a price that exist nowhere, and one containing `[force-refund]` makes an order explanation claim a
-refund, so a test can prove each guardrail catches it.
+dish and a price that exist nowhere, one containing `[force-mispair]` attributes a real dish to a restaurant that does not offer it, one containing `[force-verdict]` makes an order explanation judge the order on time,
+one containing `[force-refund]` makes an order explanation claim a
+refund, and one containing `[force-no-reason]` makes it deny a cause (or, for an order that was not
+cancelled, assert a cancellation), so a test can prove each guardrail catches it.
 """
 
 import json
@@ -90,11 +92,19 @@ class DeterministicChatModel(BaseChatModel):
             return "I recommend the **Imaginary Dragon Roll** for $1.00."
         context = _block(human, "CONTEXT")
         items = context.get("items", [])
+        if "[force-mispair]" in human:
+            # Real names and a real price, wrongly combined: a dish attributed to a restaurant that does not
+            # offer it. Every token is in the context, so only a pairing check can catch it.
+            offered = {(i["name"], i["restaurant"]) for i in items}
+            for a in items:
+                for b in items:
+                    if (a["name"], b["restaurant"]) not in offered:
+                        return f"I recommend **{a['name']}** at **{b['restaurant']}** ({a['price']})."
         if items:
             top = items[0]
             return (
                 f"Based on what is on the menu, I recommend **{top['name']}** at "
-                f"**{top['restaurant']}** (${top['price']:.2f})."
+                f"**{top['restaurant']}** ({top['price']})."
             )
         restaurants = context.get("restaurants", [])
         if restaurants:
@@ -104,6 +114,10 @@ class DeterministicChatModel(BaseChatModel):
     def _explain(self, human: str) -> str:
         if "[force-refund]" in human:
             return "Your order was cancelled and you were refunded in full."
+        if "[force-verdict]" in human:
+            return "Your order is on time and nothing is wrong."
+        if "[force-no-reason]" in human:
+            return "We do not have a recorded reason for the cancellation of your order."
         facts = _block(human, "FACTS")
         return facts.get("plain_summary", "Your order is being handled.")
 

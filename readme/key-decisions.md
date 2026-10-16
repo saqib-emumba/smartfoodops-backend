@@ -2370,8 +2370,9 @@ floor (`ASSISTANT_MIN_SCORE`, the Phase 4 open point) ends without calling the m
 **The guardrail is code, not a prompt.** The generation prompt makes the model write every dish and
 restaurant name in **bold**, exactly as given, so the names an answer asserts are its bold spans. After
 generation each must match a name in the retrieved context, and every `$` price must match a price in it
-(plus the customer's own stated budget). An answer that fails is replaced by one rendered from the context
-by rules (`render_food_fallback`). Order explanations get the same treatment for quantities: every
+(plus the customer's own stated budget). Within each sentence it also checks that a dish, the restaurant named
+with it and the price quoted *belong together* (`verify_pairings`). An answer that fails is replaced by one rendered
+from the context by rules (`render_food_fallback`). Order explanations get the same treatment for quantities: every
 "N minutes" or "N km" must be a figure in the order facts (D64). Tokens already streamed cannot be
 recalled, so the final SSE chunk carries `replacement` and `grounded: false` and the client shows that
 instead.
@@ -2405,12 +2406,28 @@ with D59, but weaker answers and a large extra container).
 
 - **Retrieved context leaves the stack** when `LLM_PROVIDER=anthropic`. Acceptable for menu data; the
   `ollama` setting exists for a deployment where it is not.
-- **The guardrail has a ceiling.** It catches an invented dish name, price or quantity. It does not catch a
+- **The guardrail has a ceiling.** It catches an invented dish name, price or quantity, and a real dish, restaurant
+  or price attached to the wrong partner. That second check exists because a real model did it: run on a local
+  `llama3.2:3b`, asked about a margherita pizza at a restaurant that has none, it answered "<that restaurant> has a
+  Margherita Pizza, $9.5", using a pizza name from another restaurant and the burger's price here. Every token was in
+  the context, so the original set-membership check passed it. A negated sentence ("X does not have Y") is exempt
+  from the pairing check, because a correct denial asserts nothing to verify and replacing it would answer a
+  different question; "X is not only at Y" would therefore slip through. It does not catch a
   false claim made without a bold name, a price or a figure — an invented ingredient in prose, say. The
   prompt forbids it and nothing else checks it. Dietary and allergen tags are the restaurant's own word, and
   the prompt tells the model to say so.
 - **A strict name match produces some false alarms** (a model that paraphrases a dish name in bold is
-  replaced). A plainer answer is the cheaper error.
+  replaced). A plainer answer is the cheaper error. Two kinds are relaxed, both found on Claude: a bold
+  name that is the shared stem of at least two real names ("Desi Dhaba" for three branches) passes, and a name
+  inside a denial ("I can't find **Claude Test Grill**", "there is no **X**") is not checked, because a denial does
+  not claim the thing exists. The negation must sit within three words before the name, so "there is no X, but **Y**
+  is great" still has Y checked.
+- **The price check reads two forms.** `$12.50` and, because Claude dropped the symbol, a bare two-decimal number
+  that is not a distance, duration or clock time; the context also gives prices as `$12.50` so a model copies the
+  symbol. Before this, an answer with no `$` in it was never price-checked.
+- **`temperature` is not sent to Anthropic.** `claude-sonnet-5-5` rejects a non-default value, which made the first
+  real call a 503. It still applies to Ollama. Grounding never rested on a low temperature; the guardrail checks the
+  output.
 - **Conversation text is stored.** Questions and answers sit in Redis for an hour (that is what memory is),
   and a question travels in the URL because the spec's streaming endpoint is a `GET` — so it appears in
   gateway access logs. The usage log in Postgres (D65) holds ids and outcomes only, but Redis and the logs
@@ -2453,7 +2470,13 @@ checked against the data, not assumed: every order cancelled for a compensation 
 and every `payment_failed` order had no payment row, and the smoke test repeats that cross-check against the
 Payment database. The explanation never states an amount, a date or a method (the gateway is simulated, and the
 guardrail checks none of them), and the guardrail (`verify_money`) rejects an answer that mentions a refund, or
-says the customer was not charged, when the facts do not support it. Writing this found a gap: `payment_failed`
+says the customer was not charged, when the facts do not support it. More checks came from running real models: `verify_status` ("cancelled" or "delivered" need that recorded status —
+a local model had adopted the false premise of a question that said "cancelled"; a negation within three words
+before the word exempts it, so "it hasn't been cancelled" passes), `verify_cause` (an explanation may not say there
+is no recorded reason when the facts carry one) and `verify_no_verdict` (no "late", "on time", "early" or "slow":
+the platform records no promised delivery time, so it is a verdict the facts cannot support — Claude gave one
+repeatedly even when told not to). When an in-flight order is replaced by the rule-written summary, it ends with
+"No promised delivery time is on record to compare this against." Writing this found a gap: `payment_failed`
 was missing from the reason table, so a declined payment read "no recorded reason".
 
 **What an explanation will not say.** A cause the saga did not record: `reason` codes pass through a fixed

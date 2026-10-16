@@ -360,17 +360,26 @@ curl -s -X POST http://localhost/api/v1/ai/partner/review-summary -H "Authorizat
 ```
 
 - **Needs a chat model.** `ANTHROPIC_API_KEY` in the root `.env` (default provider, `claude-sonnet-5-5`), or
-  `LLM_PROVIDER=ollama` with `OLLAMA_BASE_URL`. Without either, the assistant endpoints answer `503` and
+  `LLM_PROVIDER=ollama` with `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`) **and an
+  `OLLAMA_MODEL` you have pulled** — the default, `llama3.1`, is only a name: if Ollama has not got it the
+  assistant answers `503` and the service logs a warning at startup saying which models it does have. For
+  example `ollama pull llama3.2:3b` and `OLLAMA_MODEL=llama3.2:3b` in `.env`. `LLM_PROVIDER` in `.env` wins over
+  the default (`anthropic`), so a key alone does not switch providers: set `LLM_PROVIDER=anthropic` or delete that
+  line. Without a usable provider, the assistant endpoints answer `503` and
   search, RAG context and ingestion are unaffected. `LLM_PROVIDER=fake` selects a deterministic test double
   — it is what the smoke test uses (`LLM_PROVIDER=fake docker compose up -d ai-service`), never a default.
 - **Grounded in code, not only in the prompt.** Retrieval always runs before generation, and the finished
-  answer is checked: every dish or restaurant name in bold must exist in the retrieved context, and every
-  price must match one. A failing answer is replaced — the final chunk carries `grounded: false` and a
-  `replacement` the client shows instead. Limits are stated in D63: it catches invented names, prices and
-  figures, not an invented ingredient in prose.
+  answer is checked: every dish or restaurant name in bold must exist in the retrieved context, every price
+  must match one, and within a sentence a dish, its restaurant and its price must *belong together* (a real
+  model once attached one restaurant's dish to another's menu with a third dish's price — every token was
+  real, the claim was false). A failing answer is replaced — the final chunk carries `grounded: false` and a
+  `replacement` the client shows instead. Limits are stated in D63: it catches invented or mismatched names,
+  prices (with or without a `$`) and figures, not an invented ingredient in prose.
 - **Zero invention about orders.** An explanation uses only the order's recorded trail, the saga's own stage
   and the assigned courier's distance. A cancellation cause comes from a fixed table of the saga's reason
-  codes (an unknown one reads "no recorded reason"), and it says what happened to the money — "your payment was
+  codes (an unknown one reads "no recorded reason"); the guardrail also rejects an explanation that denies a
+  recorded cause, calls an order cancelled or delivered when its recorded status says otherwise, or judges it
+  late, on time, early or slow (no promised delivery time is recorded, so there is nothing to judge against). It says what happened to the money — "your payment was
   refunded" or "you were not charged" — from the saga's own ordering (compensation refunds before it cancels; a
   declined payment cancels before charging), cross-checked against the Payment database in the smoke test, never
   an amount or a time. The wait is split into what is measurable: how long the
@@ -630,9 +639,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 665 assertions against http://localhost
+./scripts/smoke-test.sh            # 677 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 472 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 482 assertions, skips the saga sections and the policy-TTL wait
 # The Week 5 wording checks run only when the AI service uses the deterministic model:
 #   LLM_PROVIDER=fake docker compose up -d ai-service   (then reload the gateway)
 ./scripts/smoke-test.sh --verbose  # also print response bodies

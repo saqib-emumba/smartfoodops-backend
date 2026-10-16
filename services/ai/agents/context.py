@@ -11,6 +11,7 @@ is written from the same context by rules, so it contains only names and prices 
 
 from dataclasses import dataclass, field
 
+from ai import config
 from ai.guardrails import normalize
 from ai.schemas.rag import RagContextResponse
 
@@ -22,6 +23,26 @@ class FoodContext:
     prices: set[float] = field(default_factory=set)
     item_ids: dict[str, str] = field(default_factory=dict)
     restaurant_ids: dict[str, str] = field(default_factory=dict)
+    # (dish, restaurant, price), names normalised: what the guardrail checks pairings against.
+    offers: list[tuple[str, str, float]] = field(default_factory=list)
+    budget: float | None = None
+
+
+def _distinct(rows, key):
+    """`rows` without repeats of `key`, first (best-ranked) occurrence kept.
+
+    Retrieval ranks by similarity, so several restaurants serving an identically named dish at the same price
+    arrive as consecutive, identical-looking rows and can fill the whole top-K. The model then sees one option
+    six times. Found when a test database full of identical test kitchens made every generic question return
+    the same salad six times.
+    """
+    seen, out = set(), []
+    for row in rows:
+        k = key(row)
+        if k not in seen:
+            seen.add(k)
+            out.append(row)
+    return out
 
 
 def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_price: float | None) -> FoodContext:
@@ -34,12 +55,16 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
 
     context = FoodContext(prompt={})
     items = []
-    for item in body.items:
+    for item in _distinct(body.items, lambda i: (normalize(i.item_name), normalize(i.restaurant_name), round(i.price, 2)))[
+        : config.ASSISTANT_TOP_K
+    ]:
         items.append(
             {
                 "name": item.item_name,
                 "restaurant": item.restaurant_name,
-                "price": item.price,
+                # Dollars and cents as text with the symbol, so a model copies "$12.00" — not "12.0", and not a bare
+                # number the price check would have to guess at.
+                "price": f"${item.price:.2f}",
                 "category": item.category_name,
                 "tags": item.dietary_tags,
             }
@@ -47,11 +72,14 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
         context.names.add(normalize(item.item_name))
         context.names.add(normalize(item.restaurant_name))
         context.prices.add(round(item.price, 2))
+        context.offers.append((normalize(item.item_name), normalize(item.restaurant_name), round(item.price, 2)))
         context.item_ids[normalize(item.item_name)] = item.item_id
         context.restaurant_ids[normalize(item.restaurant_name)] = str(item.restaurant_id)
 
     restaurants = []
-    for restaurant in body.restaurants:
+    for restaurant in _distinct(body.restaurants, lambda r: (normalize(r.name), normalize(r.address or "")))[
+        : config.ASSISTANT_TOP_K
+    ]:
         entry = {"name": restaurant.name, "address": restaurant.address, "distance_km": restaurant.distance_km}
         stats = ratings.get(str(restaurant.restaurant_id))
         if stats and stats["review_count"]:
@@ -68,16 +96,24 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
         customer = {"previous_orders": profile.total_orders, "favourite_restaurants": favourites}
         context.names.update(normalize(name) for name in favourites)
 
-    couriers = [
-        {
-            "restaurant": restaurant_names[str(c.restaurant_id)],
-            "available_riders": c.available_riders,
-            "nearest_km": c.nearest_available_km,
-        }
-        for c in body.courier_availability
-        if str(c.restaurant_id) in restaurant_names
-    ]
+    # Only for restaurants the context actually shows: a courier line for a restaurant that was dropped (as a
+    # duplicate, or below the top few) would hand the model a name it has nothing else to say about.
+    shown = {normalize(r["restaurant"]) for r in items} | {normalize(r["name"]) for r in restaurants}
+    couriers = _distinct(
+        [
+            {
+                "restaurant": restaurant_names[str(c.restaurant_id)],
+                "available_riders": c.available_riders,
+                "nearest_km": c.nearest_available_km,
+            }
+            for c in body.courier_availability
+            if str(c.restaurant_id) in restaurant_names
+            and normalize(restaurant_names[str(c.restaurant_id)]) in shown
+        ],
+        lambda c: (normalize(c["restaurant"]), c["available_riders"], c["nearest_km"]),
+    )
 
+    context.budget = max_price
     if max_price is not None:
         context.prices.add(round(max_price, 2))  # restating the customer's own budget is not inventing
     context.prompt = {
@@ -96,7 +132,7 @@ def render_food_fallback(context: FoodContext) -> str:
         # Distinct, because two menus (or two entries) can carry an identical dish and price.
         lines = list(
             dict.fromkeys(
-                f"**{item['name']}** at **{item['restaurant']}** (${item['price']:.2f})"
+                f"**{item['name']}** at **{item['restaurant']}** ({item['price']})"
                 for item in prompt["items"]
             )
         )[:3]

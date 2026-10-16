@@ -21,7 +21,8 @@ def build_chat_model(*, temperature: float | None = None) -> BaseChatModel:
     """The provider `LLM_PROVIDER` names. Unknown values fail loudly at startup.
 
     `temperature` lets a caller override the service default for one model instance (the
-    partner copywriting tools want more variety than the grounded assistant).
+    partner copywriting tools could want more variety than the grounded assistant). Honoured by Ollama only:
+    the Anthropic model in use rejects a non-default temperature.
     """
     temperature = config.LLM_TEMPERATURE if temperature is None else temperature
 
@@ -29,10 +30,13 @@ def build_chat_model(*, temperature: float | None = None) -> BaseChatModel:
         # Imported here, not at module level: only the selected provider's package is loaded.
         from langchain_anthropic import ChatAnthropic
 
+        # No `temperature`: claude-sonnet-5-5 rejects a non-default value ("`temperature` is not supported for
+        # claude-sonnet-5-5 at non-default values"), which showed up as a 503 on the very first real call. The
+        # grounding does not rest on a low temperature anyway (the guardrail checks the output), so the model's
+        # own default is used. `temperature` still applies to Ollama below.
         return ChatAnthropic(
             model=config.ANTHROPIC_MODEL,
             api_key=required("ANTHROPIC_API_KEY"),
-            temperature=temperature,
             max_tokens=config.LLM_MAX_TOKENS,
             timeout=config.LLM_TIMEOUT_SECONDS,
         )

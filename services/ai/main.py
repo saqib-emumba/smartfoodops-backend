@@ -28,6 +28,29 @@ async def _vector_lifespan(_: FastAPI):
     yield
 
 
+def _warn_if_ollama_model_missing() -> None:
+    """Say so at startup if `OLLAMA_MODEL` is not among the models Ollama has pulled.
+
+    Without this the first question fails with a 503 and the reason (a 404 from Ollama) is only in the log,
+    which is a slow way to learn that `OLLAMA_MODEL` names a model nobody pulled. Best-effort: an Ollama that
+    is simply not running yet is reported, not fatal, since it may start after this service does.
+    """
+    import httpx
+
+    try:
+        tags = httpx.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=3.0).json().get("models", [])
+    except Exception as exc:  # noqa: BLE001
+        deps.logger.warning("Ollama is not reachable at %s (%s); the assistant will answer 503 until it is", config.OLLAMA_BASE_URL, type(exc).__name__)
+        return
+    pulled = sorted(m.get("name", "") for m in tags)
+    if config.OLLAMA_MODEL not in pulled and f"{config.OLLAMA_MODEL}:latest" not in pulled:
+        deps.logger.warning(
+            "OLLAMA_MODEL=%r is not pulled on that Ollama (it has: %s); the assistant will answer 503. "
+            "Run `ollama pull %s`, or set OLLAMA_MODEL to one of those.",
+            config.OLLAMA_MODEL, ", ".join(pulled) or "nothing", config.OLLAMA_MODEL,
+        )
+
+
 @asynccontextmanager
 async def _conversation_lifespan(_: FastAPI):
     """Hold the assistant's Redis connection (conversation memory, D63) open for the process."""
@@ -37,6 +60,8 @@ async def _conversation_lifespan(_: FastAPI):
             "ANTHROPIC_API_KEY is not set: the assistant endpoints will answer 503 "
             "until it is (search and RAG context are unaffected)"
         )
+    if config.LLM_PROVIDER == "ollama":
+        _warn_if_ollama_model_missing()
     try:
         yield
     finally:

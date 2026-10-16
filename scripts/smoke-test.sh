@@ -27,7 +27,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 472 of the 665
+# It is a real reduction in coverage, not just in runtime. --fast asserts 482 of the 677
 # checks (counts as of Week 5's AI layer, run with LLM_PROVIDER=fake) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -1703,6 +1703,26 @@ else
   assert "  a replacement is supplied" "$(sse_eval "bool(f.get('replacement'))")" "True"
   assert "  and it names nothing that was invented" "$(sse_eval "'Imaginary' not in f['replacement'] and '\$1.00' not in f['replacement']")" "True"
 
+  # Names and prices that each exist, wrongly combined: a real dish attributed to a restaurant that does not
+  # offer it. Every token is in the retrieved context, so only the pairing check can catch it — the failure a
+  # real local model produced ("Margherita Pizza at <the wrong restaurant> for another dish's price").
+  #
+  # Self-contained on purpose: a second restaurant with a dish no other run has (the TAG is in its name), asked
+  # about together with the salad from the first. (Neither name contains a dietary-tag word: the router turns each
+  # such word into a filter every result must satisfy, so "biryani or karahi" would match nothing.) Two genuinely different restaurants therefore always reach
+  # the context, however many identical test kitchens earlier runs left behind.
+  expect "onboard a second restaurant for the pairing check" 201 POST /api/v1/restaurants/onboard \
+    '{"name":"AI Pair Kitchen","address":"8 Pairing Lane","latitude":33.71,"longitude":73.01,"capacity":20}' "${OWNER_AUTH[@]}"
+  PAIR_REST=$(jfield "['id']")
+  PAIR_DISH="Pairtest Special $TAG"
+  expect "publish its one distinctive dish" 200 POST /api/v1/menus \
+    "{\"restaurant_id\":\"$PAIR_REST\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Menu\",\"display_order\":1,\"items\":[{\"item_id\":\"pb\",\"name\":\"$PAIR_DISH\",\"description\":\"$PAIR_DISH house speciality\",\"base_price\":10.0,\"is_available\":true,\"dietary_tags\":[]}]}]}" \
+    "${OWNER_AUTH[@]}"
+  ai_poll "{\"query\":\"$PAIR_DISH\",\"restaurant_id\":\"$PAIR_REST\"}" "len(m) == 1" 30
+  sse_ask "q=$(urlq "Recommend $PAIR_DISH or Garden Quinoa Salad [force-mispair]")" "${CUST_AUTH[@]}"
+  assert "a real dish attributed to the wrong restaurant is flagged" "$(sse_eval "f['grounded']")" "False"
+  assert "  with a replacement supplied" "$(sse_eval "bool(f.get('replacement'))")" "True"
+
   # Conversation memory: two turns in one conversation are four messages in Redis, keyed by user.
   sse_ask "q=$(urlq 'and something vegan?')&conversation_id=$CONV_ID" "${CUST_AUTH[@]}"
   if have_container sfo-redis; then
@@ -1780,6 +1800,24 @@ else
   sse_ask "q=$(urlq "Why is order $ORDER_ID late? [force-refund]")" "${CUST_AUTH[@]}"
   assert "an unsupported refund claim is flagged" "$(sse_eval "f['grounded']")" "False"
   assert "  and the replacement promises no refund" "$(sse_eval "'refund' not in f['replacement'].lower()")" "True"
+
+  # Two more mistakes a real local model made on order questions. ORDER_ID was not cancelled, so a model that
+  # talks about its "cancellation" has adopted a false premise; and an order that has a recorded cause must
+  # never be explained as having none.
+  sse_ask "q=$(urlq "Why was order $ORDER_ID cancelled? [force-no-reason]")" "${CUST_AUTH[@]}"
+  assert "asserting a cancellation the order never had is flagged" "$(sse_eval "f['grounded']")" "False"
+  if [[ -n "${REJ_ORDER:-}" ]]; then
+    sse_ask "q=$(urlq "Why was order $REJ_ORDER cancelled? [force-no-reason]")" "${CUST_AUTH[@]}"
+    assert "denying a recorded cause is flagged" "$(sse_eval "f['grounded']")" "False"
+    assert "  and the replacement states the recorded cause" "$(sse_eval "'did not' not in f['replacement'] and 'unable to accept the order' in f['replacement']")" "True"
+  fi
+
+  # No verdicts: the platform records no promised delivery time, so "your order is on time / late / early" is
+  # something the facts cannot support. A model that says so (Claude did, repeatedly) is replaced by a summary that
+  # states what happened and says plainly that no promised time is on record.
+  sse_ask "q=$(urlq "Is order $ORDER_ID late? [force-verdict]")" "${CUST_AUTH[@]}"
+  assert "a lateness verdict is flagged" "$(sse_eval "f['grounded']")" "False"
+  assert "  the replacement judges nothing" "$(sse_eval "not any(w in f['replacement'].lower() for w in ('late', 'on time', 'early', 'slow'))")" "True"
 
   # --- partner tools ---------------------------------------------------------------------------
   expect "draft a dish description from ingredients" 200 POST /api/v1/ai/partner/describe-dish \
