@@ -116,7 +116,7 @@ flowchart TB
     RiderSvc -->|record pickup / delivery stage| OrderSvc
 
     %% -- saga: services hold their own Temporal client (D47) --
-    OrderSvc -->|start OrderWorkflow + await result, D58<br/>kitchen_decision Update on FulfillmentWorkflow| TemporalServer
+    OrderSvc -->|start OrderWorkflow + await result, D58<br/>kitchen_decision Update on FulfillmentWorkflow<br/>read-only stage Queries for order explanations, D64| TemporalServer
     PaymentSvc -->|start PaymentWorkflow, manual mode, D55| TemporalServer
     RiderSvc -->|signal RiderWorkflow: pickup / delivery, D55| TemporalServer
     OrchestratorAPI -.->|health probe only| TemporalServer

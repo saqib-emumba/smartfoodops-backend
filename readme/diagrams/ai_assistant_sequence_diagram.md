@@ -76,17 +76,17 @@ sequenceDiagram
         AISvc->>OrderSvc: GET /orders/internal/{id}/explain-context [X-Internal-Key]
         OrderSvc->>Temporal: Query "stage" on the fulfilment and rider workflows (best-effort)
         Temporal-->>OrderSvc: stage, or nothing if finished / unreachable
-        OrderSvc-->>AISvc: order, kitchen_decided_at, trail (status, service, reason code, time; dispatch estimate on `assigned`), saga stage, rider_assigned
+        OrderSvc-->>AISvc: order, kitchen_decided_at, trail (status, service, reason code, time, dispatch estimate on `assigned`), saga stage, rider_assigned
         Note over AISvc: require_self_or_admin on the order's customer (403 otherwise)
         AISvc->>RestSvc: GET /restaurants/{id}/internal (name, coordinates) [X-Internal-Key]
         opt a rider holds a not-yet-delivered order
             AISvc->>RiderSvc: POST /riders/internal/order-courier [X-Internal-Key]
             RiderSvc-->>AISvc: distance in km (never an id, position or ETA)
         end
-        Note over AISvc: facts split the wait: restaurant time = kitchen_decided_at - confirmed; courier search = assigned - kitchen_decided_at
+        Note over AISvc: facts split the wait: restaurant time = kitchen_decided_at - confirmed, courier search = assigned - kitchen_decided_at
         AISvc->>LLM: phrase FACTS only
         Note over AISvc: guardrail: every "N minutes" / "N km" must be a figure in FACTS, else the rule-written summary is returned
-        Note over AISvc: money is stated from the facts: a compensation reason -> "refunded" (refund precedes cancel), payment_failed -> "not charged"; verify_money rejects any other refund or charge claim
+        Note over AISvc: money is stated from the facts: a compensation reason -> "refunded" (refund precedes cancel), payment_failed -> "not charged", and verify_money rejects any other refund or charge claim
         AISvc-->>Customer: explanation (grounded: true | false)
     end
 

@@ -50,7 +50,7 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D31](#d31--a-status-transition-is-a-compare-and-set-and-the-enum-supplies-the-ordering) | A status transition is a compare-and-set | 2026-08-21 | Accepted |
 | [D32](#d32--the-kitchen-queue-collapsed-into-the-orders-table) | The kitchen queue collapsed into the `orders` table | 2026-08-21 | Accepted |
 | [D33](#d33--the-order-services-kitchen-routes-now-honour-the-system_admin-bypass) | The Order Service's kitchen routes now honour the `system_admin` bypass | 2026-08-27 | Accepted |
-| [D34](#d34--each-service-is-a-layered-python-package-not-a-flat-module-list) | Each service is a layered Python package, not a flat module list | 2026-08-27 | Accepted |
+| [D34](#d34--each-service-is-a-layered-python-package-every-concern-its-own-directory) | Each service is a layered Python package, not a flat module list | 2026-08-27 | Accepted |
 | [D35](#d35--every-response-is-an-envelope-status-body-message-errors) | Every response is an envelope: `{status, body, message, errors}` | 2026-08-27 | Accepted |
 | [D36](#d36--the-order-sagas-workflow-and-worker-split-into-their-own-deployable) | The order saga's workflow and worker split into their own deployable | 2026-08-27 | Accepted |
 | [D37](#d37--the-orchestrator-services-subdirectories-are-entity-scoped) | The Orchestrator Service's subdirectories are entity-scoped | 2026-08-27 | Accepted |

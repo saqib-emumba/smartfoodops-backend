@@ -252,6 +252,10 @@ second, unrelated system is unreachable.
                                                       time.sleep for latency)
 ```
 
+Part B adds two more consumers, in the one `ai-ingestion-worker` process and not drawn above: group
+`ai-ingestion` reads `sfo.menu.events.v1` (a menu publish becomes vectors, D61), and group `ai-attribution`
+reads this topic's `order.created` to match an order to an earlier assistant recommendation (D65).
+
 Every service is also instrumented with OpenTelemetry: a request's trace follows it through
 every HTTP hop, into Postgres, across the Temporal boundary (via
 `temporalio.contrib.opentelemetry.TracingInterceptor` on both Temporal clients), and — via a
@@ -718,7 +722,7 @@ copy-pasteable `curl` commands, grouped by service, with the expected response f
 
 For exercising the same contract from Postman instead of a terminal, import
 [postman/smartfoodops.postman_collection.json](postman/smartfoodops.postman_collection.json) —
-129 requests across 9 folders, generated from the same scenarios `smoke-test.sh` drives,
+177 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
 including a Collection-Runner-only happy path through the saga (self-looping status polls,
 since checkout is asynchronous). See [postman/README.md](postman/README.md) for import steps,
 run order, and what it can't check that the shell script can.
@@ -1013,6 +1017,8 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `POST` | `/api/v1/users/refresh` | anyone holding a refresh token | Rotates: the presented token is consumed |
 | `POST` | `/api/v1/users/logout` | any signed-in user | `204`; revokes the refresh token |
 | `GET` | `/api/v1/users/{user_id}` | the subject, or `system_admin` | Joins `roles`, returns the role **name** |
+| `POST` | `/api/v1/users/{user_id}/roles` | the subject, or `system_admin` | Adds a role to the account; idempotent — granting a held role is a no-op. Rules in [readme/multi-role-rbac-design.md](readme/multi-role-rbac-design.md) §3.6 |
+| `DELETE` | `/api/v1/users/{user_id}/roles/{role_name}` | the subject, or `system_admin` | Removes a role; refuses to leave the account with none |
 | `POST` | `/api/v1/restaurants/onboard` | `restaurant_admin` | `201`; owner taken from the token, verified over HTTP |
 | `GET` | `/api/v1/restaurants/{restaurant_id}` | any signed-in user | Exposes `is_active` to other services |
 | `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree; items may carry `dietary_tags` (D60), and a successful publish is announced to the AI Service (D61) |
@@ -1059,6 +1065,13 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order` | AI Service | A customer's most recent order id, so "why is my order late?" needs none |
 | `GET` | `/api/v1/orders/internal/restaurants/{restaurant_id}/reviews` | AI Service | Review count, average and recent commented reviews — no customer id (D64) |
 | `POST` | `/api/v1/riders/internal/order-courier` | AI Service | Distance from a point to the rider carrying an order — never an id, position or ETA (D64) |
+| `POST` | `/api/v1/orders/internal/create` | worker | Re-price, verify and insert the order — the write behind checkout, reached only from `OrderWorkflow`'s create activity (D53, D58) |
+| `POST` | `/api/v1/orders/{order_id}/transitions` | worker | Advance an order's status and append the trail row in one transaction (compare-and-set, so a retry writes one entry) |
+| `POST` | `/api/v1/orders/{order_id}/internal/events` | worker | Publish one order event to Kafka — the one thing a workflow body cannot do (D38, D53) |
+| `POST` | `/api/v1/orders/{order_id}/internal/kitchen-decision` | worker | Record the kitchen's accept or reject: the write behind the `kitchen_decision` Temporal Update (D53) |
+| `POST` | `/api/v1/payments/internal/events` | worker | Publish one payment event to Kafka, keyed by the order id so it stays in that order's partition order (D40) |
+| `POST` | `/api/v1/payments/manual` | worker | The authorisation behind `PaymentWorkflow`'s manual mode: the customer-facing `POST /payments` reaches it through a workflow since D53 |
+| `GET` | `/api/v1/users/internal/verify` | the gateway only | The `auth_request` subrequest: authenticate and authorise every gated request (D51, D57); nginx marks it `internal`, so a client cannot call it |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -1246,10 +1259,12 @@ docker exec -it sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core
 #   -- a non-zero count here after every saga has finished means a rider leaked:
 #   SELECT count(*) FROM riders WHERE current_order_id IS NOT NULL;
 
-# Redis — the menu cache (database 0) and refresh tokens (database 1)
+# Redis — one server, four logical databases: the menu cache (0), refresh tokens (1), the rider geo
+# index `riders:geo` (2, D49) and the assistant's conversation memory (3, Week 5, D63)
 docker exec -it sfo-redis redis-cli ping
 #   redis-cli KEYS 'menu:*'
 #   redis-cli TTL menu:<restaurant_id>     # counts down from 3600
+#   redis-cli -n 3 --scan --pattern 'ai:conv:*'   # one capped list per user and conversation, 1h TTL
 
 # Analytics database — the Kafka read-model's own dedup table and derived projection
 # (Week 3, D44). Nothing else in the platform ever reads or writes this database.
@@ -1571,7 +1586,7 @@ blueprint would make every route a 502.
 `UserRegisterRequest.role` is a plain `str` rather than the `UserRole` enum, so an unknown
 role is rejected with `400` (per the Week 1 spec) instead of Pydantic's `422`, with the
 `roles` table as the single source of truth. `UserRole` remains defined in
-[services/user/schemas.py](services/user/schemas.py) for reference.
+[services/user/schemas/users.py](services/user/schemas/users.py) for reference.
 
 Every inter-service URL is declared explicitly in `docker-compose.yml` for the service that
 calls it, so the wiring is readable from the compose file alone. The identical defaults in

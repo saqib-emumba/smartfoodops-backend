@@ -17,7 +17,7 @@ Reflects the actual schema across all 8 physical databases (`db/*/init.sql`), in
 > `ROLE_PERMISSIONS` and `ROUTE_PERMISSIONS` are what the API gateway's verify subrequest
 > reads to decide whether a caller may have a route at all — the role literals that used to
 > live in `require_role(...)` call sites across six services. `ROUTE_PERMISSIONS.permission_id`
-> is deliberately nullable: `NULL` means "any authenticated caller", for the nine routes whose
+> is deliberately nullable: `NULL` means "any authenticated caller", for the eight routes whose
 > real guard is an ownership check inside the handler, which needs a row the gateway has never
 > read. See [readme/multi-role-rbac-design.md](../multi-role-rbac-design.md) §3.7.
 

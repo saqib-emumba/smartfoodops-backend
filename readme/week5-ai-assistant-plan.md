@@ -180,7 +180,7 @@ owner's restaurant and a customer for the tools; a review summary reports the da
 - **Postman:** folder 11 (21 requests), provider-agnostic assertions.
 - **Docs:** D63 to D65, README (a section, env vars, endpoint and service tables, migrations, layout), the RBAC
   design and auth guide tables, the architecture diagram, the ERD (`ORDER_REVIEWS`, `ASSISTANT_INTERACTIONS`; all
-  24 tables match), a new [ai_assistant_sequence_diagram.md](diagrams/ai_assistant_sequence_diagram.md), and
+  all 25 tables match, column for column), a new [ai_assistant_sequence_diagram.md](diagrams/ai_assistant_sequence_diagram.md), and
   section 10 of the manual testing guide.
 
 Verified: attribution end to end — the assistant named a restaurant, an order was placed there, the interaction
@@ -210,7 +210,7 @@ Checked by hand, outside the smoke test: SSE chunks reach the client 0.4 s apart
 buffered); attribution end to end (an order placed at a restaurant the assistant named stamped its interaction
 and moved `sfo_ai_attributed_orders_total` and `sfo_ai_attributed_revenue_total`); the default configuration
 (`LLM_PROVIDER=anthropic`, no key) answers `503` on the assistant and `200` on search; `nginx -t` on the new
-config; the ERD against all 24 `CREATE TABLE`s.
+config; the ERD against the live databases (25 tables, two of them named `processed_events`, every column compared).
 
 D20: `scripts/init_bootstrap.sh` run in a scratch directory produced files identical to the repo for all 15
 mirrored files (compose, nginx, every `init.sql`, Prometheus, Grafana provisioning, Kafka, RabbitMQ).

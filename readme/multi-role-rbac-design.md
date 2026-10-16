@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS user_roles (
 ERD delta (`readme/diagrams/erd.md`):
 
 ```mermaid
+erDiagram
 %% before
 ROLES ||--o{ USERS : "defines_role_of"
 
@@ -291,7 +292,7 @@ and still in the handlers — they need the resource row, so they can never move
 Three things to read carefully in that table:
 
 - **`NULL` is a decision, not a gap.** It says the gateway admits any authenticated caller
-  and the handler's ownership check is the real guard. Nine routes are like this, and
+  and the handler's ownership check is the real guard. Eight routes are like this, and
   "tidying" a `NULL` into a permission would silently replace an ownership rule with a role
   rule. A smoke-test case asserts that `GET /api/v1/orders/{id}` is still refused by the
   *service*, not the gateway, for a non-owner.

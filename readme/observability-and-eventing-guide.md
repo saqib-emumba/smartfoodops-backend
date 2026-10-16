@@ -175,6 +175,11 @@ same chassis modules — `common/telemetry.py` for tracing and metrics, `common/
     (temporal-server's OWN metrics on :9233 are scraped by Prometheus the same way as any service)
 ```
 
+Part B adds two more consumers that this diagram omits, both in `ai-ingestion-worker`: group `ai-ingestion`
+reads `sfo.menu.events.v1` and keeps the vector store in step with the menus (D61), and group `ai-attribution`
+reads `order.created` from the topic above to attribute orders to assistant recommendations (D65). Their
+metrics (`sfo_ai_ingestion_*`, `sfo_ai_attribution_*`) are scraped from the worker on `:9111`.
+
 Everything below unpacks one lane of this diagram at a time.
 
 ---
@@ -482,7 +487,7 @@ events, with no new logic — it inherits the guarantee `transition()` already h
 
 ### 6.2 The relay: table → Kafka
 
-`OutboxRelay` ([services/common/outbox.py](../services/common/outbox.py)) runs **in-process**
+`OutboxRelay` (`services/common/outbox.py`, since deleted — see D53) runs **in-process**
 inside `order-service` and `payment-service` — not a separate container. A sidecar relay would
 need write credentials to that service's database in a second place, which is exactly the kind
 of boundary regression D01/D19 exist to prevent, for no real benefit at this platform's size.

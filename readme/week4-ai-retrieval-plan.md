@@ -182,7 +182,8 @@ Verified on the running stack:
   returns the three Italian dishes.
 - `--fast` smoke passed.
 
-Open point for Week 5: a semantic search always returns its nearest rows, however weak, so an
+Open point for Week 5 (**closed in Week 5:** `min_score` on `/search` and `/rag-context`, applied in SQL; the
+assistant sets it): a semantic search always returns its nearest rows, however weak, so an
 off-topic query still gets low-scoring matches. A minimum similarity threshold (or a
 `min_score` parameter) would let the assistant say "nothing matches" instead of presenting a
 poor match; it is not in the spec and not built.

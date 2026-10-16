@@ -84,7 +84,7 @@ sequenceDiagram
 
     rect rgb(240, 240, 240)
         Note over Customer, VectorDB: Hybrid semantic search
-        Customer->>Gateway: POST /ai/search {query, top_k, max_price, dietary_filters}
+        Customer->>Gateway: POST /ai/search {query, top_k, max_price, dietary_filters, min_score?}
         Gateway->>UserSvc: auth_request verify + authorize (ai:search)
         break the caller's roles lack ai:search (a rider, a restaurant_admin)
             UserSvc-->>Gateway: 403
@@ -105,7 +105,7 @@ sequenceDiagram
 
     rect rgb(255, 245, 230)
         Note over Customer, RiderSvc: RAG context for the Week 5 assistant
-        Customer->>Gateway: POST /ai/rag-context {customer_id, prompt_query, latitude?, longitude?}
+        Customer->>Gateway: POST /ai/rag-context {customer_id, prompt_query, latitude?, longitude?, min_score?}
         Gateway->>UserSvc: auth_request verify + authorize (ai:rag_context)
         Gateway->>AISvc: forward
         AISvc->>AISvc: customer_id must be the caller's own (an admin may ask for anyone's)
