@@ -6210,7 +6210,7 @@
               }
             ],
             "url": "{{base_url}}/api/v1/ai/explain-order",
-            "description": "Grounded in the order, its transition trail, the running saga's stage and the assigned courier's distance. Never carries a cause the saga did not record, an arrival time, or error text.",
+            "description": "Grounded in the order, its transition trail, the running saga's stage and the assigned courier's distance. Never carries a cause the saga did not record, an arrival time, a delay measurement or error text. A cancelled order says whether the payment was refunded or never charged, from the recorded reason, and never an amount or time. The dispatch estimate, if recorded, is quoted as an estimate.",
             "body": {
               "mode": "raw",
               "raw": "{\"order_id\":\"{{order_id}}\"}",

@@ -6,8 +6,9 @@ does not understand language, it follows the `[ROLE:...]` tag at the top of each
 message. That is enough to drive every branch of the graph — routing, retrieval, streaming,
 the guardrail's replacement path — repeatably, which a real model cannot be asked to do.
 
-Its one deliberate misbehaviour: a question containing `[force-ungrounded]` makes the assistant
-reply with a dish and a price that exist nowhere, so a test can prove the guardrail catches it.
+Its deliberate misbehaviours: a question containing `[force-ungrounded]` makes the assistant reply with a
+dish and a price that exist nowhere, and one containing `[force-refund]` makes an order explanation claim a
+refund, so a test can prove each guardrail catches it.
 """
 
 import json
@@ -101,6 +102,8 @@ class DeterministicChatModel(BaseChatModel):
         return "I could not find anything matching that on the current menus."
 
     def _explain(self, human: str) -> str:
+        if "[force-refund]" in human:
+            return "Your order was cancelled and you were refunded in full."
         facts = _block(human, "FACTS")
         return facts.get("plain_summary", "Your order is being handled.")
 

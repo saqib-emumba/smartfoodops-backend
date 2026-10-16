@@ -366,8 +366,16 @@ curl -s -X POST http://localhost/api/v1/ai/partner/review-summary -H "Authorizat
   figures, not an invented ingredient in prose.
 - **Zero invention about orders.** An explanation uses only the order's recorded trail, the saga's own stage
   and the assigned courier's distance. A cancellation cause comes from a fixed table of the saga's reason
-  codes (an unknown one reads "no recorded reason"); there is no arrival time, because the platform has no
-  real one; no error text and no rider identity reach the model (D64).
+  codes (an unknown one reads "no recorded reason"), and it says what happened to the money — "your payment was
+  refunded" or "you were not charged" — from the saga's own ordering (compensation refunds before it cancels; a
+  declined payment cancels before charging), cross-checked against the Payment database in the smoke test, never
+  an amount or a time. The wait is split into what is measurable: how long the
+  restaurant took to respond (the order's `kitchen_decided_at` against the `confirmed` row) and how long finding
+  a courier took (the `assigned` row against that decision), and for an order still in flight, how long it has
+  waited on the current step. The one dispatch figure it may quote is the platform's
+  rough estimate recorded when the courier was assigned, labelled as an estimate — there is no arrival time and
+  no "late by N minutes", because the platform records neither; no error text and no rider identity reach the
+  model (D64).
 - **Memory.** Conversations live in Redis (db 3) for an hour, keyed by user and conversation id, so one
   customer's history is never reachable with another's.
 - **Partner tools** (`restaurant_admin` owning the restaurant): `describe-dish`, `promo`, `review-summary`.
@@ -618,9 +626,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 648 assertions against http://localhost
+./scripts/smoke-test.sh            # 665 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 470 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 472 assertions, skips the saga sections and the policy-TTL wait
 # The Week 5 wording checks run only when the AI service uses the deterministic model:
 #   LLM_PROVIDER=fake docker compose up -d ai-service   (then reload the gateway)
 ./scripts/smoke-test.sh --verbose  # also print response bodies
@@ -1047,7 +1055,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | AI ingestion worker | The restaurant record, for a caller with no user |
 | `POST` | `/api/v1/riders/internal/nearby` | AI Service | Available-rider count and nearest distance around a point — aggregates only, never a rider id or position (D62) |
 | `GET` | `/api/v1/analytics/internal/customers/{customer_id}/summary` | AI Service | Order counts and favourite restaurants; zeros for a customer with no history (D62). Not routed by the gateway |
-| `GET` | `/api/v1/orders/internal/{order_id}/explain-context` | AI Service | The order, its reduced trail (status, service, reason code, time — never `detail` or `raw_log`) and the running workflows' stage (D64) |
+| `GET` | `/api/v1/orders/internal/{order_id}/explain-context` | AI Service | The order, its reduced trail (status, service, reason code, time, and on the `assigned` row the dispatch estimate and distance — never `detail`, `raw_log` or a rider id) plus when the kitchen answered and the running workflows' stage (D64) |
 | `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order` | AI Service | A customer's most recent order id, so "why is my order late?" needs none |
 | `GET` | `/api/v1/orders/internal/restaurants/{restaurant_id}/reviews` | AI Service | Review count, average and recent commented reviews — no customer id (D64) |
 | `POST` | `/api/v1/riders/internal/order-courier` | AI Service | Distance from a point to the rider carrying an order — never an id, position or ETA (D64) |

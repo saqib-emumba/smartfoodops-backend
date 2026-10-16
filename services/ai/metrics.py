@@ -84,7 +84,7 @@ LLM_FAILURES_TOTAL = Counter(
 GUARDRAIL_VIOLATIONS_TOTAL = Counter(
     "sfo_ai_guardrail_violations_total",
     "Model answers the grounding check rejected, by what it caught",
-    ["kind"],  # unknown_name | unknown_price | unknown_quantity
+    ["kind"],  # unknown_name | unknown_price | unknown_quantity | unsupported_refund_claim | unsupported_charge_claim
 )
 RECOMMENDED_ITEMS_TOTAL = Counter(
     "sfo_ai_recommended_items_total",

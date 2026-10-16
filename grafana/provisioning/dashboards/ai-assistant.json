@@ -578,7 +578,7 @@
           "mode": "multi"
         }
       },
-      "description": "What the grounding check caught: a dish or restaurant not in the context, a price not in the context, a figure not in the order facts."
+      "description": "What the grounding check caught: a dish or restaurant not in the context, a price not in the context, a figure not in the order facts, or a refund / not-charged claim the order's facts do not support."
     },
     {
       "id": 16,

@@ -27,7 +27,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 470 of the 648
+# It is a real reduction in coverage, not just in runtime. --fast asserts 472 of the 665
 # checks (counts as of Week 5's AI layer, run with LLM_PROVIDER=fake) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -1743,6 +1743,43 @@ else
   assert "  and is grounded" "$(jfield "['grounded']")" "True"
   assert "  without leaking internals" \
     "$(jeval "not any(w in b['explanation'].lower() for w in ('workflow','traceback','exception','stage'))")" "True"
+  if (( ! FAST )); then
+    # The saga assigned a rider to ORDER_ID, and the rider workflow recorded its dispatch estimate in the
+    # `assigned` trail row. The explanation quotes it as an estimate, never as a delay (D64).
+    assert "  quotes the dispatch estimate recorded at assignment, as an estimate" \
+      "$(jeval "'roughly estimated' in b['explanation'] and 'not a promise' in b['explanation']")" "True"
+    # The kitchen's answer is not a trail row, so its time comes from the order (`kitchen_decided_at`); with
+    # the `confirmed` and `assigned` rows it splits the wait into the restaurant's part and the courier search.
+    assert "  says how long the restaurant took to accept it" "$(jeval "'to accept the order' in b['explanation']")" "True"
+    assert "  and how long finding a courier took" "$(jeval "'Finding a courier took' in b['explanation']")" "True"
+    assert "  and does not call the order late" "$(jeval "'late by' not in b['explanation'].lower() and 'delayed by' not in b['explanation'].lower()")" "True"
+  fi
+
+  # What happened to the customer's money (D64). The explanation says it from the saga's own ordering —
+  # compensation refunds *then* cancels, a declined payment cancels before charging — so each claim is
+  # cross-checked against the Payment database rather than taken on trust.
+  if [[ -n "${REJ_ORDER:-}" ]]; then
+    expect "explain an order the kitchen rejected" 200 POST /api/v1/ai/explain-order \
+      "{\"order_id\":\"$REJ_ORDER\"}" "${CUST_AUTH[@]}"
+    assert "  it gives the recorded cause" "$(jeval "'unable to accept the order' in b['explanation']")" "True"
+    assert "  and says the payment was refunded" "$(jeval "'Your payment was refunded' in b['explanation']")" "True"
+    have_container sfo-payment-db && assert "  and the Payment database agrees" \
+      "$(cut -d'|' -f1 <<<"$(docker_payment_row "$REJ_ORDER")")" "refunded"
+  fi
+  if [[ -n "${DECL_ORDER:-}" ]]; then
+    expect "explain an order whose payment was declined" 200 POST /api/v1/ai/explain-order \
+      "{\"order_id\":\"$DECL_ORDER\"}" "${CUST_AUTH[@]}"
+    assert "  it gives the recorded cause, not 'no recorded reason'" \
+      "$(jeval "'payment could not be authorised' in b['explanation'] and 'no recorded reason' not in b['explanation']")" "True"
+    assert "  and says they were not charged" "$(jeval "'You were not charged' in b['explanation']")" "True"
+    assert "  without mentioning a refund" "$(jeval "'refund' not in b['explanation'].lower()")" "True"
+    have_container sfo-payment-db && assert "  and the Payment database has no payment for it" "$(docker_payment_row "$DECL_ORDER")" ""
+  fi
+  # A model that promises a refund the platform never recorded is caught, and replaced by an answer that
+  # promises none. ORDER_ID is a delivered (or still-confirmed) order: no refund is recorded for it.
+  sse_ask "q=$(urlq "Why is order $ORDER_ID late? [force-refund]")" "${CUST_AUTH[@]}"
+  assert "an unsupported refund claim is flagged" "$(sse_eval "f['grounded']")" "False"
+  assert "  and the replacement promises no refund" "$(sse_eval "'refund' not in f['replacement'].lower()")" "True"
 
   # --- partner tools ---------------------------------------------------------------------------
   expect "draft a dish description from ingredients" 200 POST /api/v1/ai/partner/describe-dish \

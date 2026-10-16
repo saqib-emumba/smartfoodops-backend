@@ -22,22 +22,34 @@ from order.schemas.explain import ExplainTimelineEntry, OrderExplainContext, Sag
 router = APIRouter(prefix="/api/v1/orders", dependencies=[Depends(require_internal)])
 
 
+def _number(metadata: dict, key: str) -> float | None:
+    """`metadata[key]` if it is a real number, else None. A bool is an int in Python, and a string
+    in a free-form JSONB column is not a figure an explanation may quote."""
+    value = metadata.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 @router.get("/internal/{order_id}/explain-context", response_model=Envelope[OrderExplainContext])
 async def explain_context(order_id: UUID) -> Envelope[OrderExplainContext]:
     order = deps.orders.find(order_id)
     if order is None:
         raise not_found(f"Order {order_id} not found")
 
-    timeline = [
-        ExplainTimelineEntry(
-            status=row["status"],
-            previous_status=row["previous_status"],
-            service=row["service"],
-            reason=(row["metadata"] or {}).get("reason"),
-            occurred_at=row["created_at"],
+    timeline = []
+    for row in deps.tracking.timeline(order_id):
+        metadata = row["metadata"] or {}
+        assigned = row["status"] == "assigned"
+        timeline.append(
+            ExplainTimelineEntry(
+                status=row["status"],
+                previous_status=row["previous_status"],
+                service=row["service"],
+                reason=metadata.get("reason"),
+                estimated_courier_minutes=_number(metadata, "eta_minutes") if assigned else None,
+                courier_distance_at_assignment_km=_number(metadata, "distance_km") if assigned else None,
+                occurred_at=row["created_at"],
+            )
         )
-        for row in deps.tracking.timeline(order_id)
-    ]
     progress = await deps.orchestrator_service.progress(order_id)
     return ok(
         OrderExplainContext(
@@ -47,6 +59,7 @@ async def explain_context(order_id: UUID) -> Envelope[OrderExplainContext]:
             status=order["status"],
             total_amount=order["total_amount"],
             kitchen_decision=order["kitchen_decision"],
+            kitchen_decided_at=deps.orders.kitchen_decided_at(order_id),
             rider_reported_stage=order["rider_reported_stage"],
             rider_assigned=order["rider_id"] is not None,
             timeline=timeline,

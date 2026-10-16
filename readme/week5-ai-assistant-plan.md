@@ -102,7 +102,7 @@ logs a warning and answers `503` on the assistant, `200` on search.
   restaurant's count, average and commented reviews — no customer id.
   Migration: [add_order_reviews.sql](../db/order/add_order_reviews.sql).
 - **Explain context.** `GET /orders/internal/{id}/explain-context`: the order, its trail reduced to
-  `(status, service, reason, time)` — never the log's `detail` or `raw_log` — and the fulfilment and rider
+  `(status, service, reason, time)` plus, on the `assigned` row, the dispatch estimate and distance already recorded in `metadata`, and the moment the kitchen answered (`kitchen_decided_at`, which lets an explanation split the wait into the restaurant's part and the courier search) — never the log's `detail`, `raw_log` or `rider_id` — and the fulfilment and rider
   workflows' `stage` via Temporal Queries, best-effort. `GET /orders/internal/customers/{id}/latest-order`
   so "why is my order late?" needs no id.
 - **Courier distance.** `POST /riders/internal/order-courier`: distance from a point to the rider holding an
@@ -153,7 +153,10 @@ gateway — it does not buffer. Role, validation and ownership errors are `401`/
 ### Phase 5 — Explanations and partner tools (done)
 
 - `POST /ai/explain-order`: facts from the Order, Restaurant and Rider services, ownership checked, the model
-  only phrases them, quantities checked, a rule-written summary as the fallback.
+  only phrases them, quantities checked, a rule-written summary as the fallback. A claim about the customer's
+  money is checked too: "refunded" and "not charged" are stated from the saga's own ordering (compensation
+  refunds before it cancels; a declined payment cancels before charging), and `verify_money` rejects a refund or
+  not-charged claim the facts do not support. See D64.
 - `POST /ai/partner/{describe-dish,promo,review-summary}` (`ai:partner`), each scoped to a restaurant the caller
   owns (verified against the Restaurant Service as the caller). Copy containing a number the owner did not
   supply is replaced by a plain rendering and flagged; counts and averages never pass through the model.
@@ -187,9 +190,17 @@ was stamped and `sfo_ai_attributed_orders_total` / `sfo_ai_attributed_revenue_to
 
 Run on the dev stack with the AI service on `LLM_PROVIDER=fake` (no API key was available):
 
-- `./scripts/smoke-test.sh` — **648 passed, 0 failed.** (The three `compensation_failed` timing failures that
+- `./scripts/smoke-test.sh` — **665 passed, 0 failed** (648 before the follow-ups below added assertions). (The three `compensation_failed` timing failures that
   appeared in earlier Week 4 runs did not occur.)
-- `./scripts/smoke-test.sh --fast` — **470 passed, 0 failed.**
+- `./scripts/smoke-test.sh --fast` — **472 passed, 0 failed.**
+- A follow-up (explanations also quote the recorded dispatch estimate, and split the wait into the restaurant's time
+  and the courier search) was verified on a real delivered order against its raw trail timestamps, on an in-flight
+  order waiting on the kitchen, and by unit-checking six timelines (accepted, rejected, instant, waiting on the
+  restaurant, searching for a courier, no decision time recorded).
+- A second follow-up (explanations say what happened to the money, and `payment_failed` was added to the reason
+  table) was verified against real orders of each outcome and their payment rows: a rejected and a timed-out order
+  (payment `refunded`), a declined payment (no payment row), and a `compensation_failed` order (payment still
+  `authorized`). The full smoke run cross-checks the rejected and declined cases against the Payment database.
 - Both include the new *AI assistant and explanations (Week 5)* section and the Prometheus assertions that the
   `sfo_ai_assistant_*`, `sfo_ai_llm_*`, `sfo_ai_guardrail_*`, `sfo_ai_explain_*` and `sfo_ai_partner_*` series
   reach Prometheus. The route-template cardinality bound in the Observability section was raised from 60 to 100:
@@ -212,7 +223,10 @@ mirrored files (compose, nginx, every `init.sql`, Prometheus, Grafana provisioni
   in prose or a false claim made without a bold name.
 - **No rate limit** on the LLM-backed endpoints (key-decisions, open questions).
 - **Conversion is attribution, not lift,** and restaurant-level, not dish-level (D65).
-- **Courier distance is to the restaurant,** not the customer: orders carry no delivery coordinates.
+- **Courier distance and the dispatch estimate are to the restaurant,** not the customer: orders carry no delivery
+  coordinates, and no cause is recorded for an order that is merely slow (only for cancellations): an
+  explanation says where the time went, not why. The estimate is
+  `rider.eta`'s mock, recorded in the `assigned` trail row; explanations quote it as an estimate and never as a delay.
 - **Saga stage is best-effort:** a finished workflow or an unreachable Temporal answers "unknown".
 - **Conversation text sits in Redis for an hour and a question travels in the URL** (a `GET`, per the spec).
 - **After rebuilding `ai-service`, reload the gateway** (`docker exec sfo-api-gateway nginx -s reload`): nginx

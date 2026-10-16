@@ -37,12 +37,29 @@ STATUS_MEANING = {
 
 # The saga's machine codes, in words a customer can read. A code not listed is not guessed at.
 REASON_TEXT = {
+    "payment_failed": "the payment could not be authorised",
     "kitchen_at_capacity": "the restaurant was too busy to take the order",
     "kitchen_timeout": "the restaurant did not respond in time",
     "kitchen_rejected": "the restaurant was unable to accept the order",
     "no_rider_available": "no courier was available nearby",
     "pickup_timeout": "the courier did not collect the order in time",
     "delivery_timeout": "the delivery was not completed in time",
+}
+
+# The reasons that cancel an order through `CompensationWorkflow`. That workflow refunds *first* and
+# writes `cancelled` only once the refund has succeeded (a refund that fails every retry becomes
+# `compensation_failed` instead), so a `cancelled` row with one of these reasons means the payment was
+# refunded. `payment_failed` is the other kind of cancellation: it happens before anything is charged and
+# never reaches the refund step. Checked against the data: every order cancelled for a reason below has a
+# `refunded` payment, and every `payment_failed` order has no payment row. A reason in neither set (a new
+# one, say) claims nothing about money.
+REFUNDED_REASONS = {
+    "kitchen_at_capacity",
+    "kitchen_timeout",
+    "kitchen_rejected",
+    "no_rider_available",
+    "pickup_timeout",
+    "delivery_timeout",
 }
 
 # What a still-running fulfilment is waiting on, from the workflow's own stage name.
@@ -59,6 +76,13 @@ def _minutes(delta_seconds: float) -> int:
 
 def _parse(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def _span(minutes: int) -> str:
+    """A whole-minute duration in words. Under a minute reads as that, not "0 minutes"."""
+    if minutes < 1:
+        return "less than a minute"
+    return f"about {minutes} minute" + ("" if minutes == 1 else "s")
 
 
 class OrderExplainer:
@@ -147,12 +171,56 @@ class OrderExplainer:
         elif stamps:
             facts["placed_minutes_ago"] = _minutes((datetime.now(timezone.utc) - stamps[0]).total_seconds())
 
+        # What the platform estimated when the courier was assigned (recorded on that trail row). Kept
+        # as an *estimate* and nothing more: it is a mock for the courier reaching the restaurant, so
+        # it is never turned into "late by N minutes".
+        for index, entry in enumerate(timeline):
+            if entry["status"] == "assigned" and entry.get("estimated_courier_minutes") is not None:
+                estimate = {
+                    "courier_minutes": entry["estimated_courier_minutes"],
+                    "courier_distance_km": entry.get("courier_distance_at_assignment_km"),
+                }
+                if status not in TERMINAL:
+                    estimate["minutes_since_assignment"] = _minutes(
+                        (datetime.now(timezone.utc) - stamps[index]).total_seconds()
+                    )
+                facts["estimate_at_assignment"] = estimate
+                break
+
+        # Splitting the wait. `confirmed` -> `assigned` lumps two things together: the restaurant taking
+        # the order, then a courier being found. The kitchen's answer is not a trail row (accepting does
+        # not move an order along its lifecycle), so its moment comes from the order itself. Both
+        # timestamps are written by the same database, so they compare directly.
+        decided_at = _parse(context["kitchen_decided_at"]) if context.get("kitchen_decided_at") else None
+        confirmed_at = next((stamps[i] for i, e in enumerate(timeline) if e["status"] == "confirmed"), None)
+        assigned_at = next((stamps[i] for i, e in enumerate(timeline) if e["status"] == "assigned"), None)
+        if decided_at and confirmed_at and decided_at >= confirmed_at:
+            facts["kitchen_response_minutes"] = _minutes((decided_at - confirmed_at).total_seconds())
+        if context["kitchen_decision"] == "accepted" and decided_at and assigned_at and assigned_at >= decided_at:
+            facts["courier_search_minutes"] = _minutes((assigned_at - decided_at).total_seconds())
+
         reasons = [entry["reason"] for entry in timeline if entry.get("reason")]
         if status in ("cancelled", "compensation_failed"):
             facts["cause"] = REASON_TEXT.get(reasons[-1]) if reasons else None
+        # What happened to the customer's money, from the saga's own ordering (see REFUNDED_REASONS) —
+        # never an amount, a time or a method: the gateway is simulated and the guardrail checks none of those.
+        money = None
+        if status == "compensation_failed":
+            money = "refund_incomplete"
+        elif status == "cancelled" and reasons:
+            if reasons[-1] in REFUNDED_REASONS:
+                money = "refunded"
+            elif reasons[-1] == "payment_failed":
+                money = "not_charged"
+        facts["money"] = money
         stage = (context["saga"] or {}).get("fulfillment_stage")
         if status not in TERMINAL and stage in WAITING_TEXT:
             facts["waiting_on"] = WAITING_TEXT[stage]
+            # How long it has been waiting on *that*: for the restaurant, since the order was confirmed;
+            # for a courier, since the restaurant accepted.
+            since = decided_at if stage == "dispatching_rider" else confirmed_at
+            if since:
+                facts["waiting_minutes"] = _minutes((datetime.now(timezone.utc) - since).total_seconds())
         if courier is not None:
             facts["courier"] = courier
         facts["unavailable"] = unavailable
@@ -163,7 +231,7 @@ class OrderExplainer:
 def quantities_in(facts: dict) -> set[float]:
     """Every figure an explanation may quote: the numbers the facts carry, nothing derived."""
     figures: set[float] = set()
-    for key in ("total_minutes", "placed_minutes_ago"):
+    for key in ("total_minutes", "placed_minutes_ago", "kitchen_response_minutes", "courier_search_minutes", "waiting_minutes"):
         if facts.get(key) is not None:
             figures.add(float(facts[key]))
     for step in facts["steps"]:
@@ -171,6 +239,10 @@ def quantities_in(facts: dict) -> set[float]:
     courier = facts.get("courier") or {}
     if courier.get("distance_km") is not None:
         figures.add(float(courier["distance_km"]))
+    estimate = facts.get("estimate_at_assignment") or {}
+    for key in ("courier_minutes", "courier_distance_km", "minutes_since_assignment"):
+        if estimate.get(key) is not None:
+            figures.add(float(estimate[key]))
     return figures
 
 
@@ -186,16 +258,51 @@ def render_summary(facts: dict) -> str:
         parts.append(f"The reason recorded is that {facts['cause']}.")
     elif facts["status"] in ("cancelled", "compensation_failed"):
         parts.append("We do not have a recorded reason.")
+    if facts.get("money") == "refunded":
+        parts.append("Your payment was refunded.")
+    elif facts.get("money") == "not_charged":
+        parts.append("You were not charged.")
+    if facts.get("kitchen_response_minutes") is not None:
+        if facts.get("kitchen_decision") == "accepted":
+            parts.append(f"The restaurant took {_span(facts['kitchen_response_minutes'])} to accept the order.")
+        else:
+            parts.append(f"The restaurant responded after {_span(facts['kitchen_response_minutes'])}.")
+    if facts.get("courier_search_minutes") is not None:
+        parts.append(f"Finding a courier took {_span(facts['courier_search_minutes'])}.")
     if facts.get("waiting_on"):
-        parts.append(f"It is currently waiting for {facts['waiting_on']}.")
+        so_far = f" ({_span(facts['waiting_minutes'])} so far)" if facts.get("waiting_minutes") is not None else ""
+        parts.append(f"It is currently waiting for {facts['waiting_on']}{so_far}.")
     if facts.get("placed_minutes_ago") is not None:
-        parts.append(f"It was placed {facts['placed_minutes_ago']} minutes ago.")
+        parts.append(f"It was placed {_span(facts['placed_minutes_ago'])} ago.")
+    estimate = facts.get("estimate_at_assignment")
+    if estimate:
+        minutes = f"{estimate['courier_minutes']:g}"
+        parts.append(
+            f"When the courier was assigned, the platform roughly estimated {minutes} minutes for them to "
+            "reach the restaurant (an estimate, not a promise)."
+        )
     courier = facts.get("courier")
     if courier and courier.get("distance_km") is not None:
         parts.append(f"The assigned courier is {courier['distance_km']} km from the restaurant.")
     if facts["unavailable"]:
         parts.append(f"I could not load: {', '.join(facts['unavailable'])}.")
     return " ".join(parts)
+
+
+def check_explanation(text: str, facts: dict):
+    """Hold an explanation against its facts: every figure must be one the facts carry, and a claim about
+    the customer's money (refunded, not charged) must be one the facts support.
+
+    The one check both `explain` and the assistant's order path run, so the two cannot disagree about what
+    counts as grounded.
+    """
+    from ai.guardrails import verify_money, verify_quantities
+
+    verdict = verify_quantities(text, quantities=quantities_in(facts))
+    money = verify_money(text, money=facts.get("money"))
+    verdict.ok = verdict.ok and money.ok
+    verdict.violations += money.violations
+    return verdict
 
 
 async def explain(model, facts: dict) -> tuple[str, bool]:
@@ -210,7 +317,6 @@ async def explain(model, facts: dict) -> tuple[str, bool]:
     from langchain_core.messages import HumanMessage, SystemMessage
 
     from ai.agents import prompts
-    from ai.guardrails import verify_quantities
     from ai.llm import call_model
     from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 
@@ -220,7 +326,7 @@ async def explain(model, facts: dict) -> tuple[str, bool]:
         node="explain",
     )
     text = text.strip()
-    verdict = verify_quantities(text, quantities=quantities_in(facts))
+    verdict = check_explanation(text, facts)
     for kind, _ in verdict.violations:
         GUARDRAIL_VIOLATIONS_TOTAL.labels(kind=kind).inc()
     if not text or not verdict.ok:

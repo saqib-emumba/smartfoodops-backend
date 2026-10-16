@@ -71,6 +71,28 @@ def verify_quantities(answer: str, *, quantities: set[float]) -> Verdict:
     return verdict
 
 
+_REFUND = re.compile(r"\brefund(?:ed|s|ing)?\b", re.I)
+_NOT_CHARGED = re.compile(
+    r"\b(?:not|never)\s+(?:been\s+)?charged\b|n['’]t\s+(?:been\s+)?charged\b|\bno\s+charge\b", re.I
+)
+
+
+def verify_money(answer: str, *, money: str | None) -> Verdict:
+    """A claim about the customer's money must be one the order's facts support.
+
+    `money` is the explainer's own conclusion (`refunded`, `not_charged`, `refund_incomplete`, or None when
+    nothing is recorded). Mentioning a refund needs `refunded` or `refund_incomplete`; saying the customer was
+    not charged needs `not_charged`. With None, neither may appear: an explanation that promises a refund the
+    platform never recorded is the costliest kind of invention this assistant could make.
+    """
+    verdict = Verdict()
+    if _REFUND.search(answer) and money not in ("refunded", "refund_incomplete"):
+        verdict.add("unsupported_refund_claim", "refund")
+    if _NOT_CHARGED.search(answer) and money != "not_charged":
+        verdict.add("unsupported_charge_claim", "not charged")
+    return verdict
+
+
 def mentioned(answer: str, catalogue: dict[str, str]) -> list[str]:
     """The ids of catalogue entries (`normalised name -> id`) the answer names, in order, once each."""
     seen: list[str] = []

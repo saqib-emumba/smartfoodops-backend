@@ -2426,17 +2426,45 @@ with D59, but weaker answers and a large extra container).
 **Decided:** `POST /api/v1/ai/explain-order` builds a small dictionary of facts and the model only phrases
 it. The facts come from one new internal route on the Order Service
 (`GET /orders/internal/{id}/explain-context`: the order, its transition trail reduced to status, service,
-`reason` code and time, and the running fulfilment and rider workflows' own stage, read with Temporal
-Queries), the Restaurant Service (a name and coordinates) and a new Rider Service route
+`reason` code and time — plus, on the `assigned` row only, the dispatch estimate and distance the rider workflow
+recorded — the moment the kitchen answered (`orders.kitchen_decided_at`), and the running fulfilment and rider
+workflows' own stage, read with Temporal Queries), the Restaurant Service (a name and coordinates) and a new Rider Service route
 (`POST /riders/internal/order-courier`: a distance from a point, never an id or position). The Order Service
 holds the Temporal client already, so the AI image needs neither `temporalio` nor a second database
 connection (D01).
 
+**What an explanation can measure, and how.** `confirmed` to `assigned` in the trail lumps two waits together:
+the restaurant taking the order, then a courier being found. Accepting does not move an order along its
+lifecycle, so the kitchen's answer is not a trail row; it is `orders.kitchen_decided_at`, which the same
+statement that records the decision sets. With it, "the restaurant took about N minutes to accept" is `decided
+- confirmed`, "finding a courier took about N minutes" is `assigned - decided` (accepted orders only), and for an
+order still in flight the time spent on the current step is measured from the same points. All of it is
+subtraction over timestamps the platform wrote itself, in one database; if `kitchen_decided_at` is missing no
+segment is claimed. No saga code changed.
+
+**What happened to the customer's money.** Stated from the saga's own ordering, not from the model.
+`CompensationWorkflow` refunds first and writes `cancelled` only after the refund succeeded (a refund that
+fails every retry becomes `compensation_failed`), so a `cancelled` row with a compensation reason
+(`kitchen_rejected`, `kitchen_timeout`, `kitchen_at_capacity`, `no_rider_available`, `pickup_timeout`,
+`delivery_timeout`) means "your payment was refunded". `payment_failed` cancels before anything is charged and
+never reaches the refund, so it means "you were not charged". `compensation_failed` says the refund could not be
+completed automatically and is with the team. A reason in none of these sets claims nothing about money. This was
+checked against the data, not assumed: every order cancelled for a compensation reason had a `refunded` payment
+and every `payment_failed` order had no payment row, and the smoke test repeats that cross-check against the
+Payment database. The explanation never states an amount, a date or a method (the gateway is simulated, and the
+guardrail checks none of them), and the guardrail (`verify_money`) rejects an answer that mentions a refund, or
+says the customer was not charged, when the facts do not support it. Writing this found a gap: `payment_failed`
+was missing from the reason table, so a declined payment read "no recorded reason".
+
 **What an explanation will not say.** A cause the saga did not record: `reason` codes pass through a fixed
-table and an unknown one reads as "no recorded reason". An arrival time: the platform's only estimate
-(`rider.eta`) is a labelled mock with kitchen padding in it, so no ETA is exposed. Anything from a log's
-free-text `detail` or `raw_log`, which can carry technical error text. A refund the platform did not record.
-Ownership is checked in the AI Service (`require_self_or_admin` on the order's customer) before anything is
+table and an unknown one reads as "no recorded reason". An arrival time, or "late by N minutes": the
+only estimate the platform records is the dispatch one in the `assigned` trail row (`metadata.eta_minutes`,
+from `rider.eta`), a labelled mock for the courier reaching the *restaurant* (distance at an assumed speed plus
+kitchen padding), not delivery to the customer. An explanation may quote it as "the platform roughly estimated
+N minutes when the courier was assigned" and nothing more; the prompt forbids presenting it as a promise or
+subtracting from it, and the guardrail accepts only that figure. Anything from a log's
+free-text `detail` or `raw_log`, which can carry technical error text. A refund the platform did not record, or
+any amount, date or method for one. Ownership is checked in the AI Service (`require_self_or_admin` on the order's customer) before anything is
 generated.
 
 **Reviews.** `order_reviews` (Order Service database): one rating (1–5) and an optional comment per
@@ -2461,7 +2489,9 @@ and letting the model infer causes from raw logs.
   (D57). The internal key's blast radius grows by three routes (see the open question on per-service keys).
 - **Saga stage is best-effort.** A finished workflow, or Temporal being down, answers "unknown" and the
   explanation says less.
-- **Courier distance is to the restaurant**, not the customer: orders carry no delivery coordinates.
+- **Courier distance and the dispatch estimate are to the restaurant**, not the customer: orders carry no
+  delivery coordinates, and no cause is recorded for an order that is merely slow (only for cancellations) — it can say *where* the
+  time went (the restaurant, the courier search) but not *why* that step was slow.
 - **Review text is prompt input written by strangers.** Mitigated by the data-not-instructions rule and by the
   summary being shown only to the restaurant's own owner, but a determined review could still skew a summary.
 

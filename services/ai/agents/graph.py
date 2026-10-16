@@ -50,11 +50,11 @@ from ai.agents.context import (
 )
 from ai.agents.router import parse_router
 from ai.clients.order import OrderServiceClient
-from ai.guardrails import mentioned, verify_food_answer, verify_quantities
+from ai.guardrails import mentioned, verify_food_answer
 from ai.llm import call_model, stream_model
 from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 from ai.memory import ConversationStore
-from ai.order_explainer import OrderExplainer, quantities_in
+from ai.order_explainer import OrderExplainer, check_explanation
 from ai.rag_context import RagContextAssembler
 from ai.schemas.rag import RagContextRequest
 
@@ -253,7 +253,7 @@ class Assistant:
     async def _guardrail(self, state: AssistantState):
         draft = state["draft"]
         if state["intent"] == "order_tracking":
-            verdict = verify_quantities(draft, quantities=quantities_in(state["facts"]))
+            verdict = check_explanation(draft, state["facts"])
             fallback = state["facts"]["plain_summary"]
             catalogue = None
         else:

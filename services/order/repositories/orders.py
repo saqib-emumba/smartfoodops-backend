@@ -27,6 +27,7 @@ from order.repositories.sql import (
     SELECT_BY_ID,
     SELECT_BY_KEY,
     SELECT_BY_STATUS,
+    SELECT_KITCHEN_DECIDED_AT,
     SELECT_KITCHEN_QUEUE,
     SELECT_LATEST_FOR_CUSTOMER,
     SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
@@ -66,6 +67,16 @@ class OrderRepository(Repository):
         if order is not None:
             self._attach_items([order])
         return order
+
+    def kitchen_decided_at(self, order_id: UUID):
+        """When the kitchen accepted or rejected this order, or None if it has not answered.
+
+        Set by `decide_kitchen` in the same statement as the decision, so it is the moment the
+        restaurant responded — which no trail row records, because accepting does not move an order
+        along its lifecycle.
+        """
+        row = self.one(SELECT_KITCHEN_DECIDED_AT, (str(order_id),))
+        return row["kitchen_decided_at"] if row else None
 
     def latest_id_for_customer(self, customer_id: UUID) -> UUID | None:
         """The id of this customer's most recent order, or None if they have never ordered."""
