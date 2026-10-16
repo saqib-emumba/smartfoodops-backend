@@ -171,6 +171,10 @@ class RiderRepository(Repository):
             )
             return self._row(cur.fetchone())
 
+    def holding(self, order_id: UUID) -> dict | None:
+        """The rider currently holding this order, or None (never assigned, or already released)."""
+        return self.one(_SELECT_BY_ORDER, {"order_id": str(order_id)})
+
     def release(self, order_id: UUID) -> dict | None:
         """Free whichever rider holds this order.
 

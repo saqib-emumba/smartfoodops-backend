@@ -187,6 +187,10 @@ TRANSITION_ORDER = f"""
 # listing-by-status endpoint existed before `compensation_failed` needed one (every other
 # read here is by id). Oldest first, the same ordering `SELECT_KITCHEN_QUEUE` uses for the
 # same reason: the longest-stuck order is the most urgent one.
+SELECT_LATEST_FOR_CUSTOMER = """
+    SELECT id FROM orders WHERE customer_id = %s ORDER BY created_at DESC LIMIT 1
+"""
+
 SELECT_BY_STATUS = f"""
     SELECT {_COLUMNS} FROM orders WHERE status = %(status)s::order_status ORDER BY created_at
 """

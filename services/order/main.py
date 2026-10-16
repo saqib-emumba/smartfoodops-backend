@@ -32,9 +32,11 @@ from order.apis import (
     checkout,
     health,
     internal_events,
+    internal_explain,
     internal_kitchen,
     internal_orders,
     kitchen,
+    reviews,
     rider_reports,
     tracking,
     transitions,
@@ -59,6 +61,8 @@ app.include_router(transitions.router)
 app.include_router(internal_orders.router)
 app.include_router(internal_events.router)
 app.include_router(internal_kitchen.router)
+app.include_router(internal_explain.router)
+app.include_router(reviews.router)
 
 
 if __name__ == "__main__":

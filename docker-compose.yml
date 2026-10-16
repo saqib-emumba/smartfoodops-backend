@@ -627,12 +627,14 @@ services:
     networks:
       - smartfoodops-network
 
-  # --- 3b'. AI SERVICE (Week 4, D59) ---
-  # Semantic search and RAG context. Verifies tokens like every request-path service (the
+  # --- 3b'. AI SERVICE (Week 4, D59; Week 5, D63/D64) ---
+  # Semantic search, RAG context, the streaming assistant, order explanations and the partner
+  # authoring tools. Verifies tokens like every request-path service (the
   # gateway forwards identity headers; D52), reads the menu, restaurant, rider and analytics
   # services over their internal routes (D01 — it never touches their databases), and keeps its
   # own vectors in sfo_vector_core. The embedding model is baked into the image, so this
-  # container needs no outbound network to start.
+  # container needs no outbound network to start; generating answers needs ANTHROPIC_API_KEY
+  # (or LLM_PROVIDER=ollama), and without it only the assistant endpoints are unavailable.
   ai-service:
     build:
       context: ./services
@@ -645,8 +647,20 @@ services:
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       RIDER_SERVICE_URL: http://rider-service:8006
       ANALYTICS_SERVICE_URL: http://analytics-service:8008
+      ORDER_SERVICE_URL: http://order-service:8004
+      # Conversation memory (D63): its own Redis db, and no `depends_on` — a Redis outage means no
+      # follow-up context, never a failed answer, so the assistant does not wait for it to start.
+      AI_REDIS_URL: redis://cache-redis:6379/3
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      # Only meaningful with LLM_PROVIDER=fake: seconds between streamed tokens, so a test can see
+      # that the gateway forwards them as they are written rather than all at once.
+      FAKE_LLM_TOKEN_DELAY_SECONDS: ${FAKE_LLM_TOKEN_DELAY_SECONDS:-0}
     depends_on:
       db-vector-postgres:
         condition: service_healthy

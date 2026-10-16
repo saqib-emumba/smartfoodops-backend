@@ -46,21 +46,29 @@ class VectorRepository(Repository):
         max_price: float | None = None,
         tags: list[str] | None = None,
         restaurant_id: str | None = None,
+        min_score: float | None = None,
     ) -> tuple[list[dict], list[dict]]:
         """`(item_matches, restaurant_matches)` nearest to `vector`, best first.
 
         Items must be available, within `max_price`, carry every tag in `tags`, and belong to an
         active restaurant. Restaurants must be active and have at least one item that passes the
         same constraints — a restaurant with nothing the customer could actually order under
-        their filters is not a useful result. `score` is cosine similarity (1 - distance).
+        their filters is not a useful result. `score` is cosine similarity (1 - distance); with
+        `min_score`, rows below it are dropped, so a weak match is absent rather than ranked last.
         """
         item_where, params = _item_predicates("d", max_price=max_price, tags=tags)
         params.update({"vector": as_vector(vector), "top_k": top_k})
         item_scope = ""
         restaurant_scope = ""
+        if min_score is not None:
+            # Distance is the HNSW-ordered expression, so bounding it keeps the index scan usable.
+            # `1 - score` because `<=>` is cosine *distance*.
+            item_scope += " AND d.embedding <=> %(vector)s::vector <= %(max_distance)s"
+            restaurant_scope += " AND r.embedding <=> %(vector)s::vector <= %(max_distance)s"
+            params["max_distance"] = 1.0 - min_score
         if restaurant_id is not None:
-            item_scope = "AND d.restaurant_id = %(restaurant_id)s"
-            restaurant_scope = "AND r.restaurant_id = %(restaurant_id)s"
+            item_scope += " AND d.restaurant_id = %(restaurant_id)s"
+            restaurant_scope += " AND r.restaurant_id = %(restaurant_id)s"
             params["restaurant_id"] = str(restaurant_id)
 
         items_sql = f"""

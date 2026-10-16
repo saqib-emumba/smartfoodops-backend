@@ -254,6 +254,10 @@
     {
       "key": "ai_rest_id",
       "value": ""
+    },
+    {
+      "key": "ai_conversation_id",
+      "value": ""
     }
   ],
   "item": [
@@ -5947,6 +5951,801 @@
             "body": {
               "mode": "raw",
               "raw": "{\"customer_id\":\"{{cust_id}}\",\"prompt_query\":\"lunch\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "7297b494-0f60-4755-9db8-e6c04b99040a",
+      "name": "11. AI Assistant (Week 5)",
+      "description": "The streaming assistant, order explanations, order reviews and the restaurant-admin authoring tools (D63, D64). Run after folders 2-4 and 6-8 and 10 (it uses `{{order_id}}`, `{{rest_id}}`, `{{ai_rest_id}}` and the tokens). The assistant needs a chat provider: `ANTHROPIC_API_KEY`, `LLM_PROVIDER=ollama`, or `LLM_PROVIDER=fake` for deterministic runs. The assertions are provider-agnostic: they check structure, ownership and the grounding contract, not wording. Cases that need a deterministic model (the guardrail replacing a fabricated dish, the exact wording) live in scripts/smoke-test.sh only.",
+      "item": [
+        {
+          "id": "e5a86a4b-99e5-4096-8e85-2a810350f03d",
+          "name": "AI health names the chat provider",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/ai/health",
+            "description": "`llm_provider` is `anthropic`, `ollama` or (for tests) `fake`; the key is never reported."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"a provider is named\", () => pm.expect(b.llm_provider).to.be.a(\"string\"));",
+                  "const b = pm.response.json().body; pm.test(\"conversation memory is reachable\", () => pm.expect(b.conversation_store_reachable).to.eql(true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "7ff522dc-a610-4981-babb-0fa719c6abb1",
+          "name": "Assistant stream: a food question",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Recommend%20a%20spicy%20chicken%20dish%20under%20%2415",
+            "description": "Server-Sent Events. Postman shows the stream once it has ended. Needs ANTHROPIC_API_KEY (or LLM_PROVIDER=ollama/fake) on the AI service; without one the answer is a 503. The wording varies by model, so these tests check structure and the grounding contract, not text."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); });",
+                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the final chunk names the intent and the conversation\", () => { const f = events[events.length - 1]; pm.expect(f.intent).to.be.a(\"string\"); pm.expect(f.conversation_id).to.be.a(\"string\"); pm.collectionVariables.set(\"ai_conversation_id\", f.conversation_id); });",
+                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"a replaced (ungrounded) answer carries its replacement\", () => { const f = events[events.length - 1]; if (f.grounded === false) pm.expect(f.replacement).to.be.a(\"string\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3250c3d9-1ff9-4d6c-8222-75a4ca3d73fc",
+          "name": "Assistant stream: a follow-up in the same conversation",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=and%20something%20vegan%3F&conversation_id={{ai_conversation_id}}",
+            "description": "Conversation memory lives in Redis, keyed by user and conversation id, with a one-hour expiry."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the conversation id is continued\", () => pm.expect(events[events.length - 1].conversation_id).to.eql(pm.collectionVariables.get(\"ai_conversation_id\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8aeeeaf9-ccd5-45dd-9165-2715b780655d",
+          "name": "Assistant stream: an off-topic question is declined",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=What%20is%20the%20capital%20of%20France%3F",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"routed as out of scope\", () => pm.expect(events[events.length - 1].intent).to.eql(\"out_of_scope\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "fa8edce1-0016-41e7-9a3f-6069cbd5e833",
+          "name": "Assistant stream without a token -> 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=spicy%20food",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ecb2ce34-3eb9-4de5-91e9-538c95960c58",
+          "name": "A rider cannot use the assistant -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{rider_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=spicy%20food",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "e2ea1b2f-71f4-42d9-82ad-ed2de7381ef6",
+          "name": "A one-character question -> 422",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=a",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "aeaa3e03-7847-4a92-bb06-ae970050b60e",
+          "name": "Explain the customer's own order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "Grounded in the order, its transition trail, the running saga's stage and the assigned courier's distance. Never carries a cause the saga did not record, an arrival time, or error text.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"an explanation is returned for that order\", () => { pm.expect(b.order_id).to.eql(pm.collectionVariables.get(\"order_id\")); pm.expect(b.explanation).to.be.a(\"string\").and.not.empty; });",
+                  "const b = pm.response.json().body; pm.test(\"no internals leak\", () => pm.expect(b.explanation.toLowerCase()).to.not.match(/workflow|traceback|exception/));",
+                  "pm.test(\"envelope message matches the spec\", () => pm.expect(pm.response.json().message).to.eql(\"Order explanation generated successfully\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2d303048-da7d-498b-8ae7-475649a34f3d",
+          "name": "Explaining another customer's order -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "7d121758-182c-4698-8a65-b1fab97e6093",
+          "name": "Explaining an unknown order -> 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"00000000-0000-4000-8000-000000000001\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 404\", () => pm.response.to.have.status(404));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3efe9939-9393-4ff0-b5e3-c75f2f94fdd1",
+          "name": "explain-order without a token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "47a2f5c9-c5e3-48c9-9606-0bf97492c540",
+          "name": "Review a delivered order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/review",
+            "description": "Only the customer who placed the order, only once it is delivered, only once. Run after the happy-path folder has delivered `{{order_id}}`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"rating\":4,\"comment\":\"Great burger, but the delivery took a little while.\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"the rating is stored against the order's restaurant\", () => { pm.expect(b.rating).to.eql(4); pm.expect(b.restaurant_id).to.eql(pm.collectionVariables.get(\"rest_id\")); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "cfa6b84e-55a4-4a1b-8c88-127ed129fabb",
+          "name": "A second review of the same order -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/review",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"rating\":1}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 409\", () => pm.response.to.have.status(409));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5ee55bb5-6d14-425c-b67c-6ba98b976e3f",
+          "name": "Reviewing someone else's order -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{other_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/review",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"rating\":5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a35843dc-0c3e-4db1-ba52-e71a385062dc",
+          "name": "A rating of 6 -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/{{order_id}}/review",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"rating\":6}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d2a0456c-f815-4c6b-8d5b-2f35d5dbfb1e",
+          "name": "Partner: draft a dish description",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/describe-dish",
+            "description": "Uses only the dish name and ingredients supplied. A draft that states a price or a number the owner did not give is replaced by a plain rendering and flagged `grounded: false`.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"dish_name\":\"Zesty Chicken Karahi\",\"ingredients\":[\"chicken\",\"tomatoes\",\"green chillies\"]}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"a description is returned\", () => { pm.expect(b.description).to.be.a(\"string\").and.not.empty; pm.expect(b.grounded).to.be.a(\"boolean\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d90331b5-ecd5-467f-807e-f8955fd95c90",
+          "name": "Partner: draft promotional copy",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/promo",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"offer\":\"10% off all karahi this weekend\",\"channel\":\"social\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"promo text is returned\", () => pm.expect(b.promo_text).to.be.a(\"string\").and.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "57eb649a-6305-41bb-9da2-8f19d1c0a87a",
+          "name": "Partner: summarise a restaurant's reviews",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/review-summary",
+            "description": "The count and average come from the database; only the prose is the model's. With no written reviews `summary` is null.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{rest_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "const b = pm.response.json().body; pm.test(\"counts come from the database\", () => { pm.expect(b.review_count).to.be.at.least(1); pm.expect(b.average_rating).to.be.a(\"number\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "8ad55171-138f-4e60-9d7f-f580ddebcb55",
+          "name": "Partner tools without a token -> 401",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/promo",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"offer\":\"10% off karahi\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 401\", () => pm.response.to.have.status(401));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "38a25756-f1e1-4298-8312-521cee7b91fa",
+          "name": "A customer cannot use the partner tools -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/promo",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"offer\":\"10% off karahi\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "616ad8f4-ec80-4377-a483-52b256e4e854",
+          "name": "An owner cannot write copy for someone else's restaurant -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner2_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/partner/promo",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"offer\":\"10% off karahi\"}",
               "options": {
                 "raw": {
                   "language": "json"

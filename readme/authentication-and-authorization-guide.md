@@ -217,6 +217,10 @@ gateway, from the policy tables, and once in the handler:
 | Rider | `POST /riders`, `GET /riders/me`, `PATCH /riders/me/location`, `PATCH /riders/me/availability`, `POST /riders/me/orders/{id}/picked-up`, `/delivered` | `require_permission("rider:profile")` / `require_permission("delivery:report")` |
 | Rider | `POST /riders/dispatch`, `POST /riders/release`, `POST /riders/internal/nearby` | `require_internal` |
 | AI | `POST /ai/search`, `POST /ai/rag-context` | `require_permission("ai:search")` / `require_permission("ai:rag_context")`; the latter also `require_self_or_admin` on the body's `customer_id` (Week 4, D59/D62) |
+| AI | `GET /ai/assistant/stream`, `POST /ai/explain-order` | `require_permission("ai:assistant")` / `require_permission("ai:explain_order")`; explain-order also `require_self_or_admin` on the order's customer (Week 5, D63/D64) |
+| AI | `POST /ai/partner/describe-dish`, `/promo`, `/review-summary` | `require_permission("ai:partner")` + ownership of the body's `restaurant_id`, resolved over HTTP as the caller (Week 5, D64) |
+| Order | `POST /orders/{id}/review` | `require_permission("order:review")` + the caller must be the order's own customer (no admin bypass, D64) |
+| Order, Rider | `GET /orders/internal/{id}/explain-context`, `GET /orders/internal/customers/{id}/latest-order`, `GET /orders/internal/restaurants/{id}/reviews`, `POST /riders/internal/order-courier` | `require_internal` — for the AI Service, which holds the caller's identity and decides ownership itself (Week 5, D64) |
 | Menu, Restaurant, Analytics | `GET /menus/{id}/internal`, `GET /menus/internal/restaurant-ids`, `GET /restaurants/{id}/internal`, `GET /analytics/internal/customers/{id}/summary` | `require_internal` — for the AI Service's ingestion worker and RAG assembler, which hold no user token (D61/D62) |
 
 Every health endpoint (`GET /api/v1/{service}/health`) is deliberately unguarded — a probe

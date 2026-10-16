@@ -139,6 +139,26 @@ CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
     ON orders (restaurant_id, created_at)
     WHERE status = 'confirmed' AND kitchen_decision IS NULL;
 
+-- 3. Order Reviews (One Customer Rating + Comment Per Delivered Order — Week 5, D64)
+-- Written by the customer through POST /api/v1/orders/{order_id}/review, read by the AI
+-- Service's review-summary tool over an internal route. `restaurant_id` is copied from the
+-- order so a restaurant's reviews are one indexed read rather than a join, and so the row
+-- keeps saying which restaurant it was about even if the order is later archived.
+-- UNIQUE (order_id): the engine, not a check in the handler, is what makes "one review per
+-- order" true under concurrent submits.
+CREATE TABLE IF NOT EXISTS order_reviews (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+    customer_id UUID NOT NULL,   -- users.id       (User Service database)
+    restaurant_id UUID NOT NULL, -- restaurants.id (Restaurant Service database)
+    rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment TEXT CHECK (char_length(comment) <= 1000),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_reviews_restaurant
+    ON order_reviews (restaurant_id, created_at DESC);
+
 -- ============================================================================
 -- No transactional outbox table here any more (D53, superseding Week 3's D39).
 --

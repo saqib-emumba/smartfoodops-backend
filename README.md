@@ -9,7 +9,9 @@ Analytics read-model and a Notification pipeline that dispatches simulated SMS/e
 Celery — and the whole platform is traced end to end with OpenTelemetry into Jaeger, and
 scraped by Prometheus into Grafana dashboards. Part B adds a semantic retrieval layer: an AI
 Service with its own pgvector database, an ingestion worker fed by a `menu.published` event,
-hybrid semantic search, and a multi-source RAG context for the Week 5 assistant (D59–D62).
+hybrid semantic search, and a multi-source RAG context (D59–D62); Week 5 adds a streaming conversational
+assistant built as a LangGraph with a code-enforced grounding check, order explanations, order reviews and
+restaurant-admin authoring tools (D63–D65).
 Everything runs locally through Docker Compose: eight PostgreSQL databases, Redis, the
 Temporal dev server, Kafka, Schema Registry, RabbitMQ, Jaeger, Prometheus, Grafana, the
 gateway, nine FastAPI services and five background workers (the saga worker, two
@@ -95,14 +97,14 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | `user-service` | 8001 | `roles`, `users`, and the RBAC policy (`permissions`, `role_permissions`, `route_permissions` — D57) | `sfo_user_core` @ `sfo-user-db` (5432) | — |
 | `restaurant-service` | 8002 | `restaurants` | `sfo_restaurant_core` @ `sfo-restaurant-db` (5433) | User Service (owner check) |
 | `menu-service` | 8003 | `menus` and its item tree, including each item's owner-declared `dietary_tags` (D60) | `sfo_menu_core` @ `sfo-menu-db` (5436), cached in Redis DB 0 | Restaurant Service (active check); publishes `menu.published` to Kafka (D61, best-effort) |
-| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal (starts the saga, signals the kitchen's decision — D47) |
+| `order-service` | 8004 | `orders` (incl. the kitchen queue), `order_tracking_logs`, `order_reviews` | `sfo_order_core` @ `sfo-order-db` (5434) | Menu Service (pricing), User + Restaurant Services (participant + ownership checks), Temporal (starts the saga, signals the kitchen's decision — D47) |
 | `payment-service` | 8005 | `payments` | `sfo_payment_core` @ `sfo-payment-db` (5435) | Order Service (order + amount check) |
-| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (records the pickup/delivery stage), Temporal (signals the saga — D47); answers the AI Service's courier-availability reads (D62) |
+| `rider-service` | 8006 | `riders` | `sfo_rider_core` @ `sfo-rider-db` (5437) | User Service (role check), Order Service (records the pickup/delivery stage), Temporal (signals the saga — D47); answers the AI Service's courier-availability and courier-distance reads (D62, D64) |
 | `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; health and `/metrics` alone since D47, and the gateway proxies just its `/health` |
 | `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
 | `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls (D44); since D62 it also serves an internal-key customer-history read, so it now holds the internal key |
-| `ai-service` | 8009 | the vector documents (`menu_item_documents`, `restaurant_documents`) | `sfo_vector_core` @ `sfo-vector-db` (5439, pgvector) | Analytics + Rider Services (internal routes, for RAG context); embeds queries with a local model (D59–D62) |
-| `ai-ingestion-worker` | — | the same vector database | `sfo_vector_core` (5439) | Kafka (`menu.published`), Menu + Restaurant Services (internal routes) — keeps the vectors in step with the menus (D61) |
+| `ai-service` | 8009 | the vector documents (`menu_item_documents`, `restaurant_documents`) and the assistant usage log (`assistant_interactions`) | `sfo_vector_core` @ `sfo-vector-db` (5439, pgvector) | Analytics, Rider, Order and Restaurant Services (internal routes); Redis db 3 (conversation memory); a chat model (Claude by default, Ollama selectable); embeds queries with a local model (D59–D65) |
+| `ai-ingestion-worker` | — | the same vector database | `sfo_vector_core` (5439) | Kafka (`menu.published`), Menu + Restaurant Services (internal routes) — keeps the vectors in step with the menus (D61); also consumes `order.created` to attribute orders to assistant recommendations (D65) |
 | `notification-consumer` | — | nothing — no database | — | Kafka (reads), User Service (resolves contact details, D45), RabbitMQ (enqueues) |
 | `notification-worker` | — | nothing — no database | — | RabbitMQ only — no sibling calls, no JWT keys |
 
@@ -317,6 +319,73 @@ curl -s -X POST http://localhost/api/v1/ai/rag-context -H "Authorization: Bearer
 Full reasoning: D59–D62 in [readme/key-decisions.md](readme/key-decisions.md); the phased build in
 [readme/week4-ai-retrieval-plan.md](readme/week4-ai-retrieval-plan.md).
 
+### The AI assistant (Part B, Week 5)
+
+```
+GET /api/v1/ai/assistant/stream?q=...        (SSE, customers: ai:assistant)
+        │
+        ▼
+   router ──▶ out of scope ───────────────────────────────▶ fixed reply
+     │
+     ├─▶ food / restaurant ─▶ retrieve (Week 4 RAG: vector + analytics + courier) ─┐
+     │                              └─ nothing above the similarity floor ─▶ "nothing matches" (no model call)
+     └─▶ order tracking ───▶ retrieve (order + trail + saga stage + courier distance) ─┤
+                                                                                       ▼
+                                                  generate (model, streams tokens) ─▶ guardrail ─▶ final chunk
+```
+
+```bash
+# Stream an answer (-N: do not buffer). Tokens arrive as `data: {"token": "...", "done": false}`;
+# the last chunk has done=true, the conversation_id, the routed intent, and `grounded`.
+curl -N -H "Authorization: Bearer $CUSTOMER" -H 'Accept: text/event-stream' \
+  "http://localhost/api/v1/ai/assistant/stream?q=Recommend+spicy+sushi+under+%2415"
+
+# Continue the conversation, optionally with a location for "near me".
+curl -N -H "Authorization: Bearer $CUSTOMER" \
+  "http://localhost/api/v1/ai/assistant/stream?q=and+something+vegan%3F&conversation_id=$CONV&latitude=33.68&longitude=73.04"
+
+# Explain an order you placed (also answered inside the stream: "why is my order late?").
+curl -s -X POST http://localhost/api/v1/ai/explain-order -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' -d "{\"order_id\":\"$ORDER_ID\"}"
+
+# Review a delivered order (once), then summarise a restaurant's reviews as its owner.
+curl -s -X POST "http://localhost/api/v1/orders/$ORDER_ID/review" -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' -d '{"rating":4,"comment":"Great food, slow delivery."}'
+curl -s -X POST http://localhost/api/v1/ai/partner/review-summary -H "Authorization: Bearer $OWNER" \
+  -H 'Content-Type: application/json' -d "{\"restaurant_id\":\"$REST_ID\"}"
+```
+
+- **Needs a chat model.** `ANTHROPIC_API_KEY` in the root `.env` (default provider, `claude-sonnet-5-5`), or
+  `LLM_PROVIDER=ollama` with `OLLAMA_BASE_URL`. Without either, the assistant endpoints answer `503` and
+  search, RAG context and ingestion are unaffected. `LLM_PROVIDER=fake` selects a deterministic test double
+  — it is what the smoke test uses (`LLM_PROVIDER=fake docker compose up -d ai-service`), never a default.
+- **Grounded in code, not only in the prompt.** Retrieval always runs before generation, and the finished
+  answer is checked: every dish or restaurant name in bold must exist in the retrieved context, and every
+  price must match one. A failing answer is replaced — the final chunk carries `grounded: false` and a
+  `replacement` the client shows instead. Limits are stated in D63: it catches invented names, prices and
+  figures, not an invented ingredient in prose.
+- **Zero invention about orders.** An explanation uses only the order's recorded trail, the saga's own stage
+  and the assigned courier's distance. A cancellation cause comes from a fixed table of the saga's reason
+  codes (an unknown one reads "no recorded reason"); there is no arrival time, because the platform has no
+  real one; no error text and no rider identity reach the model (D64).
+- **Memory.** Conversations live in Redis (db 3) for an hour, keyed by user and conversation id, so one
+  customer's history is never reachable with another's.
+- **Partner tools** (`restaurant_admin` owning the restaurant): `describe-dish`, `promo`, `review-summary`.
+  Generated copy may not contain a number the owner did not supply; review counts and averages come from the
+  database, not the model.
+- **Business telemetry.** Each answer is logged (ids and outcomes only — never the question or answer), and
+  `order.created` events are matched to a recommendation by the same customer for the same restaurant within
+  24 hours (D65). The *SmartFoodOps — AI Assistant* Grafana dashboard shows usage, answer rate, first-token
+  and end-to-end latency, guardrail replacements, provider failures, acceptance rate and attributed revenue.
+  It is attribution, not lift.
+- **Streaming through the gateway** needs buffering off for that one route; `api-gateway/nginx.conf` has a
+  dedicated `location = /api/v1/ai/assistant/stream` for it. A stream the gateway buffered would arrive all
+  at once, which is exactly the lag streaming exists to remove.
+
+Full reasoning: D63–D65 in [readme/key-decisions.md](readme/key-decisions.md); the phased build in
+[readme/week5-ai-assistant-plan.md](readme/week5-ai-assistant-plan.md); the request flow in
+[readme/diagrams/ai_assistant_sequence_diagram.md](readme/diagrams/ai_assistant_sequence_diagram.md).
+
 ### References that cross a database boundary
 
 A foreign key cannot span two physical databases, so a column pointing at another service's
@@ -431,6 +500,8 @@ service talks to which database.
 | `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD`, `RIDER_POSTGRES_PASSWORD`, `ANALYTICS_POSTGRES_PASSWORD`, `VECTOR_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
 | `GRAFANA_ADMIN_PASSWORD` | yes | Grafana's own admin login, not a database password |
 | `EMBEDDING_PROVIDER`, `OPENAI_API_KEY` | no | `local` (default) embeds in-container with no key; `openai` calls the API and needs the key. Compose passes both through (Week 4, D59) |
+| `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | no — but the assistant endpoints answer `503` without a usable one | `anthropic` (default) calls Claude and needs the key; `ollama` uses a self-hosted server; `fake` is a deterministic test double for the smoke test. Passed to `ai-service` only (Week 5, D63) |
+| `AI_REDIS_URL`, `ASSISTANT_MIN_SCORE`, `ATTRIBUTION_WINDOW_HOURS`, `FAKE_LLM_TOKEN_DELAY_SECONDS` | no | Conversation memory Redis (default db 3); the cosine floor below which retrieval counts as "nothing matches" (0.30); the window for attributing an order to a recommendation (24h); a per-token delay for the fake model only (Week 5, D63/D65) |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | yes | Celery's broker credentials (Week 3, D45) — required even though Kafka, not RabbitMQ, is the durable ledger |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
@@ -547,9 +618,11 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 552 assertions against http://localhost
+./scripts/smoke-test.sh            # 648 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 379 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 470 assertions, skips the saga sections and the policy-TTL wait
+# The Week 5 wording checks run only when the AI service uses the deterministic model:
+#   LLM_PROVIDER=fake docker compose up -d ai-service   (then reload the gateway)
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
@@ -940,6 +1013,10 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/orders/{order_id}` | the order's customer, or `system_admin` | Exposes the recalculated `total_amount` to the Payment Service |
 | `POST` | `/api/v1/orders/logs` | services only (`X-Internal-Key`) | Appends one row to `order_tracking_logs`; `422` on an unknown order or an undefined status |
 | `GET` | `/api/v1/orders/{order_id}/logs` | the order's customer, or `system_admin` | The full transition timeline, oldest first |
+| `POST` | `/api/v1/orders/{order_id}/review` | `customer` who placed it | A rating 1–5 and optional comment; `409` unless the order is `delivered`, and `409` on a second review (D64) |
+| `GET` | `/api/v1/ai/assistant/stream?q=` | `customer` | Server-Sent Events: `data: {"token", "done"}` chunks; the final one carries `conversation_id`, `intent`, `grounded` and, if the guardrail rejected the answer, `replacement` (D63). Not enveloped — a stream has no single body |
+| `POST` | `/api/v1/ai/explain-order` | `customer` who placed the order | Plain-language status, delay or cancellation, grounded in the trail and saga stage (D64) |
+| `POST` | `/api/v1/ai/partner/{describe-dish,promo,review-summary}` | `restaurant_admin` **owning the restaurant in the body** | Authoring tools; copy may not contain a number the owner did not supply (D64) |
 | `POST` | `/api/v1/payments` | `customer` owning the order | `409` for a saga-owned order (D30); otherwise `201`/`200` idempotent replay |
 | `GET` | `/api/v1/payments/{payment_id}` | the order's customer | Where a payment stopped — `pending`, `authorized` or `refunded` |
 | `GET` | `/api/v1/orders/kitchen/{restaurant_id}` | `restaurant_admin` owning it | The kitchen's rail, oldest first. Returns a narrowed projection — no `total_amount`, `customer_id` or `idempotency_key` |
@@ -970,6 +1047,10 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/restaurants/{restaurant_id}/internal` | AI ingestion worker | The restaurant record, for a caller with no user |
 | `POST` | `/api/v1/riders/internal/nearby` | AI Service | Available-rider count and nearest distance around a point — aggregates only, never a rider id or position (D62) |
 | `GET` | `/api/v1/analytics/internal/customers/{customer_id}/summary` | AI Service | Order counts and favourite restaurants; zeros for a customer with no history (D62). Not routed by the gateway |
+| `GET` | `/api/v1/orders/internal/{order_id}/explain-context` | AI Service | The order, its reduced trail (status, service, reason code, time — never `detail` or `raw_log`) and the running workflows' stage (D64) |
+| `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order` | AI Service | A customer's most recent order id, so "why is my order late?" needs none |
+| `GET` | `/api/v1/orders/internal/restaurants/{restaurant_id}/reviews` | AI Service | Review count, average and recent commented reviews — no customer id (D64) |
+| `POST` | `/api/v1/riders/internal/order-courier` | AI Service | Distance from a point to the rider carrying an order — never an id, position or ETA (D64) |
 
 Interactive docs per service, once you expose a port (see below): `http://localhost:<port>/docs`.
 
@@ -1170,8 +1251,9 @@ docker exec -it sfo-analytics-db psql -U sfo_analytics_admin -d sfo_analytics_co
 #   -- if this database were dropped entirely, resetting the "analytics" consumer group's
 #   -- Kafka offset and replaying the topic would rebuild both tables exactly.
 
-# Vector database — the AI Service's embeddings of the menus (Week 4, D59). Derived state:
-# dropping it loses nothing a menu publish or `--backfill` cannot rebuild.
+# Vector database — the AI Service's embeddings of the menus (Week 4, D59). The documents are derived
+# state: dropping them loses nothing a menu publish or `--backfill` cannot rebuild. The one exception is
+# `assistant_interactions` (Week 5, D65), a usage log — losing it loses telemetry, never a menu or order.
 docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core
 #   SELECT restaurant_name, item_name, base_price, dietary_tags FROM menu_item_documents LIMIT 5;
 #   SELECT vector_dims(embedding), embedding_model, count(*) FROM menu_item_documents GROUP BY 1, 2;
@@ -1221,6 +1303,17 @@ docker exec -i sfo-menu-db psql -U sfo_menu_admin -d sfo_menu_core < db/menu/add
 docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_ai_permissions.sql
 ```
 
+Week 5 adds three more, same rules, each run **before** the matching service build:
+
+```bash
+# order_reviews (D64) — before the new order-service build
+docker exec -i sfo-order-db psql -U sfo_order_admin -d sfo_order_core < db/order/add_order_reviews.sql
+# ai:assistant / ai:explain_order / ai:partner / order:review, their grants and routes (D63, D64)
+docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_week5_permissions.sql
+# assistant_interactions (D65) — before the new ai-service build
+docker exec -i sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core < db/vector/add_assistant_interactions.sql
+```
+
 The new `kafka/init-topics.sh` topics (`sfo.menu.events.v1` and its DLQ) are created by the
 one-shot `kafka-init` container: on an existing broker, `docker compose run --rm kafka-init`.
 
@@ -1244,7 +1337,8 @@ smartfoodops-backend/
 ├── prometheus/prometheus.yml  # Scrape config — every FastAPI service, both Temporal ports,
 │                              #   the outbox relays' own metrics, RabbitMQ (Week 3)
 ├── grafana/provisioning/      # Datasource + dashboards, file-provisioned so `down -v`
-│                              #   never loses them (Week 3, D42)
+│                              #   never loses them (Week 3, D42); AI Retrieval (Week 4) and
+│                              #   AI Assistant (Week 5) dashboards
 ├── kafka/init-topics.sh       # One-shot: creates sfo.order.events.v1 (+ .dlq) explicitly,
 │                              #   at the partition count per-order ordering depends on
 ├── rabbitmq/enabled_plugins   # Enables the management UI and the Prometheus exporter
@@ -1253,15 +1347,19 @@ smartfoodops-backend/
 │   │                          #   route_permissions (the RBAC policy, D57)
 │   ├── user/add_rbac_permissions.sql  # hand-run migration for an already-initialised user DB
 │   ├── user/add_ai_permissions.sql    # hand-run: ai:search / ai:rag_context (Week 4)
+│   ├── user/add_week5_permissions.sql # hand-run: ai:assistant / ai:explain_order / ai:partner / order:review (Week 5)
 │   ├── restaurant/init.sql    # restaurants
 │   ├── menu/init.sql          # menus (category tree as JSONB)
 │   ├── menu/add_dietary_tags.sql  # hand-run: menu_items.dietary_tags (Week 4, D60)
 │   ├── order/init.sql         # order_status enum, orders (+ outbox + rider report columns,
-│   │                          #   Week 3), order_tracking_logs, order_outbox
+│   │                          #   Week 3), order_tracking_logs, order_outbox, order_reviews (Week 5)
+│   ├── order/add_order_reviews.sql    # hand-run: order_reviews (Week 5, D64)
 │   ├── payment/init.sql       # payment_status enum, payments, payment_outbox
 │   ├── rider/init.sql         # riders
 │   ├── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
-│   └── vector/init.sql        # pgvector: menu_item_documents, restaurant_documents (HNSW) — Week 4
+│   ├── vector/init.sql        # pgvector: menu_item_documents, restaurant_documents (HNSW) — Week 4;
+│   │                          #   assistant_interactions (usage log + attribution) — Week 5
+│   └── vector/add_assistant_interactions.sql  # hand-run (Week 5, D65)
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
 │   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_permission, require_self_or_admin
@@ -1329,7 +1427,11 @@ smartfoodops-backend/
 │   └── ai/                      # main.py, deps.py, ingestion.py (the worker), chunking.py,
 │                                #   embeddings.py, rag_context.py, apis/{search,rag,health}.py,
 │                                #   repositories/{vectors,documents}.py, clients/
-│                                #   Two containers, one image (Week 4, D59-D62)     (:8009)
+│                                #   Week 5: llm.py (provider factory), agents/{graph,router,context,
+│                                #   prompts}.py (the LangGraph), guardrails.py, order_explainer.py,
+│                                #   partner.py, memory.py (Redis), attribution.py, fake_llm.py (test
+│                                #   double), assistant_deps.py, apis/{assistant,explain,partner}.py
+│                                #   Two containers, one image (Weeks 4-5, D59-D65)  (:8009)
 ├── scripts/
 │   ├── smoke-test.sh           # End-to-end assertions across the whole stack
 │   ├── saga-resilience-test.sh # Concurrency, durability and lost-signal recovery

@@ -250,6 +250,10 @@ SELECT r.name AS role, p.name AS permission
 | `delivery:report` | `rider` | Reporting pickup and delivery |
 | `ai:search` | `customer` | Semantic search over dishes and restaurants (Week 4, D59) |
 | `ai:rag_context` | `customer` | Assembling RAG context for the caller's own account (Week 4, D62) |
+| `ai:assistant` | `customer` | Asking the streaming food assistant (Week 5, D63) |
+| `ai:explain_order` | `customer` | Having the AI explain an order the caller placed (Week 5, D64) |
+| `order:review` | `customer` | Reviewing a delivered order the caller placed (Week 5, D64) |
+| `ai:partner` | `restaurant_admin` | The AI authoring tools for a restaurant the caller owns (Week 5, D64) |
 
 **Which permission each route demands** (`route_permissions`). Ownership checks are unchanged
 and still in the handlers — they need the resource row, so they can never move to the gateway:
@@ -278,7 +282,11 @@ and still in the handlers — they need the resource row, so they can never move
 | `POST /api/v1/riders/me/orders/{id}/picked-up` \| `/delivered` | `delivery:report` | self-scoped by construction | |
 | `POST /api/v1/ai/search` | `ai:search` | — (reads only published, available dishes) | D59 |
 | `POST /api/v1/ai/rag-context` | `ai:rag_context` | `require_self_or_admin` on the body's `customer_id` | D62 |
-| `/api/v1/payments/authorize` \| `/refund` \| `/manual`, `/api/v1/orders/*/internal*`, `/transitions`, `/rider-report`, `/logs`, `/api/v1/riders/dispatch` \| `/release` \| `/internal/nearby`, `/api/v1/menus/*/internal` \| `/internal/restaurant-ids`, `/api/v1/restaurants/*/internal`, `/api/v1/analytics/internal/*` | *absent from the table* | — | `require_internal` only (D15); the gateway refuses them (no row, or no route at all) |
+| `GET /api/v1/ai/assistant/stream` | `ai:assistant` | — (the caller's own identity scopes retrieval, history and order lookups) | D63 |
+| `POST /api/v1/ai/explain-order` | `ai:explain_order` | `require_self_or_admin` on the order's `customer_id` | D64 |
+| `POST /api/v1/ai/partner/describe-dish` \| `/promo` \| `/review-summary` | `ai:partner` | `verify_owner` on the body's `restaurant_id`, as the caller | D64 |
+| `POST /api/v1/orders/{id}/review` | `order:review` | the caller must be the order's customer — **not** `require_self_or_admin`: an admin may not write a customer's review | D64 |
+| `/api/v1/payments/authorize` \| `/refund` \| `/manual`, `/api/v1/orders/*/internal*`, `/transitions`, `/rider-report`, `/logs`, `/api/v1/riders/dispatch` \| `/release` \| `/internal/nearby` \| `/internal/order-courier`, `/api/v1/orders/internal/*` (explain-context, latest-order, restaurant reviews), `/api/v1/menus/*/internal` \| `/internal/restaurant-ids`, `/api/v1/restaurants/*/internal`, `/api/v1/analytics/internal/*` | *absent from the table* | — | `require_internal` only (D15); the gateway refuses them (no row, or no route at all) |
 
 Three things to read carefully in that table:
 

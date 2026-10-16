@@ -319,7 +319,7 @@ async def main(backfill_only: bool) -> None:
     import signal
 
     from common.config import service_url
-    from common.events.topics import MENU_EVENTS_TOPIC
+    from common.events.topics import MENU_EVENTS_TOPIC, ORDER_EVENTS_TOPIC
     from ai import deps
 
     logger = deps.logger
@@ -351,9 +351,21 @@ async def main(backfill_only: bool) -> None:
             schema_registry_url=service_url("SCHEMA_REGISTRY_URL", "http://schema-registry:8081"),
             logger=logger,
         )
+        # The attribution consumer (Week 5, D63) shares this process: it is a few lines of SQL per
+        # order, so a container of its own would cost more than it protects.
+        from ai.attribution import AttributionConsumer
+        from ai.repositories.interactions import InteractionRepository
+
+        attribution = AttributionConsumer(
+            InteractionRepository(deps.db, logger=logger),
+            topic=ORDER_EVENTS_TOPIC,
+            bootstrap_servers=service_url("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092"),
+            logger=logger,
+        )
         tasks = [
             asyncio.create_task(_startup_backfill(service, logger)),
             asyncio.create_task(consumer.run_forever()),
+            asyncio.create_task(attribution.run_forever()),
         ]
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()

@@ -2,10 +2,11 @@
 
 `smartfoodops.postman_collection.json` is every route the Nginx gateway exposes across all 8
 services (user, restaurant, menu, order, payment, rider, orchestrator, ai), built from the same
-contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 156 requests across 11 folders,
+contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 177 requests across 12 folders,
 covering the happy path, authorisation boundaries, validation edge cases, and the Temporal-driven
-order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery), and the Week 4 AI
-layer (dietary-tagged menus, semantic search, RAG context).
+order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery), the Week 4 AI
+layer (dietary-tagged menus, semantic search, RAG context), and the Week 5 AI layer (the streaming
+assistant, order explanations, order reviews, the restaurant-admin authoring tools).
 
 The JSON is hand-maintained directly — there is no generator script in this repo despite what an
 earlier version of this doc said. When you add or change a request, check it for duplicate names
@@ -29,7 +30,7 @@ json.load(open('smartfoodops.postman_collection.json'))"`).
 
 ## Running it
 
-**Run order matters.** Folders are numbered 1–10 because later ones read collection variables
+**Run order matters.** Folders are numbered 1–11 because later ones read collection variables
 (bearer tokens, ids) that earlier ones set via `pm.collectionVariables.set(...)` in their Tests
 scripts — the same reason `scripts/smoke-test.sh` is one long script rather than independent
 pieces. Use the **Collection Runner** (Postman's GUI test runner, not the `Send` button) and run
@@ -61,6 +62,14 @@ RAG context. Its first search waits ~2.5s in a pre-request script: the menu publ
 is indexed asynchronously by the ingestion worker, via Kafka. The cases that need a container
 stopped (a degraded analytics or rider source) or Kafka inspected (the dead-letter queue) are in
 `scripts/smoke-test.sh` only — Postman cannot stop a container.
+
+**Folder 11 (AI Assistant) needs everything folder 10 does, plus a delivered `{{order_id}}`** (the review
+requests need it) and a chat provider on the AI service: `ANTHROPIC_API_KEY`, `LLM_PROVIDER=ollama`, or
+`LLM_PROVIDER=fake` for a deterministic run. The streaming requests show the event stream once it has
+ended — Postman reports a response when it completes; to watch tokens arrive use
+`curl -N -H "Authorization: Bearer $TOKEN" "http://localhost/api/v1/ai/assistant/stream?q=..."`. Assertions
+are provider-agnostic (structure, ownership, the grounding contract), so they hold whatever the model says;
+the checks that need exact wording, such as the guardrail replacing a fabricated dish, are in the smoke test.
 
 ## Testing just the happy path
 

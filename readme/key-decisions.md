@@ -78,6 +78,9 @@ right in Week 1 and wrong in Week 3 is more instructive than one silently rewrit
 | [D60](#d60--menu-items-carry-owner-declared-tags-from-a-fixed-vocabulary) | Menu items carry owner-declared tags from a fixed vocabulary | 2026-10-08 | Accepted |
 | [D61](#d61--a-menu-publish-is-announced-on-kafka-and-the-ai-service-re-reads) | A menu publish is announced on Kafka and the AI Service re-reads | 2026-10-08 | Accepted |
 | [D62](#d62--rag-context-is-assembled-from-three-stores-and-degrades-instead-of-failing) | RAG context is assembled from three stores and degrades instead of failing | 2026-10-08 | Accepted |
+| [D63](#d63--the-assistant-is-a-langgraph-with-a-code-enforced-grounding-check-and-a-hosted-model-chosen-independently-of-the-local-embedder) | The assistant is a LangGraph with a code-enforced grounding check, and a hosted model chosen independently of the local embedder | 2026-10-15 | Accepted |
+| [D64](#d64--order-explanations-reviews-and-partner-tools-read-facts-over-internal-routes) | Order explanations, reviews and partner tools read facts over internal routes | 2026-10-15 | Accepted |
+| [D65](#d65--conversion-is-attributed-from-ordercreated-events-not-carried-through-checkout) | Conversion is attributed from `order.created` events, not carried through checkout | 2026-10-15 | Accepted |
 
 ---
 
@@ -2353,6 +2356,144 @@ generation step be honest about it.
 - **Time budgets are guesses** (`config.RAG_*_TIMEOUT_SECONDS`) and will want tuning against real
   latency; a source that misses its budget is reported, not retried.
 
+### D63 — The assistant is a LangGraph with a code-enforced grounding check, and a hosted model chosen independently of the local embedder
+
+**Decided:** `GET /api/v1/ai/assistant/stream` runs a LangGraph of four kinds of node: a **router**
+(classifies intent and extracts the budget, dietary tags and order id as JSON), **retrieval** (the Week 4
+`RagContextAssembler` for food and restaurant questions, the order explainer for order questions),
+**generation** (the model, streaming) and a **guardrail**. LangChain supplies the model wrapper
+(`ChatAnthropic` / `ChatOllama`, chosen by `LLM_PROVIDER` in `ai.llm.build_chat_model`) and message types;
+LangGraph supplies the flow. Retrieval always runs before generation because the edges say so — the model
+cannot decide to skip it, which a tool-calling agent could. A run that finds nothing above the similarity
+floor (`ASSISTANT_MIN_SCORE`, the Phase 4 open point) ends without calling the model at all.
+
+**The guardrail is code, not a prompt.** The generation prompt makes the model write every dish and
+restaurant name in **bold**, exactly as given, so the names an answer asserts are its bold spans. After
+generation each must match a name in the retrieved context, and every `$` price must match a price in it
+(plus the customer's own stated budget). An answer that fails is replaced by one rendered from the context
+by rules (`render_food_fallback`). Order explanations get the same treatment for quantities: every
+"N minutes" or "N km" must be a figure in the order facts (D64). Tokens already streamed cannot be
+recalled, so the final SSE chunk carries `replacement` and `grounded: false` and the client shows that
+instead.
+
+**Chat model and embedder are chosen independently on purpose.** Embeddings are pinned to the schema
+(`vector(384)`, vectors from two models are not comparable, a change is a re-ingest); a chat model carries no
+such state. Generation uses Claude (`claude-sonnet-5-5`) by default, and `LLM_PROVIDER=ollama` swaps in a
+self-hosted model with no code change. The embedder stays local and custom (D59) and is not replaced by a
+LangChain wrapper: nothing in the graph needs one and Week 4 is built and verified. `LLM_PROVIDER=fake`
+selects a deterministic test double (`ai/fake_llm.py`) that follows a `[ROLE:...]` tag in each prompt; it
+exists so the smoke test can drive every branch, including the guardrail's replacement, with no key and no
+network, and is never a default.
+
+**Conversation memory is Redis, not a LangGraph checkpointer.** A capped list per `ai:conv:{user_id}:{id}`
+with a one-hour TTL, loaded before the graph runs and saved after it ends. The stock checkpointers need
+psycopg3 or Redis Stack (RediSearch), neither of which the stack runs, and `MemorySaver` is unbounded and
+lost on restart. The user id is in the key, so a conversation id is a label inside one user's history and
+never a way into another's. Redis down means no history, not a failed answer.
+
+**What reaches the model:** only what `rag-context` and the explain-context route return — dish names, prices,
+tags, restaurant names, order counts, rider *counts* and a courier distance, a reduced transition trail.
+Never a rider id or position (D62), never contact details, never a free-text log `detail` or error text.
+Menu text and customer reviews are written by other people, so every prompt says the context is data and any
+instruction inside it is ignored.
+
+**Instead of:** a tool-calling agent (retrieval optional, grounding only as good as the prompt), custom
+provider classes mirroring `embeddings.py` (more code for the same interface), and Ollama only (consistent
+with D59, but weaker answers and a large extra container).
+
+**Costs:**
+
+- **Retrieved context leaves the stack** when `LLM_PROVIDER=anthropic`. Acceptable for menu data; the
+  `ollama` setting exists for a deployment where it is not.
+- **The guardrail has a ceiling.** It catches an invented dish name, price or quantity. It does not catch a
+  false claim made without a bold name, a price or a figure — an invented ingredient in prose, say. The
+  prompt forbids it and nothing else checks it. Dietary and allergen tags are the restaurant's own word, and
+  the prompt tells the model to say so.
+- **A strict name match produces some false alarms** (a model that paraphrases a dish name in bold is
+  replaced). A plainer answer is the cheaper error.
+- **Conversation text is stored.** Questions and answers sit in Redis for an hour (that is what memory is),
+  and a question travels in the URL because the spec's streaming endpoint is a `GET` — so it appears in
+  gateway access logs. The usage log in Postgres (D65) holds ids and outcomes only, but Redis and the logs
+  do not.
+- **A new secret** (`ANTHROPIC_API_KEY`), read in one place and passed through compose. The service starts
+  without it: only the assistant endpoints answer `503`, search and RAG context are unaffected.
+- **Replacement after streaming is a client contract**, not something HTTP can express.
+- **`ASSISTANT_MIN_SCORE` (0.30) is a guess** calibrated on the seed menus with MiniLM and will want
+  revisiting if the embedding model changes.
+
+### D64 — Order explanations, reviews and partner tools read facts over internal routes
+
+**Decided:** `POST /api/v1/ai/explain-order` builds a small dictionary of facts and the model only phrases
+it. The facts come from one new internal route on the Order Service
+(`GET /orders/internal/{id}/explain-context`: the order, its transition trail reduced to status, service,
+`reason` code and time, and the running fulfilment and rider workflows' own stage, read with Temporal
+Queries), the Restaurant Service (a name and coordinates) and a new Rider Service route
+(`POST /riders/internal/order-courier`: a distance from a point, never an id or position). The Order Service
+holds the Temporal client already, so the AI image needs neither `temporalio` nor a second database
+connection (D01).
+
+**What an explanation will not say.** A cause the saga did not record: `reason` codes pass through a fixed
+table and an unknown one reads as "no recorded reason". An arrival time: the platform's only estimate
+(`rider.eta`) is a labelled mock with kitchen padding in it, so no ETA is exposed. Anything from a log's
+free-text `detail` or `raw_log`, which can carry technical error text. A refund the platform did not record.
+Ownership is checked in the AI Service (`require_self_or_admin` on the order's customer) before anything is
+generated.
+
+**Reviews.** `order_reviews` (Order Service database): one rating (1–5) and an optional comment per
+*delivered* order, `UNIQUE (order_id)` so the engine rather than a check decides "once". Only the customer
+who placed the order may review it — not an admin on their behalf, because a review is the customer's
+statement. Written by `POST /orders/{id}/review` (`order:review`, granted to `customer`), read by the AI
+Service over an internal route that returns counts, an average and commented text, never a customer id.
+
+**Partner tools** (`ai:partner`, granted to `restaurant_admin`): `describe-dish`, `promo` and
+`review-summary`, each scoped to a restaurant the caller owns, verified against the Restaurant Service as the
+caller (D16). They are plain prompt → model → check chains, because there is no retrieval to force and no
+branching. The check is narrower and matched to the harm: any number in generated copy must appear in what
+the owner supplied, otherwise a plain rendering of the input is returned and flagged. Review counts and
+averages never pass through the model.
+
+**Instead of:** reading the Order database from the AI Service (D01), giving the AI image a Temporal client,
+and letting the model infer causes from raw logs.
+
+**Costs:**
+
+- **Another internal route per fact source**, each unmapped in `route_permissions` so the gateway refuses it
+  (D57). The internal key's blast radius grows by three routes (see the open question on per-service keys).
+- **Saga stage is best-effort.** A finished workflow, or Temporal being down, answers "unknown" and the
+  explanation says less.
+- **Courier distance is to the restaurant**, not the customer: orders carry no delivery coordinates.
+- **Review text is prompt input written by strangers.** Mitigated by the data-not-instructions rule and by the
+  summary being shown only to the restaurant's own owner, but a determined review could still skew a summary.
+
+### D65 — Conversion is attributed from `order.created` events, not carried through checkout
+
+**Decided:** every assistant answer is logged to `assistant_interactions` in the vector database: the
+customer, conversation, routed intent, outcome and the restaurant and dish ids it named — never the question
+or the answer. A second consumer in the existing `ai-ingestion-worker` (`ai/attribution.py`, group
+`ai-attribution`) reads `order.created` and, if the same customer ordered from a restaurant named to them in
+the last `ATTRIBUTION_WINDOW_HOURS` (24), marks that interaction converted and adds the order's value to
+`sfo_ai_attributed_revenue_total`. The dashboard's acceptance rate is attributed orders per answer that named
+a restaurant.
+
+**Instead of:** carrying an `ai_conversation_id` through checkout into the order — it would change the order
+API, the workflow payload and the event schema for a measurement, and make the Order Service know the
+assistant exists.
+
+**Why:** the information already flows on Kafka. The Order Service stays unaware, an outage of either side
+loses a data point and nothing else, and the attribution is idempotent so redelivery is harmless.
+
+**Costs:**
+
+- **It is attribution, not lift.** A customer who was always going to order from that restaurant is counted
+  too, so the figure overstates what the assistant caused. The dashboard says so.
+- **Restaurant-level, not dish-level.** `order.created` carries no line items (the same gap as D62), so "did
+  they add the recommended dish" is not answerable.
+- **Lightweight consumer by design:** no schema-registry lookup and no dead-letter topic (a dropped
+  attribution is a missing dashboard point, not a stale search). It starts from the latest offset, so a fresh
+  deployment attributes from then on.
+- **`assistant_interactions` is the one non-derived table in the vector database.** Losing it loses
+  telemetry, never an order or a menu; the database header says so.
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:
@@ -2381,6 +2522,12 @@ Not yet decided, and worth settling before the code forces an answer:
   case already used. Note this was closed with a column, not the outbox — the outbox (D39)
   answers a different question (getting a fact to Kafka), not this one (having a fact to read
   back before compensating).
+- **No rate limit on the LLM-backed endpoints** (D63, D64). `assistant/stream`, `explain-order` and the
+  partner tools each spend money per call and take a bearer token, but nothing bounds how often one
+  customer can call them: the gateway has no per-user limit and the AI Service adds none. The model's own
+  provider limits are the only ceiling, and hitting them shows up as `sfo_ai_llm_failures_total{kind="rate_limit"}`
+  for everyone at once. A per-user token bucket (in the same Redis as conversation memory) is the obvious
+  fix and is not built.
 - **Per-service credentials for internal calls** (D15, D26). The shared `INTERNAL_API_KEY`
   unlocked seven endpoints across three services after D32, including refunds, and Week 3
   added an eighth — `GET /api/v1/users/{user_id}/internal` (D45), the Notification

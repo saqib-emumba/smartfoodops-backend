@@ -1181,6 +1181,99 @@ Metrics are on the *SmartFoodOps — AI Retrieval* Grafana dashboard (<http://lo
 
 ---
 
+## 10. The AI assistant (Week 5)
+
+A streaming conversational assistant, order explanations, order reviews and the restaurant-admin
+authoring tools. The assistant needs a chat model: put `ANTHROPIC_API_KEY` in the root `.env` and
+recreate the service (`docker compose up -d ai-service`), or run it with `LLM_PROVIDER=ollama`. For a
+deterministic run with no key (the same model the smoke test uses) start it as
+`LLM_PROVIDER=fake docker compose up -d ai-service`; wording is then canned, but every branch behaves
+as it does for real. Without any of these, only the assistant endpoints answer `503`. Uses `$CUSTOMER`,
+`$OWNER` and the restaurant from section 9 (`$AI_REST`).
+
+```bash
+# Stream an answer. -N turns off curl's buffering; each event is a `data:` line.
+curl -N -H "Authorization: Bearer $CUSTOMER" -H 'Accept: text/event-stream' \
+  "$BASE/api/v1/ai/assistant/stream?q=Recommend+a+spicy+chicken+dish+under+%2415"
+# -> data: {"token": "Based", "done": false} ... then a last chunk:
+#    data: {"token": "", "done": true, "conversation_id": "...", "intent": "food_discovery", "grounded": true}
+
+# Watch the tokens arrive over time rather than at the end (the gateway must not buffer them):
+LLM_PROVIDER=fake FAKE_LLM_TOKEN_DELAY_SECONDS=0.4 docker compose up -d ai-service
+curl -sN -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=Recommend+sushi" \
+  | while IFS= read -r l; do [ -n "$l" ] && echo "$(date +%S.%N | cut -c1-5) $l"; done
+
+# Continue the same conversation (history is in Redis db 3, keyed by you and this id, for an hour):
+curl -N -H "Authorization: Bearer $CUSTOMER" \
+  "$BASE/api/v1/ai/assistant/stream?q=and+something+vegan%3F&conversation_id=<id from the last chunk>"
+docker exec sfo-redis redis-cli -n 3 --scan --pattern 'ai:conv:*'
+
+# Off-topic is declined without a dish; an impossible filter is an honest "nothing matches"
+curl -N -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=What+is+the+capital+of+France%3F"
+curl -N -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=Recommend+a+dish+under+%240.50"
+
+# Errors that happen before any output are ordinary enveloped HTTP errors:
+curl -s -w '\n[%{http_code}]\n' "$BASE/api/v1/ai/assistant/stream?q=hello+food"                          # 401
+curl -s -w '\n[%{http_code}]\n' -H "Authorization: Bearer $OWNER" "$BASE/api/v1/ai/assistant/stream?q=hello+food"   # 403
+curl -s -w '\n[%{http_code}]\n' -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=a"        # 422
+```
+
+**See the guardrail work.** With the fake model, a question containing `[force-ungrounded]` makes it
+name a dish and price that exist nowhere. The tokens still stream (they cannot be recalled), but the final
+chunk says so and supplies the answer to show instead:
+
+```bash
+curl -N -H "Authorization: Bearer $CUSTOMER" \
+  "$BASE/api/v1/ai/assistant/stream?q=Recommend+a+dish+%5Bforce-ungrounded%5D"
+# -> ... data: {"token": "", "done": true, ..., "grounded": false,
+#              "replacement": "Here is what is on the menus right now: **...** at **...** ($...)."}
+```
+
+**Orders.** `$ORDER_ID` is an order you placed (section 4). Ask in plain words, or explicitly:
+
+```bash
+curl -N -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=Why+is+my+order+late%3F"   # your latest order
+curl -s -X POST $BASE/api/v1/ai/explain-order -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' -d "{\"order_id\":\"$ORDER_ID\"}"
+# -> {"status":200,"body":{"order_id":"...","explanation":"...","grounded":true},
+#     "message":"Order explanation generated successfully","errors":null}
+# Someone else's order -> 403; an unknown one -> 404. A cancelled order's explanation uses the saga's
+# recorded reason ("the restaurant was too busy to take the order"); with no recorded reason it says so.
+```
+
+**Reviews and the partner tools.** A customer reviews a *delivered* order once; the restaurant's owner can
+then have the themes summarised. The count and average come from the database, only the prose is the model's:
+
+```bash
+curl -s -X POST $BASE/api/v1/orders/$ORDER_ID/review -H "Authorization: Bearer $CUSTOMER" \
+  -H 'Content-Type: application/json' -d '{"rating":4,"comment":"Great burger, but the delivery took a while."}'   # 201
+# again -> 409; a rating of 6 -> 422; an order that is not delivered -> 409; someone else's -> 403
+
+curl -s -X POST $BASE/api/v1/ai/partner/review-summary -H "Authorization: Bearer $OWNER" \
+  -H 'Content-Type: application/json' -d "{\"restaurant_id\":\"$REST_ID\"}"
+curl -s -X POST $BASE/api/v1/ai/partner/describe-dish -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d "{\"restaurant_id\":\"$AI_REST\",\"dish_name\":\"Zesty Chicken Karahi\",\"ingredients\":[\"chicken\",\"tomatoes\",\"green chillies\"]}"
+curl -s -X POST $BASE/api/v1/ai/partner/promo -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off all karahi this weekend\",\"channel\":\"social\"}"
+# A restaurant you do not own -> 403; a customer -> 403. Copy that states a number you did not supply is
+# replaced by a plain rendering and flagged "grounded": false.
+```
+
+**Conversion attribution.** Ask the assistant for a dish, then place an order at a restaurant it named. The
+worker's log shows the attribution, and the row is stamped:
+
+```bash
+docker compose logs --tail 5 ai-ingestion-worker | grep -i attribution
+docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core \
+  -c "SELECT intent, outcome, cardinality(recommended_restaurant_ids) AS named, converted_order_id IS NOT NULL AS converted FROM assistant_interactions ORDER BY created_at DESC LIMIT 5;"
+```
+
+Metrics are on the *SmartFoodOps — AI Assistant* Grafana dashboard (<http://localhost:3000>): questions,
+answer rate, first-token latency, guardrail replacements, provider failures, acceptance rate and attributed
+revenue.
+
+---
+
 ## Status code reference
 
 | Code | Meaning in this system |

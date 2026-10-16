@@ -17,12 +17,18 @@
 #   ./scripts/smoke-test.sh --fast       # skip the saga sections (~90s instead of ~12min)
 #   BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 #
+# The Week 5 section asserts what the AI assistant *says* only when the AI service runs with
+# LLM_PROVIDER=fake (a deterministic test double, no API key needed):
+#   LLM_PROVIDER=fake docker compose up -d ai-service && docker exec sfo-api-gateway nginx -s reload
+# Against any other provider those checks are skipped visibly; access control, validation and the
+# review rules are asserted either way.
+#
 # --fast exists for refactoring, where the cost that matters is per-commit rather than
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 379 of the 552
-# checks (counts as of Week 4's AI layer) and leaves fourteen
+# It is a real reduction in coverage, not just in runtime. --fast asserts 470 of the 648
+# checks (counts as of Week 5's AI layer, run with LLM_PROVIDER=fake) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
@@ -636,7 +642,7 @@ if have_container sfo-user-db; then
             (SELECT count(*) FROM role_permissions)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NOT NULL)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NULL);" 2>/dev/null | tr -d '[:space:]')
-  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "12|23|17|8"
+  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "16|31|23|8"
 
   # system_admin must hold every permission, or the seed's CROSS JOIN has regressed and the
   # table stops telling the whole story (db/user/init.sql section 1e).
@@ -1577,6 +1583,190 @@ if (( ! FAST )); then
     "$(jeval "any(c['available_riders'] >= 1 for c in b['courier_availability'])")" "True"
 fi
 
+# ------------------------------------------------ AI assistant (Week 5)
+# The streaming assistant, order explanations, the partner authoring tools and order reviews
+# (D63, D64). Access control, validation and review rules are asserted whatever the chat provider;
+# the assertions about what the assistant *says* need a deterministic model, so they run only when
+# the AI Service was started with LLM_PROVIDER=fake (docker compose reads it from the shell:
+#   LLM_PROVIDER=fake docker compose up -d ai-service
+# ) and are skipped otherwise rather than run against a real model whose wording varies.
+section "AI assistant and explanations (Week 5)"
+
+urlq() { python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+
+# sse_ask <query-string> [curl args...] -> SSE_CODE, SSE_EVENTS (a JSON list of the `data:` events).
+# On a non-200 the body is the ordinary envelope, left in BODY for efield/jfield.
+sse_ask() {
+  local qs="$1"; shift
+  local out
+  out=$(curl -sS -N -m 45 -w $'\n%{http_code}' "$BASE_URL/api/v1/ai/assistant/stream?$qs" \
+        -H 'Accept: text/event-stream' "$@" 2>&1)
+  SSE_CODE=$(tail -n1 <<<"$out")
+  BODY=$(sed '$d' <<<"$out")
+  SSE_EVENTS=$(python3 -c "
+import json,sys
+print(json.dumps([json.loads(l[6:]) for l in sys.stdin.read().splitlines() if l.startswith('data: ')]))" <<<"$BODY" 2>/dev/null)
+}
+# `ev` the events, `t` the streamed text, `f` the final event — single quotes only in the expression.
+sse_eval() { python3 -c "import json,sys; ev=json.load(sys.stdin); t=''.join(e['token'] for e in ev); f=ev[-1]; print($1)" <<<"$SSE_EVENTS" 2>/dev/null; }
+sse_status() { local name="$1" want="$2" qs="$3"; shift 3; sse_ask "$qs" "$@"; assert "$name" "$SSE_CODE" "$want"; }
+
+expect "AI health names the chat provider and the conversation store" 200 GET /api/v1/ai/health
+AI_LLM=$(jfield "['llm_provider']")
+assert "  conversation memory (Redis) is reachable" "$(jfield "['conversation_store_reachable']")" "True"
+
+# --- access control and validation (D57) -------------------------------------------------------
+sse_status "the assistant stream without a token -> 401" 401 "q=$(urlq 'spicy food')"
+sse_status "a rider cannot use the assistant -> 403" 403 "q=$(urlq 'spicy food')" "${RIDER_AUTH[@]}"
+sse_status "a restaurant admin cannot use the assistant -> 403" 403 "q=$(urlq 'spicy food')" "${OWNER_AUTH[@]}"
+sse_status "a one-character question -> 422" 422 "q=a" "${CUST_AUTH[@]}"
+sse_status "a malformed conversation id -> 422" 422 "q=$(urlq 'spicy food')&conversation_id=..%2Fx" "${CUST_AUTH[@]}"
+sse_status "a latitude without a longitude -> 422" 422 "q=$(urlq 'spicy food')&latitude=33.7" "${CUST_AUTH[@]}"
+
+expect "explain-order without a token -> 401" 401 POST /api/v1/ai/explain-order "{\"order_id\":\"$ORDER_ID\"}"
+expect "a restaurant admin cannot explain orders -> 403" 403 POST /api/v1/ai/explain-order \
+  "{\"order_id\":\"$ORDER_ID\"}" "${OWNER_AUTH[@]}"
+expect "explaining an unknown order -> 404" 404 POST /api/v1/ai/explain-order \
+  '{"order_id":"00000000-0000-4000-8000-000000000001"}' "${CUST_AUTH[@]}"
+expect "explaining another customer's order -> 403" 403 POST /api/v1/ai/explain-order \
+  "{\"order_id\":\"$ORDER_ID\"}" "${OTHER_AUTH[@]}"
+expect "a malformed order id -> 422" 422 POST /api/v1/ai/explain-order '{"order_id":"nope"}' "${CUST_AUTH[@]}"
+
+expect "partner tools without a token -> 401" 401 POST /api/v1/ai/partner/promo \
+  "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off karahi\"}"
+expect "a customer cannot use the partner tools -> 403" 403 POST /api/v1/ai/partner/promo \
+  "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off karahi\"}" "${CUST_AUTH[@]}"
+expect "an owner cannot write copy for someone else's restaurant -> 403" 403 POST /api/v1/ai/partner/promo \
+  "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off karahi\"}" "${OWNER2_AUTH[@]}"
+expect "an unknown promo channel -> 422" 422 POST /api/v1/ai/partner/promo \
+  "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off karahi\",\"channel\":\"pigeon\"}" "${OWNER_AUTH[@]}"
+
+# --- internal routes stay internal -------------------------------------------------------------
+# The AI Service reads the Order Service over internal-key routes. They carry no route_permissions
+# row, so the gateway refuses them for every bearer — including an admin's (D57, fail-closed).
+expect "the order explain-context route is refused at the gateway -> 403" 403 GET \
+  "/api/v1/orders/internal/$ORDER_ID/explain-context" "" "${ADMIN_AUTH[@]}"
+expect "the restaurant reviews route is refused at the gateway -> 403" 403 GET \
+  "/api/v1/orders/internal/restaurants/$REST_ID/reviews" "" "${ADMIN_AUTH[@]}"
+expect "the courier-distance route is refused at the gateway -> 403" 403 POST \
+  /api/v1/riders/internal/order-courier \
+  "{\"order_id\":\"$ORDER_ID\",\"latitude\":33.7,\"longitude\":73.0}" "${ADMIN_AUTH[@]}"
+
+# --- reviews (D64) -----------------------------------------------------------------------------
+expect "review without a token -> 401" 401 POST "/api/v1/orders/$ORDER_ID/review" '{"rating":5}'
+expect "a restaurant admin cannot review -> 403" 403 POST "/api/v1/orders/$ORDER_ID/review" '{"rating":5}' "${OWNER_AUTH[@]}"
+expect "a rating of 6 -> 422" 422 POST "/api/v1/orders/$ORDER_ID/review" '{"rating":6}' "${CUST_AUTH[@]}"
+expect "reviewing an unknown order -> 404" 404 POST "/api/v1/orders/00000000-0000-4000-8000-000000000001/review" \
+  '{"rating":5}' "${CUST_AUTH[@]}"
+expect "reviewing someone else's order -> 403" 403 POST "/api/v1/orders/$ORDER_ID/review" '{"rating":5}' "${OTHER_AUTH[@]}"
+if (( FAST )); then
+  # Nothing accepted the order, so it is still 'confirmed'.
+  expect "an order that is not delivered cannot be reviewed -> 409" 409 POST "/api/v1/orders/$ORDER_ID/review" \
+    '{"rating":5}' "${CUST_AUTH[@]}"
+  REVIEW_REST="$AI_REST"
+else
+  expect "review a delivered order" 201 POST "/api/v1/orders/$ORDER_ID/review" \
+    '{"rating":4,"comment":"Great burger, but the delivery took a little while."}' "${CUST_AUTH[@]}"
+  assert "  the rating is stored" "$(jfield "['rating']")" "4"
+  assert "  against the restaurant the order was placed with" "$(jfield "['restaurant_id']")" "$REST_ID"
+  expect "a second review of the same order -> 409" 409 POST "/api/v1/orders/$ORDER_ID/review" \
+    '{"rating":1}' "${CUST_AUTH[@]}"
+  REVIEW_REST="$REST_ID"
+fi
+
+# --- what the assistant says (deterministic model only) ----------------------------------------
+if [[ "$AI_LLM" != "fake" ]]; then
+  printf '  %sSKIP%s  assistant wording checks (LLM_PROVIDER is "%s", not "fake" — see the note above)\n' "$DIM" "$RESET" "$AI_LLM"
+else
+  sse_ask "q=$(urlq 'Recommend a spicy chicken dish under $13')" "${CUST_AUTH[@]}"
+  assert "the assistant streams a food answer" "$SSE_CODE" "200"
+  assert "  as several chunks, not one" "$(sse_eval "sum(1 for e in ev if e['token']) > 3")" "True"
+  assert "  with exactly one final chunk, and it is last" \
+    "$(sse_eval "[e['done'] for e in ev].count(True) == 1 and ev[-1]['done']")" "True"
+  assert "  routed as food discovery" "$(sse_eval "f['intent']")" "food_discovery"
+  assert "  and grounded" "$(sse_eval "f['grounded']")" "True"
+  assert "  every price quoted respects the stated budget" \
+    "$(sse_eval "all(float(x) <= 13 for x in __import__('re').findall(r'[\$](\d+(?:[.]\d+)?)', t))")" "True"
+  CONV_ID=$(sse_eval "f['conversation_id']")
+
+  sse_ask "q=$(urlq 'What is the capital of France?')" "${CUST_AUTH[@]}"
+  assert "an off-topic question is declined" "$(sse_eval "f['intent']")" "out_of_scope"
+  assert "  without involving a dish" "$(sse_eval "'**' not in t and 'SmartFoodOps' in t")" "True"
+
+  sse_ask "q=$(urlq 'Recommend a dish under $0.50')" "${CUST_AUTH[@]}"
+  assert "nothing under the price floor -> an honest 'nothing matches'" "$(sse_eval "t.startswith('I couldn')")" "True"
+
+  # The model is made to name a dish and price that exist nowhere. The guardrail must catch it and
+  # hand the client a replacement written from retrieved data alone.
+  sse_ask "q=$(urlq 'Recommend a dish to eat [force-ungrounded]')" "${CUST_AUTH[@]}"
+  assert "an ungrounded model answer is flagged" "$(sse_eval "f['grounded']")" "False"
+  assert "  a replacement is supplied" "$(sse_eval "bool(f.get('replacement'))")" "True"
+  assert "  and it names nothing that was invented" "$(sse_eval "'Imaginary' not in f['replacement'] and '\$1.00' not in f['replacement']")" "True"
+
+  # Conversation memory: two turns in one conversation are four messages in Redis, keyed by user.
+  sse_ask "q=$(urlq 'and something vegan?')&conversation_id=$CONV_ID" "${CUST_AUTH[@]}"
+  if have_container sfo-redis; then
+    assert "a follow-up is stored in the same conversation" \
+      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" "4"
+    assert "  with an expiry" \
+      "$([[ "$(docker exec sfo-redis redis-cli -n 3 TTL "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" -gt 0 ]] && echo yes)" "yes"
+    sse_ask "q=$(urlq 'spicy food please')&conversation_id=$CONV_ID" "${OTHER_AUTH[@]}"
+    assert "another customer reusing the id gets their own history" \
+      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$OTHER_ID:$CONV_ID" | tr -d '\r')" "2"
+    assert "  and the first customer's is untouched" \
+      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" "4"
+  fi
+
+  # Orders: the customer's latest order is found without an id, and a customer with none is told so.
+  sse_ask "q=$(urlq 'Why is my order late?')" "${CUST_AUTH[@]}"
+  assert "an order question is routed to order tracking" "$(sse_eval "f['intent']")" "order_tracking"
+  # Which order is "latest" depends on what the run placed after ORDER_ID, so assert the shape of the
+  # answer (the rule-written summary always opens this way) rather than a particular restaurant.
+  assert "  and answered about an order, from the order's own facts" "$(sse_eval "t.startswith('Your order') and f['grounded']")" "True"
+
+  # Naming someone else's order in the question is the same refusal as explain-order, and (since it
+  # happens before any output) a real HTTP status rather than an in-stream error.
+  sse_status "asking the assistant about another customer's order -> 403" 403 \
+    "q=$(urlq "Why is order $ORDER_ID late?")" "${OTHER_AUTH[@]}"
+
+  AIF_EMAIL="aifresh_${TAG}@example.com"
+  expect "register a customer who has never ordered" 201 POST /api/v1/users/register \
+    "{\"email\":\"$AIF_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Fresh Customer\",\"phone\":\"+1121${RANDOM}${RANDOM}\",\"role\":\"customer\"}"
+  do_login "$AIF_EMAIL" "$PASSWORD"; AIF_AUTH=(-H "Authorization: Bearer $ACCESS_TOKEN")
+  sse_ask "q=$(urlq 'Where is my order?')" "${AIF_AUTH[@]}"
+  assert "a customer with no orders is told so, not given a guess" "$(sse_eval "t.startswith('I can')")" "True"
+
+  expect "explain the customer's own order" 200 POST /api/v1/ai/explain-order \
+    "{\"order_id\":\"$ORDER_ID\"}" "${CUST_AUTH[@]}"
+  assert "  the envelope message matches the spec" "$(efield "['message']")" "Order explanation generated successfully"
+  assert "  names the restaurant" "$(jeval "'Smoke Diner' in b['explanation']")" "True"
+  assert "  and is grounded" "$(jfield "['grounded']")" "True"
+  assert "  without leaking internals" \
+    "$(jeval "not any(w in b['explanation'].lower() for w in ('workflow','traceback','exception','stage'))")" "True"
+
+  # --- partner tools ---------------------------------------------------------------------------
+  expect "draft a dish description from ingredients" 200 POST /api/v1/ai/partner/describe-dish \
+    "{\"restaurant_id\":\"$AI_REST\",\"dish_name\":\"Zesty Chicken Karahi\",\"ingredients\":[\"chicken\",\"tomatoes\",\"green chillies\"]}" \
+    "${OWNER_AUTH[@]}"
+  assert "  it describes that dish" "$(jeval "'Zesty Chicken Karahi' in b['description']")" "True"
+  assert "  and is grounded" "$(jfield "['grounded']")" "True"
+  expect "describe-dish needs at least one ingredient -> 422" 422 POST /api/v1/ai/partner/describe-dish \
+    "{\"restaurant_id\":\"$AI_REST\",\"dish_name\":\"Plain\",\"ingredients\":[]}" "${OWNER_AUTH[@]}"
+  expect "draft promotional copy for an offer" 200 POST /api/v1/ai/partner/promo \
+    "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off all karahi this weekend\"}" "${OWNER_AUTH[@]}"
+  assert "  the offer is carried through unaltered" "$(jeval "'10% off all karahi this weekend' in b['promo_text']")" "True"
+  expect "summarise a restaurant's reviews" 200 POST /api/v1/ai/partner/review-summary \
+    "{\"restaurant_id\":\"$REVIEW_REST\"}" "${OWNER_AUTH[@]}"
+  if (( FAST )); then
+    assert "  no reviews: count is zero" "$(jfield "['review_count']")" "0"
+    assert "  and nothing is invented to fill the gap" "$(jfield "['summary']")" "None"
+  else
+    assert "  the count comes from the database" "$(jfield "['review_count']")" "1"
+    assert "  and so does the average" "$(jfield "['average_rating']")" "4.0"
+    assert "  with a written summary" "$([[ "$(jfield "['summary']")" != "None" ]] && echo yes)" "yes"
+  fi
+fi
+
 # --- graceful degradation ----------------------------------------------------------------------
 # A source that is down is reported in `sources_failed`; the rest of the context is still served.
 # Silence would be worse than an error: the model would read "no riders listed" as "no riders".
@@ -1756,14 +1946,16 @@ print(sum(1 for x in t if x.get('health') == 'up'), len(t))
   # labels by the matched ROUTE TEMPLATE rather than request.url.path (the bug the Week 3
   # blueprint draft made) is to keep this bounded regardless of how many orders the
   # platform has ever served. A regression back to the raw path would make this number
-  # climb with every order id the suite has ever minted.
+  # climb with every order id the suite has ever minted. The bound is a ceiling well below that
+  # failure (hundreds), not a count of routes: it was 60 until Week 5 added ten route templates
+  # (the assistant, explain-order, three partner tools, reviews and the internal reads).
   ROUTE_CARD=$(prom_value 'count(count by (route) (sfo_http_requests_total))')
   ROUTE_CARD_INT=${ROUTE_CARD%%.*}
-  if [[ -n "$ROUTE_CARD_INT" ]] && (( ROUTE_CARD_INT < 60 )); then
+  if [[ -n "$ROUTE_CARD_INT" ]] && (( ROUTE_CARD_INT < 100 )); then
     ok "  route-template cardinality stays bounded ($ROUTE_CARD_INT distinct routes)"
   else
     bad "  route-template cardinality stays bounded" \
-      "got '$ROUTE_CARD' distinct routes, expected < 60 — request.url.path may have leaked into a label"
+      "got '$ROUTE_CARD' distinct routes, expected < 100 — request.url.path may have leaked into a label"
   fi
 
   # Week 4 (D59): the AI Service's own metrics, fed by the searches and RAG calls above. Prometheus
@@ -1777,6 +1969,21 @@ print(sum(1 for x in t if x.get('health') == 'up'), len(t))
     done
     assert "  $metric is reaching Prometheus" "$([[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && echo yes)" "yes"
   done
+
+  # Week 5 (D63, D64): fed by the assistant, explanation and partner calls above, which only ran
+  # their wording checks against the deterministic model.
+  if [[ "${AI_LLM:-}" == "fake" ]]; then
+    for metric in sfo_ai_assistant_requests_total sfo_ai_llm_calls_total sfo_ai_guardrail_violations_total \
+                  sfo_ai_explain_requests_total sfo_ai_partner_requests_total; do
+      AI_METRIC=""
+      for _ in $(seq 1 6); do
+        AI_METRIC=$(prom_value "sum($metric)"); AI_METRIC=${AI_METRIC%%.*}
+        [[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && break
+        sleep 5
+      done
+      assert "  $metric is reaching Prometheus" "$([[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && echo yes)" "yes"
+    done
+  fi
 else
   printf '  %sSKIP%s  Prometheus checks (localhost:9090 not reachable)\n' "$DIM" "$RESET"
 fi

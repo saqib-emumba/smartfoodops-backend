@@ -17,6 +17,10 @@ class SearchRequest(BaseModel):
     top_k: int = Field(5, ge=1, le=20)
     # Hard SQL constraints, applied beside the vector ordering — not hints to it.
     max_price: Optional[float] = Field(None, gt=0)
+    # Minimum cosine similarity a match must reach. A semantic search otherwise always returns its
+    # nearest rows, however weak, so an off-topic query still gets matches; the Week 5 assistant
+    # sets this so it can say "nothing matches" instead of presenting a poor one (D63).
+    min_score: Optional[float] = Field(None, ge=0, le=1)
     # Every tag listed must be present on a match (array containment). Validated against the
     # shared vocabulary (common/dietary.py) so a typo is a 422, not a silently empty result.
     dietary_filters: List[str] = []

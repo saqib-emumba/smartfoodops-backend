@@ -144,6 +144,7 @@ class RagContextAssembler:
             top_k=request.top_k,
             max_price=request.max_price,
             tags=request.dietary_filters,
+            min_score=request.min_score,
         )
 
     def _restaurants(self, rows: list[dict], request: RagContextRequest) -> list[RagRestaurant]:

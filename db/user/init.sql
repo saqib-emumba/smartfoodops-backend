@@ -90,7 +90,11 @@ INSERT INTO permissions (name, description) VALUES
 ('rider:profile',      'Join the fleet and maintain own rider profile, location, availability'),
 ('delivery:report',    'Report pickup and delivery of an assigned order'),
 ('ai:search',          'Semantic search over dishes and restaurants (Week 4, D59)'),
-('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)')
+('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)'),
+('ai:assistant',       'Ask the conversational food assistant (streamed answers grounded in retrieved context, D63)'),
+('ai:explain_order',   'Have the AI explain the status or delay of an order the caller owns (D64)'),
+('ai:partner',         'Use the AI authoring tools for a restaurant the caller owns: dish copy, promos, review summaries (D64)'),
+('order:review',       'Review a delivered order the caller placed (D64)')
 ON CONFLICT (name) DO NOTHING;
 
 -- 1e. Role <-> permission grants. Composite PK for the same reason as user_roles (1c):
@@ -112,10 +116,14 @@ FROM (VALUES
     ('customer',         'payment:read'),
     ('customer',         'ai:search'),
     ('customer',         'ai:rag_context'),
+    ('customer',         'ai:assistant'),
+    ('customer',         'ai:explain_order'),
+    ('customer',         'order:review'),
     ('restaurant_admin', 'restaurant:onboard'),
     ('restaurant_admin', 'menu:write'),
     ('restaurant_admin', 'kitchen:read'),
     ('restaurant_admin', 'kitchen:decide'),
+    ('restaurant_admin', 'ai:partner'),
     ('rider',            'rider:profile'),
     ('rider',            'delivery:report'),
     ('system_admin',     'order:read_any')
@@ -178,7 +186,13 @@ FROM (VALUES
     ('POST',  '/api/v1/riders/me/orders/{order_id}/picked-up', 'delivery:report', 'Report pickup'),
     ('POST',  '/api/v1/riders/me/orders/{order_id}/delivered',  'delivery:report', 'Report delivery'),
     ('POST',  '/api/v1/ai/search',                         'ai:search',          'Hybrid semantic search over dishes and restaurants'),
-    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler')
+    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler'),
+    ('GET',   '/api/v1/ai/assistant/stream',               'ai:assistant',       'Conversational assistant, streamed over SSE'),
+    ('POST',  '/api/v1/ai/explain-order',                  'ai:explain_order',   'Explain an order; ownership checked in the handler'),
+    ('POST',  '/api/v1/ai/partner/describe-dish',          'ai:partner',         'Draft a dish description from ingredients'),
+    ('POST',  '/api/v1/ai/partner/promo',                  'ai:partner',         'Draft promotional copy for an offer'),
+    ('POST',  '/api/v1/ai/partner/review-summary',         'ai:partner',         'Summarise a restaurant''s reviews; ownership checked in the handler'),
+    ('POST',  '/api/v1/orders/{order_id}/review',          'order:review',       'Review a delivered order; ownership checked in the handler')
 ) AS route(method, path_pattern, permission_name, description)
 JOIN permissions p ON p.name = route.permission_name
 ON CONFLICT (method, path_pattern) DO NOTHING;

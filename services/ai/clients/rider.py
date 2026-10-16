@@ -23,3 +23,16 @@ class RiderServiceClient(ServiceFacade):
             unreachable_hint="cannot read courier availability",
             headers=internal_headers(),
         )
+
+    def order_courier(self, order_id: str, latitude: float, longitude: float) -> dict:
+        """`{assigned, distance_km}` for the rider carrying an order, measured from a point.
+
+        A distance only — never the rider's id or position (the answer ends up in an LLM prompt).
+        """
+        return self._client.post(
+            "/api/v1/riders/internal/order-courier",
+            json={"order_id": order_id, "latitude": latitude, "longitude": longitude},
+            missing="Courier distance endpoint not found",
+            unreachable_hint="cannot read the courier's distance",
+            headers=internal_headers(),
+        )

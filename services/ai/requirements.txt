@@ -19,3 +19,20 @@ fastembed==0.9.0
 # The ingestion worker consumes menu.published (common.kafka + the DLQ producer).
 aiokafka==0.14.0
 fastjsonschema==2.22.2
+
+# Week 5 (D63). langgraph orchestrates the router / retrieval / generation / guardrail flow;
+# langchain-core is its model and message abstraction. Exactly one chat provider package is
+# imported at runtime (`ai.llm.build_chat_model`), but both are installed so switching
+# LLM_PROVIDER is a deploy, not a rebuild.
+langgraph==1.2.15
+langchain-core==1.6.10
+langchain-anthropic==1.7.6
+langchain-ollama==1.1.0
+
+# sse-starlette: EventSourceResponse for the assistant's token stream. 2.2.x, not the latest:
+# 3.x needs starlette>=0.49, while the shared chassis pins fastapi 0.115.6 (starlette<0.42),
+# and upgrading FastAPI would touch every service for the sake of one.
+sse-starlette==2.2.1
+
+# redis: conversation memory for the assistant (D63) — same pin the menu, user and rider services use.
+redis==5.2.1

@@ -29,6 +29,7 @@ from order.clients.orchestrator import OrchestratorClient
 from order.clients.restaurant import RestaurantServiceClient
 from order.clients.user import UserServiceClient
 from order.repositories.orders import OrderRepository
+from order.repositories.reviews import OrderReviewRepository
 from order.repositories.tracking import OrderTrackingRepository
 
 TEMPORAL_ADDRESS = service_url("TEMPORAL_ADDRESS", DEFAULT_TEMPORAL_ADDRESS)
@@ -44,6 +45,7 @@ db = runtime.db
 
 orders = OrderRepository(db, logger=logger, service_name=SERVICE_NAME)
 tracking = OrderTrackingRepository(db)
+reviews = OrderReviewRepository(db, logger=logger)
 menu_service = MenuServiceClient(logger)
 user_service = UserServiceClient(logger)
 restaurant_service = RestaurantServiceClient(logger)

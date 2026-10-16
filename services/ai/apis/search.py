@@ -51,6 +51,7 @@ def search(
                 max_price=payload.max_price,
                 tags=payload.dietary_filters,
                 restaurant_id=payload.restaurant_id,
+                min_score=payload.min_score,
             )
     except Exception:
         SEARCH_REQUESTS_TOTAL.labels(outcome="error").inc()

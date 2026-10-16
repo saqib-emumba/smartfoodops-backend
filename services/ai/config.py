@@ -45,3 +45,47 @@ RAG_MAX_COURIER_LOOKUPS = 5
 # approach notification-consumer takes — the worker is not a FastAPI process).
 INGESTION_CONSUMER_GROUP = "ai-ingestion"
 INGESTION_METRICS_PORT = 9111
+
+# --- Week 5: the chat model (D63) ---
+# "anthropic" calls Claude through the API and needs ANTHROPIC_API_KEY, read with `required()`
+# in `llm.build_chat_model` and nowhere else; "ollama" talks to a self-hosted Ollama server, so
+# nothing leaves the deployment. Selected by env, like EMBEDDING_PROVIDER.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+
+# Low on purpose: the assistant restates retrieved menu data, it does not write fiction. The
+# partner copywriting tools (Phase 5) may pass their own value per call.
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+
+# --- Week 5: the assistant (D63) ---
+# Conversation memory lives in Redis (db 3, beside the menu cache on 0, auth on 1, riders on 2),
+# keyed per user, with a TTL: bounded, survives a restart, and shared by every replica — which an
+# in-process checkpointer is not. A Redis outage means "no history", never a failed answer.
+AI_REDIS_URL = os.getenv("AI_REDIS_URL", "redis://cache-redis:6379/3")
+CONVERSATION_TTL_SECONDS = 3600
+# Messages kept per conversation (a question and its answer are two).
+CONVERSATION_MAX_MESSAGES = 12
+
+# Candidates handed to the model per question. Fewer than the search API's ceiling: every dish is
+# prompt tokens, and a recommendation list nobody reads past five is not worth the latency.
+ASSISTANT_TOP_K = 6
+# Cosine floor below which a match is treated as "nothing matches" (the Phase 4 open point). A
+# guess calibrated on the seed menus with all-MiniLM-L6-v2, where on-topic queries score well
+# above it; revisit if the embedding model changes (D59).
+ASSISTANT_MIN_SCORE = float(os.getenv("ASSISTANT_MIN_SCORE", "0.30"))
+# Longest question the assistant accepts: the question goes into a prompt.
+ASSISTANT_MAX_QUESTION_CHARS = 500
+
+# Recent commented reviews handed to the summariser; the count and average always cover all.
+REVIEW_SUMMARY_MAX_REVIEWS = 30
+
+# An order counts as "after an AI interaction" if the same customer places it at a restaurant the
+# assistant named to them within this many hours. A convention, not a measurement of cause: someone
+# who was already going to order from that restaurant is counted too, which is why the dashboard calls
+# it attribution and not lift.
+ATTRIBUTION_WINDOW_HOURS = int(os.getenv("ATTRIBUTION_WINDOW_HOURS", "24"))
+ATTRIBUTION_CONSUMER_GROUP = "ai-attribution"

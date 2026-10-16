@@ -119,3 +119,22 @@ class ReleaseResponse(BaseModel):
     released: bool
     order_id: UUID
     rider_id: Optional[UUID] = None
+
+
+class OrderCourierRequest(BaseModel):
+    """The AI Service's order-explanation question: how far is the rider carrying this order from
+    a point (the restaurant, which the caller already holds)?"""
+
+    order_id: UUID
+    latitude: float = Field(..., ge=-90, le=90)
+    longitude: float = Field(..., ge=-180, le=180)
+
+
+class OrderCourierResponse(BaseModel):
+    """A distance, never the rider's id or position (the consumer is an LLM prompt). No ETA: the
+    platform's only estimate (`rider.eta`) is a labelled mock with kitchen padding in it, and an
+    explanation must not present that as a promise. `assigned: false` and a null distance are
+    different answers: nobody holds the order, versus a rider holds it but has reported no position."""
+
+    assigned: bool
+    distance_km: Optional[float] = None

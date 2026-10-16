@@ -32,7 +32,12 @@ from common.config import (
     CHECKOUT_DEADLINE_SECONDS,
     ORDER_TASK_QUEUE,
 )
-from common.temporal import SagaClient, fulfillment_workflow_id_for, workflow_id_for
+from common.temporal import (
+    SagaClient,
+    fulfillment_workflow_id_for,
+    rider_workflow_id_for,
+    workflow_id_for,
+)
 from order.schemas.orders import OrderCreateRequest
 
 ORDER_WORKFLOW = "OrderWorkflow"
@@ -102,3 +107,26 @@ class OrchestratorClient:
             "kitchen_decision",
             {"order_id": str(order_id), "decision": decision},
         )
+
+    async def progress(self, order_id: UUID) -> dict:
+        """What the still-running fulfilment and rider workflows say about themselves.
+
+        Read-only (Temporal Queries), and best-effort by design: a workflow that has finished, or
+        Temporal being unreachable, answers "unknown" — never an error and never a guess — because
+        the caller is an explanation that must say less rather than invent more. The rider
+        workflow's own answer includes the rider's id; it is dropped here, since the consumer is an
+        LLM prompt (D62).
+        """
+        progress = {"fulfillment_stage": None, "rider_picked_up": None, "rider_delivered": None}
+        try:
+            fulfillment = await self._saga.query(fulfillment_workflow_id_for(order_id), "stage")
+            progress["fulfillment_stage"] = fulfillment.get("stage")
+        except Exception as exc:  # noqa: BLE001 - best-effort read; absence is the answer
+            self._logger.debug("No fulfilment stage for order %s: %s", order_id, exc)
+        try:
+            rider = await self._saga.query(rider_workflow_id_for(order_id), "stage")
+            progress["rider_picked_up"] = rider.get("picked_up")
+            progress["rider_delivered"] = rider.get("delivered")
+        except Exception as exc:  # noqa: BLE001
+            self._logger.debug("No rider stage for order %s: %s", order_id, exc)
+        return progress

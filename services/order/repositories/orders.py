@@ -28,6 +28,7 @@ from order.repositories.sql import (
     SELECT_BY_KEY,
     SELECT_BY_STATUS,
     SELECT_KITCHEN_QUEUE,
+    SELECT_LATEST_FOR_CUSTOMER,
     SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
     SELECT_LINE_ITEMS_FOR_ORDERS,
     TRANSITION_ORDER,
@@ -65,6 +66,11 @@ class OrderRepository(Repository):
         if order is not None:
             self._attach_items([order])
         return order
+
+    def latest_id_for_customer(self, customer_id: UUID) -> UUID | None:
+        """The id of this customer's most recent order, or None if they have never ordered."""
+        row = self.one(SELECT_LATEST_FOR_CUSTOMER, (str(customer_id),))
+        return row["id"] if row else None
 
     def find_by_idempotency_key(self, key: str) -> dict | None:
         order = self.one(SELECT_BY_KEY, (key,))

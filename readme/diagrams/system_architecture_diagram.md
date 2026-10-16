@@ -13,13 +13,22 @@ workflows, D57 RBAC moves into the database and is enforced at the gateway, D58 
 starts `OrderWorkflow` and answers after payment, with the post-payment work in an abandoned
 `FulfillmentWorkflow`, and — for Part B — D59 the AI Service with its own pgvector database, D60
 owner-declared menu tags, D61 `menu.published` feeding an ingestion worker, D62 the RAG context
-assembler).
+assembler; and for Week 5 — D63 the streaming assistant as a LangGraph with a code-enforced grounding
+check, D64 order explanations, reviews and partner tools over internal routes, D65 conversion
+attributed from `order.created`).
 
 The AI layer (pink) is two containers from one image: `ai-service` answers search and RAG-context
 requests (gated at the gateway like every other route, `ai:search` / `ai:rag_context`), and
 `ai-ingestion-worker` consumes `menu.published`, re-reads the menu and restaurant over internal-key
 routes, and keeps `sfo_vector_core` in step. RAG context also reads the Analytics and Rider services,
 and degrades — naming the failed source — rather than failing when one is down.
+
+Week 5 adds, to the same two containers: the streaming assistant (`GET /ai/assistant/stream`, SSE through
+a gateway location with buffering off), order explanations, and the restaurant-admin authoring tools. The
+AI Service reads the Order Service (order, reduced trail, saga stage, reviews) and the Rider Service
+(courier distance) over internal-key routes, keeps conversation memory in Redis db 3, and calls a chat
+model — the one new dependency that leaves the stack. The ingestion worker also consumes `order.created`
+to attribute orders to recommendations.
 
 Every `Gateway -->` edge below implies a preceding `auth_request` round trip to the User
 Service's internal verify endpoint (D51) — drawn once, explicitly, as the dotted edge into
@@ -52,7 +61,7 @@ flowchart TB
         RiderSvc["Rider Service<br/>8006"]
         OrchestratorAPI["Orchestrator Service<br/>8007 health only"]
         AnalyticsSvc["Analytics Service<br/>8008"]
-        AISvc["AI Service<br/>8009<br/>search + RAG context"]
+        AISvc["AI Service<br/>8009<br/>search, RAG, assistant (SSE),<br/>explain-order, partner tools"]
     end
 
     subgraph AI ["AI retrieval (Part B, D59-D62)"]
@@ -122,6 +131,11 @@ flowchart TB
     AIWorker -->|internal read: restaurant| RestaurantSvc
     AISvc -->|RAG: customer order history, internal, D62| AnalyticsSvc
     AISvc -->|RAG: courier availability counts, internal, D62| RiderSvc
+    AISvc -->|explain-context, latest order, reviews, internal, D64| OrderSvc
+    AISvc -->|courier distance for an order, internal, D64| RiderSvc
+    AISvc -->|ownership + restaurant details, D64| RestaurantSvc
+    AISvc -.->|generate answers: Claude by default, Ollama selectable, D63| LLM[("Chat model")]
+    Kafka -.->|order.created: attribution, D65| AIWorker
 
     %% -- each service owns one database --
     UserSvc --> UserDB
@@ -131,9 +145,10 @@ flowchart TB
     PaymentSvc --> PaymentDB
     RiderSvc --> RiderDB
     AnalyticsSvc --> AnalyticsDB
-    AISvc -->|search + RAG vectors| VectorDB
+    AISvc -->|search + RAG vectors; assistant usage log, D65| VectorDB
     AIWorker -->|replace a restaurant's documents| VectorDB
     MenuSvc -.->|menu cache, db 0| Redis
+    AISvc -.->|assistant conversation memory, db 3, D63| Redis
     UserSvc -.->|refresh tokens, db 1| Redis
     %% D49: rider live location moved from a Postgres column to this Redis GEO index.
     RiderSvc -.->|location GEO index, db 2| Redis
@@ -182,6 +197,7 @@ flowchart TB
 
     class UserSvc,RestaurantSvc,MenuSvc,OrderSvc,PaymentSvc,RiderSvc,OrchestratorAPI,AnalyticsSvc app;
     class AISvc,AIWorker ai;
+    class LLM obs;
     class TemporalServer,OrchestratorWorker saga;
     class Kafka,SchemaRegistry evt;
     class NotifConsumer,RabbitMQ,NotifWorker notify;

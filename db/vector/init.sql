@@ -3,9 +3,9 @@
 --
 -- The retrieval layer for the GenAI features (Week 4, D59). Holds vector embeddings of the
 -- Menu and Restaurant Services' data, and nothing else of anyone's: like the Analytics
--- database, everything here is *derived* state, rebuildable by re-ingesting the menus
--- (`python -m ai.ingestion --backfill`), so dropping this database loses no fact that any
--- other service owns. That is also why it is a separate physical database (D01) rather than
+-- database, the documents here are *derived* state, rebuildable by re-ingesting the menus
+-- (`python -m ai.ingestion --backfill`), so dropping them loses no fact that any
+-- other service owns. (The one exception is `assistant_interactions`, a usage log — see below.) That is also why it is a separate physical database (D01) rather than
 -- a schema inside sfo_menu_core — the menu's write path never depends on a vector index.
 --
 -- Requires the pgvector extension, which is why docker-compose.yml runs this container from
@@ -87,3 +87,27 @@ CREATE INDEX IF NOT EXISTS idx_restaurant_documents_embedding
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_restaurant ON menu_item_documents(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_filter ON menu_item_documents(is_available, base_price);
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_tags ON menu_item_documents USING gin (dietary_tags);
+
+-- Assistant usage log and conversion attribution (Week 5, D63) — the one table here that is not
+-- derived from a menu. One row per assistant answer: who asked (an id, never the question or the
+-- answer), what the router decided, how it ended, and which restaurants and dishes were named.
+-- `converted_*` are filled in later by the attribution consumer when the same customer places an
+-- order at one of those restaurants within the attribution window (`ATTRIBUTION_WINDOW_HOURS`).
+-- It is a measurement, not a source of truth: losing it loses telemetry, never an order or a menu.
+CREATE TABLE IF NOT EXISTS assistant_interactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    customer_id UUID NOT NULL,
+    conversation_id VARCHAR(64) NOT NULL,
+    intent VARCHAR(32) NOT NULL,
+    outcome VARCHAR(16) NOT NULL,
+    recommended_restaurant_ids UUID[] NOT NULL DEFAULT '{}',
+    recommended_item_ids TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    converted_order_id UUID UNIQUE,
+    converted_at TIMESTAMPTZ
+);
+
+-- The attribution lookup: this customer's recent, still-unconverted recommendations.
+CREATE INDEX IF NOT EXISTS idx_assistant_interactions_customer
+    ON assistant_interactions (customer_id, created_at DESC)
+    WHERE converted_order_id IS NULL;

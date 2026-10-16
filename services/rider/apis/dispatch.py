@@ -11,12 +11,14 @@ from common.auth import require_internal
 from common.config import RIDER_DISPATCH_CANDIDATE_CAP, RIDER_MAX_DISTANCE_KM
 from common.responses import Envelope, ok
 from rider import deps
-from rider.eta import eta_minutes
+from rider.eta import eta_minutes, haversine_km
 from rider.schemas.riders import (
     DispatchRequest,
     DispatchResponse,
     NearbyRequest,
     NearbyResponse,
+    OrderCourierRequest,
+    OrderCourierResponse,
     ReleaseRequest,
     ReleaseResponse,
 )
@@ -111,6 +113,28 @@ def nearby_riders(payload: NearbyRequest) -> Envelope[NearbyResponse]:
             radius_km=radius,
         ),
         message="Courier availability",
+    )
+
+
+@router.post("/internal/order-courier", response_model=Envelope[OrderCourierResponse])
+def order_courier(payload: OrderCourierRequest) -> Envelope[OrderCourierResponse]:
+    """How far the rider carrying this order is from a point — the AI Service's delay explanation.
+
+    Read-only. The rider's position comes from the Redis geo index (D49); `get_location` already
+    degrades to None on a miss or an outage, which here means "no distance", not an error, so an
+    explanation can say a courier is assigned without claiming where. No rider id or position
+    leaves this service.
+    """
+    rider = deps.riders.holding(payload.order_id)
+    if rider is None:
+        return ok(OrderCourierResponse(assigned=False), message="No rider holds this order")
+    position = deps.geo.get_location(rider["user_id"])
+    if position is None:
+        return ok(OrderCourierResponse(assigned=True), message="Rider assigned; no position reported")
+    distance = haversine_km(position[0], position[1], payload.latitude, payload.longitude)
+    return ok(
+        OrderCourierResponse(assigned=True, distance_km=round(distance, 2)),
+        message="Courier distance",
     )
 
 

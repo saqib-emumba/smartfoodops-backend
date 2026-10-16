@@ -27,6 +27,12 @@ Reflects the actual schema across all 8 physical databases (`db/*/init.sql`), in
 > shape as the analytics one; it is drawn here as `AI_PROCESSED_EVENTS` because Mermaid entity names
 > are global. `MENU_ITEMS.dietary_tags` (D60) is the one source-side change.
 
+> **Week 5 adds two tables (D64, D65).** `ORDER_REVIEWS` lives in `sfo_order_core`: one rating and
+> optional comment per *delivered* order, `UNIQUE (order_id)` so the engine decides "once".
+> `ASSISTANT_INTERACTIONS` lives in `sfo_vector_core` and is the one table there that is **not**
+> derived from a menu — a usage log (ids and outcomes, never a question or an answer) that the
+> attribution consumer later stamps with the order it led to. Losing it loses telemetry, nothing else.
+
 ```mermaid
 erDiagram
     %% ---- sfo_user_core ----
@@ -70,6 +76,9 @@ erDiagram
     MENU_ITEMS ||--o| MENU_ITEM_DOCUMENTS : "embedded as (via menu.published + internal read, logical, cross-db)"
     RESTAURANTS ||--o| RESTAURANT_DOCUMENTS : "embedded as (via menu.published + internal read, logical, cross-db)"
     RESTAURANTS ||--o{ MENU_ITEM_DOCUMENTS : "scopes (restaurant_id, cross-db)"
+    ORDERS ||--o| ORDER_REVIEWS : "reviewed once, when delivered (real FK, ON DELETE CASCADE, UNIQUE order_id)"
+    ORDERS ||--o| ASSISTANT_INTERACTIONS : "attributed to a recommendation (via order.created, logical, cross-db)"
+    RESTAURANTS ||--o{ ASSISTANT_INTERACTIONS : "named in (recommended_restaurant_ids, cross-db)"
 
     ROLES {
         uuid id PK
@@ -237,6 +246,16 @@ erDiagram
         timestamp created_at
     }
 
+    ORDER_REVIEWS {
+        uuid id PK
+        uuid order_id FK "Unique -- References ORDERS.id, real FK, ON DELETE CASCADE (same DB); one review per order"
+        uuid customer_id "References USERS.id, cross-db, no engine FK"
+        uuid restaurant_id "References RESTAURANTS.id, cross-db; copied from the order so a restaurant's reviews are one indexed read"
+        smallint rating "CHECK 1 to 5"
+        text comment "Nullable, CHECK length <= 1000"
+        timestamptz created_at
+    }
+
     PAYMENTS {
         uuid id PK
         uuid order_id "Unique -- References ORDERS.id, cross-db, no engine FK"
@@ -305,5 +324,18 @@ erDiagram
         uuid event_id PK "menu.published event id; derived from (restaurant_id, event type, updated_at) so each publish is distinct"
         varchar event_type
         timestamptz processed_at
+    }
+
+    ASSISTANT_INTERACTIONS {
+        uuid id PK
+        uuid customer_id "References USERS.id, cross-db, no engine FK"
+        varchar conversation_id "The label a client continues a conversation with"
+        varchar intent "food_discovery, order_tracking, restaurant_support or out_of_scope"
+        varchar outcome "answered, fallback, no_results or refused"
+        uuid_array recommended_restaurant_ids "Restaurants named in the answer"
+        text_array recommended_item_ids "Menu item keys named in the answer"
+        timestamptz created_at
+        uuid converted_order_id "Unique, nullable -- set by the attribution consumer (D65)"
+        timestamptz converted_at "Nullable"
     }
 ```

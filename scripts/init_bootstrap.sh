@@ -181,7 +181,11 @@ INSERT INTO permissions (name, description) VALUES
 ('rider:profile',      'Join the fleet and maintain own rider profile, location, availability'),
 ('delivery:report',    'Report pickup and delivery of an assigned order'),
 ('ai:search',          'Semantic search over dishes and restaurants (Week 4, D59)'),
-('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)')
+('ai:rag_context',     'Assemble RAG context (matches, order history, courier availability) for own account (D62)'),
+('ai:assistant',       'Ask the conversational food assistant (streamed answers grounded in retrieved context, D63)'),
+('ai:explain_order',   'Have the AI explain the status or delay of an order the caller owns (D64)'),
+('ai:partner',         'Use the AI authoring tools for a restaurant the caller owns: dish copy, promos, review summaries (D64)'),
+('order:review',       'Review a delivered order the caller placed (D64)')
 ON CONFLICT (name) DO NOTHING;
 
 -- 1e. Role <-> permission grants. Composite PK for the same reason as user_roles (1c):
@@ -203,10 +207,14 @@ FROM (VALUES
     ('customer',         'payment:read'),
     ('customer',         'ai:search'),
     ('customer',         'ai:rag_context'),
+    ('customer',         'ai:assistant'),
+    ('customer',         'ai:explain_order'),
+    ('customer',         'order:review'),
     ('restaurant_admin', 'restaurant:onboard'),
     ('restaurant_admin', 'menu:write'),
     ('restaurant_admin', 'kitchen:read'),
     ('restaurant_admin', 'kitchen:decide'),
+    ('restaurant_admin', 'ai:partner'),
     ('rider',            'rider:profile'),
     ('rider',            'delivery:report'),
     ('system_admin',     'order:read_any')
@@ -269,7 +277,13 @@ FROM (VALUES
     ('POST',  '/api/v1/riders/me/orders/{order_id}/picked-up', 'delivery:report', 'Report pickup'),
     ('POST',  '/api/v1/riders/me/orders/{order_id}/delivered',  'delivery:report', 'Report delivery'),
     ('POST',  '/api/v1/ai/search',                         'ai:search',          'Hybrid semantic search over dishes and restaurants'),
-    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler')
+    ('POST',  '/api/v1/ai/rag-context',                    'ai:rag_context',     'Multi-source RAG context; ownership of customer_id checked in the handler'),
+    ('GET',   '/api/v1/ai/assistant/stream',               'ai:assistant',       'Conversational assistant, streamed over SSE'),
+    ('POST',  '/api/v1/ai/explain-order',                  'ai:explain_order',   'Explain an order; ownership checked in the handler'),
+    ('POST',  '/api/v1/ai/partner/describe-dish',          'ai:partner',         'Draft a dish description from ingredients'),
+    ('POST',  '/api/v1/ai/partner/promo',                  'ai:partner',         'Draft promotional copy for an offer'),
+    ('POST',  '/api/v1/ai/partner/review-summary',         'ai:partner',         'Summarise a restaurant''s reviews; ownership checked in the handler'),
+    ('POST',  '/api/v1/orders/{order_id}/review',          'order:review',       'Review a delivered order; ownership checked in the handler')
 ) AS route(method, path_pattern, permission_name, description)
 JOIN permissions p ON p.name = route.permission_name
 ON CONFLICT (method, path_pattern) DO NOTHING;
@@ -471,6 +485,26 @@ CREATE INDEX IF NOT EXISTS idx_tracking_order_timeline ON order_tracking_logs(or
 CREATE INDEX IF NOT EXISTS idx_orders_kitchen_queue
     ON orders (restaurant_id, created_at)
     WHERE status = 'confirmed' AND kitchen_decision IS NULL;
+
+-- 3. Order Reviews (One Customer Rating + Comment Per Delivered Order — Week 5, D64)
+-- Written by the customer through POST /api/v1/orders/{order_id}/review, read by the AI
+-- Service's review-summary tool over an internal route. `restaurant_id` is copied from the
+-- order so a restaurant's reviews are one indexed read rather than a join, and so the row
+-- keeps saying which restaurant it was about even if the order is later archived.
+-- UNIQUE (order_id): the engine, not a check in the handler, is what makes "one review per
+-- order" true under concurrent submits.
+CREATE TABLE IF NOT EXISTS order_reviews (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    order_id UUID NOT NULL UNIQUE REFERENCES orders(id) ON DELETE CASCADE,
+    customer_id UUID NOT NULL,   -- users.id       (User Service database)
+    restaurant_id UUID NOT NULL, -- restaurants.id (Restaurant Service database)
+    rating SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment TEXT CHECK (char_length(comment) <= 1000),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_order_reviews_restaurant
+    ON order_reviews (restaurant_id, created_at DESC);
 
 -- ============================================================================
 -- No transactional outbox table here any more (D53, superseding Week 3's D39).
@@ -738,9 +772,9 @@ cat << 'EOF' > db/vector/init.sql
 --
 -- The retrieval layer for the GenAI features (Week 4, D59). Holds vector embeddings of the
 -- Menu and Restaurant Services' data, and nothing else of anyone's: like the Analytics
--- database, everything here is *derived* state, rebuildable by re-ingesting the menus
--- (`python -m ai.ingestion --backfill`), so dropping this database loses no fact that any
--- other service owns. That is also why it is a separate physical database (D01) rather than
+-- database, the documents here are *derived* state, rebuildable by re-ingesting the menus
+-- (`python -m ai.ingestion --backfill`), so dropping them loses no fact that any
+-- other service owns. (The one exception is `assistant_interactions`, a usage log — see below.) That is also why it is a separate physical database (D01) rather than
 -- a schema inside sfo_menu_core — the menu's write path never depends on a vector index.
 --
 -- Requires the pgvector extension, which is why docker-compose.yml runs this container from
@@ -822,6 +856,30 @@ CREATE INDEX IF NOT EXISTS idx_restaurant_documents_embedding
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_restaurant ON menu_item_documents(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_filter ON menu_item_documents(is_available, base_price);
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_tags ON menu_item_documents USING gin (dietary_tags);
+
+-- Assistant usage log and conversion attribution (Week 5, D63) — the one table here that is not
+-- derived from a menu. One row per assistant answer: who asked (an id, never the question or the
+-- answer), what the router decided, how it ended, and which restaurants and dishes were named.
+-- `converted_*` are filled in later by the attribution consumer when the same customer places an
+-- order at one of those restaurants within the attribution window (`ATTRIBUTION_WINDOW_HOURS`).
+-- It is a measurement, not a source of truth: losing it loses telemetry, never an order or a menu.
+CREATE TABLE IF NOT EXISTS assistant_interactions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    customer_id UUID NOT NULL,
+    conversation_id VARCHAR(64) NOT NULL,
+    intent VARCHAR(32) NOT NULL,
+    outcome VARCHAR(16) NOT NULL,
+    recommended_restaurant_ids UUID[] NOT NULL DEFAULT '{}',
+    recommended_item_ids TEXT[] NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    converted_order_id UUID UNIQUE,
+    converted_at TIMESTAMPTZ
+);
+
+-- The attribution lookup: this customer's recent, still-unconverted recommendations.
+CREATE INDEX IF NOT EXISTS idx_assistant_interactions_customer
+    ON assistant_interactions (customer_id, created_at DESC)
+    WHERE converted_order_id IS NULL;
 EOF
 
 # 4. Write out the Docker Compose orchestration configuration
@@ -1456,12 +1514,14 @@ services:
     networks:
       - smartfoodops-network
 
-  # --- 3b'. AI SERVICE (Week 4, D59) ---
-  # Semantic search and RAG context. Verifies tokens like every request-path service (the
+  # --- 3b'. AI SERVICE (Week 4, D59; Week 5, D63/D64) ---
+  # Semantic search, RAG context, the streaming assistant, order explanations and the partner
+  # authoring tools. Verifies tokens like every request-path service (the
   # gateway forwards identity headers; D52), reads the menu, restaurant, rider and analytics
   # services over their internal routes (D01 — it never touches their databases), and keeps its
   # own vectors in sfo_vector_core. The embedding model is baked into the image, so this
-  # container needs no outbound network to start.
+  # container needs no outbound network to start; generating answers needs ANTHROPIC_API_KEY
+  # (or LLM_PROVIDER=ollama), and without it only the assistant endpoints are unavailable.
   ai-service:
     build:
       context: ./services
@@ -1474,8 +1534,20 @@ services:
       RESTAURANT_SERVICE_URL: http://restaurant-service:8002
       RIDER_SERVICE_URL: http://rider-service:8006
       ANALYTICS_SERVICE_URL: http://analytics-service:8008
+      ORDER_SERVICE_URL: http://order-service:8004
+      # Conversation memory (D63): its own Redis db, and no `depends_on` — a Redis outage means no
+      # follow-up context, never a failed answer, so the assistant does not wait for it to start.
+      AI_REDIS_URL: redis://cache-redis:6379/3
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+      # Only meaningful with LLM_PROVIDER=fake: seconds between streamed tokens, so a test can see
+      # that the gateway forwards them as they are written rather than all at once.
+      FAKE_LLM_TOKEN_DELAY_SECONDS: ${FAKE_LLM_TOKEN_DELAY_SECONDS:-0}
     depends_on:
       db-vector-postgres:
         condition: service_healthy
@@ -2135,6 +2207,36 @@ http {
             auth_request_set $auth_user_permissions $upstream_http_x_user_permissions;
 
             proxy_pass http://rider-service:8006;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-User-Id $auth_user_id;
+            proxy_set_header X-User-Roles $auth_user_roles;
+            proxy_set_header X-User-Permissions $auth_user_permissions;
+        }
+
+        # 🌊 The assistant's token stream (Week 5, D63). Its own location because a Server-Sent Events
+        # response must not be buffered: with `proxy_buffering on` nginx would hold the tokens back
+        # until the answer was complete, which is exactly the lag streaming exists to remove. The
+        # exact match (`=`) wins over the `/api/v1/ai` prefix below. Still gated by `auth_request` and
+        # a `route_permissions` row like every other AI route. HTTP/1.1 with an empty Connection header
+        # keeps the upstream connection open for the stream.
+        location = /api/v1/ai/assistant/stream {
+            set $original_method $request_method;
+            set $original_path $uri;
+
+            auth_request /_gateway/verify;
+            auth_request_set $auth_user_id $upstream_http_x_user_id;
+            auth_request_set $auth_user_roles $upstream_http_x_user_roles;
+            auth_request_set $auth_user_permissions $upstream_http_x_user_permissions;
+
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_read_timeout 120s;
+
+            proxy_pass http://ai-service:8009;
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
