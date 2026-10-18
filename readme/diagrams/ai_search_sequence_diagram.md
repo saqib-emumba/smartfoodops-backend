@@ -3,9 +3,9 @@
 From an owner publishing a tagged menu, through its ingestion into the vector store, to a customer
 searching it and asking for RAG context. Verified against
 `services/menu/apis/menus.py`, `services/common/kafka.py`, `services/common/events/menu.py`,
-`services/ai/ingestion.py`, `services/ai/chunking.py`, `services/ai/embeddings.py`,
+`services/ai/ingestion/menu_ingestion.py`, `services/ai/retrieval/chunking.py`, `services/ai/retrieval/embeddings.py`,
 `services/ai/repositories/{vectors,documents}.py`, `services/ai/apis/{search,rag}.py`,
-`services/ai/rag_context.py`, `services/rider/apis/dispatch.py` and
+`services/ai/retrieval/rag_context.py`, `services/rider/apis/dispatch.py` and
 `services/analytics/apis/internal.py`. The reasoning is in
 [D59–D62](../key-decisions.md) and the phased build in
 [week4-ai-retrieval-plan.md](../week4-ai-retrieval-plan.md).

@@ -12,7 +12,7 @@ is written from the same context by rules, so it contains only names and prices 
 from dataclasses import dataclass, field
 
 from ai import config
-from ai.guardrails import normalize
+from ai.llm.guardrails import normalize
 from ai.schemas.rag import RagContextResponse
 
 

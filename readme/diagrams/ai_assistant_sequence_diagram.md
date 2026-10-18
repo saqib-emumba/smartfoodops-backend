@@ -2,8 +2,9 @@
 
 How a question becomes a streamed, grounded answer; how an order is explained; how reviews and the
 partner tools work; and how an order is later attributed to a recommendation. Verified against
-`services/ai/apis/{assistant,explain,partner}.py`, `services/ai/agents/{graph,router,context,prompts}.py`,
-`services/ai/{guardrails,order_explainer,partner,memory,llm,attribution}.py`,
+`services/ai/apis/{assistant,explain,partner}.py`, `services/ai/assistant/agents/{graph,router,context,prompts}.py`,
+`services/ai/assistant/{order_explainer,partner,memory}.py`, `services/ai/llm/{provider,guardrails}.py`,
+`services/ai/ingestion/attribution.py`,
 `services/ai/repositories/interactions.py`, `services/order/apis/{reviews,internal_explain}.py`,
 `services/order/clients/orchestrator.py`, `services/rider/apis/dispatch.py` and
 `api-gateway/nginx.conf`. The reasoning is in [D63–D65](../key-decisions.md) and the phased build in

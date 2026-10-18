@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends
 
 from common.auth import CurrentUser, require_permission
 from common.responses import Envelope, ok
-from ai import assistant_deps
+from ai.assistant import deps as assistant_deps
 from ai.metrics import PARTNER_REQUESTS_TOTAL
 from ai.schemas.partner import (
     DescribeDishRequest,

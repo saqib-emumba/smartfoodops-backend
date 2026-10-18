@@ -1,6 +1,6 @@
 """`POST /api/v1/ai/rag-context` — the multi-source context a language model answers from (D62).
 
-See `ai/rag_context.py` for what is gathered and how a failing source degrades. This module is the
+See `ai/retrieval/rag_context.py` for what is gathered and how a failing source degrades. This module is the
 HTTP edge: authorisation, then delegation.
 """
 
@@ -27,7 +27,7 @@ async def rag_context(
     there, and checking it against the token is what keeps that from being an impersonation hole.
 
     Always a `200` when authorised: a source that could not be read is named in
-    `sources_failed`, not turned into an error (see `ai/rag_context.py`).
+    `sources_failed`, not turned into an error (see `ai/retrieval/rag_context.py`).
     """
     require_self_or_admin(
         current_user,

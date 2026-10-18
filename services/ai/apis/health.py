@@ -9,8 +9,9 @@ from fastapi import APIRouter
 
 from common.health import HealthResponse, health_payload
 from common.responses import Envelope, ok
-from ai import assistant_deps, config, deps
-from ai.llm import model_name
+from ai import config, deps
+from ai.assistant import deps as assistant_deps
+from ai.llm.provider import model_name
 
 router = APIRouter(prefix="/api/v1/ai")
 

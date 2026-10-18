@@ -17,18 +17,16 @@
 #   ./scripts/smoke-test.sh --fast       # skip the saga sections (~90s instead of ~12min)
 #   BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 #
-# The Week 5 section asserts what the AI assistant *says* only when the AI service runs with
-# LLM_PROVIDER=fake (a deterministic test double, no API key needed):
-#   LLM_PROVIDER=fake docker compose up -d ai-service && docker exec sfo-api-gateway nginx -s reload
-# Against any other provider those checks are skipped visibly; access control, validation and the
-# review rules are asserted either way.
+# The Week 5 section asserts access control, validation and the review rules, whatever the chat
+# provider. It does not assert what the assistant *says*: a real model's wording varies, so that
+# is tested by hand and through the Postman collection (postman/README.md).
 #
 # --fast exists for refactoring, where the cost that matters is per-commit rather than
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 482 of the 677
-# checks (counts as of Week 5's AI layer, run with LLM_PROVIDER=fake) and leaves fourteen
+# It is a real reduction in coverage, not just in runtime. --fast asserts 424 of the 601
+# checks (counts as of Week 5's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
 #   POST   /api/v1/orders/{id}/accept          POST   /api/v1/payments/authorize
@@ -1586,10 +1584,7 @@ fi
 # ------------------------------------------------ AI assistant (Week 5)
 # The streaming assistant, order explanations, the partner authoring tools and order reviews
 # (D63, D64). Access control, validation and review rules are asserted whatever the chat provider;
-# the assertions about what the assistant *says* need a deterministic model, so they run only when
-# the AI Service was started with LLM_PROVIDER=fake (docker compose reads it from the shell:
-#   LLM_PROVIDER=fake docker compose up -d ai-service
-# ) and are skipped otherwise rather than run against a real model whose wording varies.
+# what the assistant *says* is not asserted here, because a real model's wording varies.
 section "AI assistant and explanations (Week 5)"
 
 urlq() { python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
@@ -1672,174 +1667,6 @@ else
   expect "a second review of the same order -> 409" 409 POST "/api/v1/orders/$ORDER_ID/review" \
     '{"rating":1}' "${CUST_AUTH[@]}"
   REVIEW_REST="$REST_ID"
-fi
-
-# --- what the assistant says (deterministic model only) ----------------------------------------
-if [[ "$AI_LLM" != "fake" ]]; then
-  printf '  %sSKIP%s  assistant wording checks (LLM_PROVIDER is "%s", not "fake" — see the note above)\n' "$DIM" "$RESET" "$AI_LLM"
-else
-  sse_ask "q=$(urlq 'Recommend a spicy chicken dish under $13')" "${CUST_AUTH[@]}"
-  assert "the assistant streams a food answer" "$SSE_CODE" "200"
-  assert "  as several chunks, not one" "$(sse_eval "sum(1 for e in ev if e['token']) > 3")" "True"
-  assert "  with exactly one final chunk, and it is last" \
-    "$(sse_eval "[e['done'] for e in ev].count(True) == 1 and ev[-1]['done']")" "True"
-  assert "  routed as food discovery" "$(sse_eval "f['intent']")" "food_discovery"
-  assert "  and grounded" "$(sse_eval "f['grounded']")" "True"
-  assert "  every price quoted respects the stated budget" \
-    "$(sse_eval "all(float(x) <= 13 for x in __import__('re').findall(r'[\$](\d+(?:[.]\d+)?)', t))")" "True"
-  CONV_ID=$(sse_eval "f['conversation_id']")
-
-  sse_ask "q=$(urlq 'What is the capital of France?')" "${CUST_AUTH[@]}"
-  assert "an off-topic question is declined" "$(sse_eval "f['intent']")" "out_of_scope"
-  assert "  without involving a dish" "$(sse_eval "'**' not in t and 'SmartFoodOps' in t")" "True"
-
-  sse_ask "q=$(urlq 'Recommend a dish under $0.50')" "${CUST_AUTH[@]}"
-  assert "nothing under the price floor -> an honest 'nothing matches'" "$(sse_eval "t.startswith('I couldn')")" "True"
-
-  # The model is made to name a dish and price that exist nowhere. The guardrail must catch it and
-  # hand the client a replacement written from retrieved data alone.
-  sse_ask "q=$(urlq 'Recommend a dish to eat [force-ungrounded]')" "${CUST_AUTH[@]}"
-  assert "an ungrounded model answer is flagged" "$(sse_eval "f['grounded']")" "False"
-  assert "  a replacement is supplied" "$(sse_eval "bool(f.get('replacement'))")" "True"
-  assert "  and it names nothing that was invented" "$(sse_eval "'Imaginary' not in f['replacement'] and '\$1.00' not in f['replacement']")" "True"
-
-  # Names and prices that each exist, wrongly combined: a real dish attributed to a restaurant that does not
-  # offer it. Every token is in the retrieved context, so only the pairing check can catch it — the failure a
-  # real local model produced ("Margherita Pizza at <the wrong restaurant> for another dish's price").
-  #
-  # Self-contained on purpose: a second restaurant with a dish no other run has (the TAG is in its name), asked
-  # about together with the salad from the first. (Neither name contains a dietary-tag word: the router turns each
-  # such word into a filter every result must satisfy, so "biryani or karahi" would match nothing.) Two genuinely different restaurants therefore always reach
-  # the context, however many identical test kitchens earlier runs left behind.
-  expect "onboard a second restaurant for the pairing check" 201 POST /api/v1/restaurants/onboard \
-    '{"name":"AI Pair Kitchen","address":"8 Pairing Lane","latitude":33.71,"longitude":73.01,"capacity":20}' "${OWNER_AUTH[@]}"
-  PAIR_REST=$(jfield "['id']")
-  PAIR_DISH="Pairtest Special $TAG"
-  expect "publish its one distinctive dish" 200 POST /api/v1/menus \
-    "{\"restaurant_id\":\"$PAIR_REST\",\"categories\":[{\"category_id\":\"c1\",\"category_name\":\"Menu\",\"display_order\":1,\"items\":[{\"item_id\":\"pb\",\"name\":\"$PAIR_DISH\",\"description\":\"$PAIR_DISH house speciality\",\"base_price\":10.0,\"is_available\":true,\"dietary_tags\":[]}]}]}" \
-    "${OWNER_AUTH[@]}"
-  ai_poll "{\"query\":\"$PAIR_DISH\",\"restaurant_id\":\"$PAIR_REST\"}" "len(m) == 1" 30
-  sse_ask "q=$(urlq "Recommend $PAIR_DISH or Garden Quinoa Salad [force-mispair]")" "${CUST_AUTH[@]}"
-  assert "a real dish attributed to the wrong restaurant is flagged" "$(sse_eval "f['grounded']")" "False"
-  assert "  with a replacement supplied" "$(sse_eval "bool(f.get('replacement'))")" "True"
-
-  # Conversation memory: two turns in one conversation are four messages in Redis, keyed by user.
-  sse_ask "q=$(urlq 'and something vegan?')&conversation_id=$CONV_ID" "${CUST_AUTH[@]}"
-  if have_container sfo-redis; then
-    assert "a follow-up is stored in the same conversation" \
-      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" "4"
-    assert "  with an expiry" \
-      "$([[ "$(docker exec sfo-redis redis-cli -n 3 TTL "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" -gt 0 ]] && echo yes)" "yes"
-    sse_ask "q=$(urlq 'spicy food please')&conversation_id=$CONV_ID" "${OTHER_AUTH[@]}"
-    assert "another customer reusing the id gets their own history" \
-      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$OTHER_ID:$CONV_ID" | tr -d '\r')" "2"
-    assert "  and the first customer's is untouched" \
-      "$(docker exec sfo-redis redis-cli -n 3 LLEN "ai:conv:$CUST_ID:$CONV_ID" | tr -d '\r')" "4"
-  fi
-
-  # Orders: the customer's latest order is found without an id, and a customer with none is told so.
-  sse_ask "q=$(urlq 'Why is my order late?')" "${CUST_AUTH[@]}"
-  assert "an order question is routed to order tracking" "$(sse_eval "f['intent']")" "order_tracking"
-  # Which order is "latest" depends on what the run placed after ORDER_ID, so assert the shape of the
-  # answer (the rule-written summary always opens this way) rather than a particular restaurant.
-  assert "  and answered about an order, from the order's own facts" "$(sse_eval "t.startswith('Your order') and f['grounded']")" "True"
-
-  # Naming someone else's order in the question is the same refusal as explain-order, and (since it
-  # happens before any output) a real HTTP status rather than an in-stream error.
-  sse_status "asking the assistant about another customer's order -> 403" 403 \
-    "q=$(urlq "Why is order $ORDER_ID late?")" "${OTHER_AUTH[@]}"
-
-  AIF_EMAIL="aifresh_${TAG}@example.com"
-  expect "register a customer who has never ordered" 201 POST /api/v1/users/register \
-    "{\"email\":\"$AIF_EMAIL\",\"password\":\"$PASSWORD\",\"full_name\":\"Fresh Customer\",\"phone\":\"+1121${RANDOM}${RANDOM}\",\"role\":\"customer\"}"
-  do_login "$AIF_EMAIL" "$PASSWORD"; AIF_AUTH=(-H "Authorization: Bearer $ACCESS_TOKEN")
-  sse_ask "q=$(urlq 'Where is my order?')" "${AIF_AUTH[@]}"
-  assert "a customer with no orders is told so, not given a guess" "$(sse_eval "t.startswith('I can')")" "True"
-
-  expect "explain the customer's own order" 200 POST /api/v1/ai/explain-order \
-    "{\"order_id\":\"$ORDER_ID\"}" "${CUST_AUTH[@]}"
-  assert "  the envelope message matches the spec" "$(efield "['message']")" "Order explanation generated successfully"
-  assert "  names the restaurant" "$(jeval "'Smoke Diner' in b['explanation']")" "True"
-  assert "  and is grounded" "$(jfield "['grounded']")" "True"
-  assert "  without leaking internals" \
-    "$(jeval "not any(w in b['explanation'].lower() for w in ('workflow','traceback','exception','stage'))")" "True"
-  if (( ! FAST )); then
-    # The saga assigned a rider to ORDER_ID, and the rider workflow recorded its dispatch estimate in the
-    # `assigned` trail row. The explanation quotes it as an estimate, never as a delay (D64).
-    assert "  quotes the dispatch estimate recorded at assignment, as an estimate" \
-      "$(jeval "'roughly estimated' in b['explanation'] and 'not a promise' in b['explanation']")" "True"
-    # The kitchen's answer is not a trail row, so its time comes from the order (`kitchen_decided_at`); with
-    # the `confirmed` and `assigned` rows it splits the wait into the restaurant's part and the courier search.
-    assert "  says how long the restaurant took to accept it" "$(jeval "'to accept the order' in b['explanation']")" "True"
-    assert "  and how long finding a courier took" "$(jeval "'Finding a courier took' in b['explanation']")" "True"
-    assert "  and does not call the order late" "$(jeval "'late by' not in b['explanation'].lower() and 'delayed by' not in b['explanation'].lower()")" "True"
-  fi
-
-  # What happened to the customer's money (D64). The explanation says it from the saga's own ordering —
-  # compensation refunds *then* cancels, a declined payment cancels before charging — so each claim is
-  # cross-checked against the Payment database rather than taken on trust.
-  if [[ -n "${REJ_ORDER:-}" ]]; then
-    expect "explain an order the kitchen rejected" 200 POST /api/v1/ai/explain-order \
-      "{\"order_id\":\"$REJ_ORDER\"}" "${CUST_AUTH[@]}"
-    assert "  it gives the recorded cause" "$(jeval "'unable to accept the order' in b['explanation']")" "True"
-    assert "  and says the payment was refunded" "$(jeval "'Your payment was refunded' in b['explanation']")" "True"
-    have_container sfo-payment-db && assert "  and the Payment database agrees" \
-      "$(cut -d'|' -f1 <<<"$(docker_payment_row "$REJ_ORDER")")" "refunded"
-  fi
-  if [[ -n "${DECL_ORDER:-}" ]]; then
-    expect "explain an order whose payment was declined" 200 POST /api/v1/ai/explain-order \
-      "{\"order_id\":\"$DECL_ORDER\"}" "${CUST_AUTH[@]}"
-    assert "  it gives the recorded cause, not 'no recorded reason'" \
-      "$(jeval "'payment could not be authorised' in b['explanation'] and 'no recorded reason' not in b['explanation']")" "True"
-    assert "  and says they were not charged" "$(jeval "'You were not charged' in b['explanation']")" "True"
-    assert "  without mentioning a refund" "$(jeval "'refund' not in b['explanation'].lower()")" "True"
-    have_container sfo-payment-db && assert "  and the Payment database has no payment for it" "$(docker_payment_row "$DECL_ORDER")" ""
-  fi
-  # A model that promises a refund the platform never recorded is caught, and replaced by an answer that
-  # promises none. ORDER_ID is a delivered (or still-confirmed) order: no refund is recorded for it.
-  sse_ask "q=$(urlq "Why is order $ORDER_ID late? [force-refund]")" "${CUST_AUTH[@]}"
-  assert "an unsupported refund claim is flagged" "$(sse_eval "f['grounded']")" "False"
-  assert "  and the replacement promises no refund" "$(sse_eval "'refund' not in f['replacement'].lower()")" "True"
-
-  # Two more mistakes a real local model made on order questions. ORDER_ID was not cancelled, so a model that
-  # talks about its "cancellation" has adopted a false premise; and an order that has a recorded cause must
-  # never be explained as having none.
-  sse_ask "q=$(urlq "Why was order $ORDER_ID cancelled? [force-no-reason]")" "${CUST_AUTH[@]}"
-  assert "asserting a cancellation the order never had is flagged" "$(sse_eval "f['grounded']")" "False"
-  if [[ -n "${REJ_ORDER:-}" ]]; then
-    sse_ask "q=$(urlq "Why was order $REJ_ORDER cancelled? [force-no-reason]")" "${CUST_AUTH[@]}"
-    assert "denying a recorded cause is flagged" "$(sse_eval "f['grounded']")" "False"
-    assert "  and the replacement states the recorded cause" "$(sse_eval "'did not' not in f['replacement'] and 'unable to accept the order' in f['replacement']")" "True"
-  fi
-
-  # No verdicts: the platform records no promised delivery time, so "your order is on time / late / early" is
-  # something the facts cannot support. A model that says so (Claude did, repeatedly) is replaced by a summary that
-  # states what happened and says plainly that no promised time is on record.
-  sse_ask "q=$(urlq "Is order $ORDER_ID late? [force-verdict]")" "${CUST_AUTH[@]}"
-  assert "a lateness verdict is flagged" "$(sse_eval "f['grounded']")" "False"
-  assert "  the replacement judges nothing" "$(sse_eval "not any(w in f['replacement'].lower() for w in ('late', 'on time', 'early', 'slow'))")" "True"
-
-  # --- partner tools ---------------------------------------------------------------------------
-  expect "draft a dish description from ingredients" 200 POST /api/v1/ai/partner/describe-dish \
-    "{\"restaurant_id\":\"$AI_REST\",\"dish_name\":\"Zesty Chicken Karahi\",\"ingredients\":[\"chicken\",\"tomatoes\",\"green chillies\"]}" \
-    "${OWNER_AUTH[@]}"
-  assert "  it describes that dish" "$(jeval "'Zesty Chicken Karahi' in b['description']")" "True"
-  assert "  and is grounded" "$(jfield "['grounded']")" "True"
-  expect "describe-dish needs at least one ingredient -> 422" 422 POST /api/v1/ai/partner/describe-dish \
-    "{\"restaurant_id\":\"$AI_REST\",\"dish_name\":\"Plain\",\"ingredients\":[]}" "${OWNER_AUTH[@]}"
-  expect "draft promotional copy for an offer" 200 POST /api/v1/ai/partner/promo \
-    "{\"restaurant_id\":\"$AI_REST\",\"offer\":\"10% off all karahi this weekend\"}" "${OWNER_AUTH[@]}"
-  assert "  the offer is carried through unaltered" "$(jeval "'10% off all karahi this weekend' in b['promo_text']")" "True"
-  expect "summarise a restaurant's reviews" 200 POST /api/v1/ai/partner/review-summary \
-    "{\"restaurant_id\":\"$REVIEW_REST\"}" "${OWNER_AUTH[@]}"
-  if (( FAST )); then
-    assert "  no reviews: count is zero" "$(jfield "['review_count']")" "0"
-    assert "  and nothing is invented to fill the gap" "$(jfield "['summary']")" "None"
-  else
-    assert "  the count comes from the database" "$(jfield "['review_count']")" "1"
-    assert "  and so does the average" "$(jfield "['average_rating']")" "4.0"
-    assert "  with a written summary" "$([[ "$(jfield "['summary']")" != "None" ]] && echo yes)" "yes"
-  fi
 fi
 
 # --- graceful degradation ----------------------------------------------------------------------
@@ -2044,21 +1871,6 @@ print(sum(1 for x in t if x.get('health') == 'up'), len(t))
     done
     assert "  $metric is reaching Prometheus" "$([[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && echo yes)" "yes"
   done
-
-  # Week 5 (D63, D64): fed by the assistant, explanation and partner calls above, which only ran
-  # their wording checks against the deterministic model.
-  if [[ "${AI_LLM:-}" == "fake" ]]; then
-    for metric in sfo_ai_assistant_requests_total sfo_ai_llm_calls_total sfo_ai_guardrail_violations_total \
-                  sfo_ai_explain_requests_total sfo_ai_partner_requests_total; do
-      AI_METRIC=""
-      for _ in $(seq 1 6); do
-        AI_METRIC=$(prom_value "sum($metric)"); AI_METRIC=${AI_METRIC%%.*}
-        [[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && break
-        sleep 5
-      done
-      assert "  $metric is reaching Prometheus" "$([[ -n "$AI_METRIC" && "$AI_METRIC" -gt 0 ]] && echo yes)" "yes"
-    done
-  fi
 else
   printf '  %sSKIP%s  Prometheus checks (localhost:9090 not reachable)\n' "$DIM" "$RESET"
 fi

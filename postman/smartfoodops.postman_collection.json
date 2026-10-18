@@ -2,7 +2,7 @@
   "info": {
     "_postman_id": "15eb2594-8df7-4a41-8247-69b17551c6b6",
     "name": "SmartFoodOps API",
-    "description": "Every route the Nginx gateway exposes across all 7 services (user, restaurant, menu, order, payment, rider, orchestrator), organised and asserted the same way scripts/smoke-test.sh drives them: happy path, authorisation boundaries, edge cases, and the Temporal-driven order saga end to end.\n\n**Run order matters.** Folders 1-9 are numbered because later ones depend on variables (tokens, ids) captured by earlier ones. Run the whole collection with the Collection Runner, top to bottom, in one sitting -- individual folders can be re-run later, but only after folder 2 has populated tokens in this session.\n\n**Folders 7 and 8 contain self-looping poll requests** (they re-send themselves via `postman.setNextRequest` until the order reaches the status they're waiting on, up to a bounded number of tries) -- since Week 2 the order lifecycle is driven by a Temporal saga, so a status is reached *eventually*, not by the time the request that triggered it returns. These only work in the Collection Runner, not on a single Send click; set a ~2000ms delay between requests there.\n\n**Two things smoke-test.sh checks that this collection can't**: it reads three tables directly (payments, order_tracking_logs, riders) via `docker exec` to assert refunds, trail rows and fleet-leak invariants no HTTP response exposes, and it drives three compensation paths (no rider available, kitchen at capacity, and a permanently-failed refund) that need direct database or container manipulation to set up. Both are read-only observations layered on top of the same HTTP contract this collection already exercises.\n\nSee readme/observability-and-eventing-guide.md and readme/order-saga-orchestration-guide.md for how the pieces underneath these routes actually work.",
+    "description": "Every route the Nginx gateway exposes across all 8 services (user, restaurant, menu, order, payment, rider, orchestrator, ai), organised and asserted the same way scripts/smoke-test.sh drives them: happy path, authorisation boundaries, edge cases, and the Temporal-driven order saga end to end.\n\n**Run order matters.** Folders 1-11 are numbered because later ones depend on variables (tokens, ids) captured by earlier ones. Run the whole collection with the Collection Runner, top to bottom, in one sitting -- individual folders can be re-run later, but only after folder 2 has populated tokens in this session.\n\n**Folders 7 and 8 contain self-looping poll requests** (they re-send themselves via `postman.setNextRequest` until the order reaches the status they're waiting on, up to a bounded number of tries) -- since Week 2 the order lifecycle is driven by a Temporal saga, so a status is reached *eventually*, not by the time the request that triggered it returns. These only work in the Collection Runner, not on a single Send click; set a ~2000ms delay between requests there.\n\n**Two things smoke-test.sh checks that this collection can't**: it reads three tables directly (payments, order_tracking_logs, riders) via `docker exec` to assert refunds, trail rows and fleet-leak invariants no HTTP response exposes, and it drives three compensation paths (no rider available, kitchen at capacity, and a permanently-failed refund) that need direct database or container manipulation to set up. Both are read-only observations layered on top of the same HTTP contract this collection already exercises.\n\nSee readme/observability-and-eventing-guide.md and readme/order-saga-orchestration-guide.md for how the pieces underneath these routes actually work.\n\n**Folders 10 and 11 are the AI layer** (Week 4 retrieval, Week 5 assistant). They need a chat provider on the AI service (`ANTHROPIC_API_KEY`, or `LLM_PROVIDER=ollama`), and the assertions are written to hold on any of them. Stream requests have a Visualize tab. See postman/README.md, section 'Testing the AI assistant with Postman'.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "event": [
@@ -34,8 +34,8 @@
           "  pm.collectionVariables.set(\"admin_phone\", phone(6));",
           "  pm.collectionVariables.set(\"owner2_email\", \"owner2_pm\" + stamp + \"@example.com\");",
           "  pm.collectionVariables.set(\"owner2_phone\", phone(7));",
-          "  pm.collectionVariables.set(\"rest_lat\", \"33.68\");",
-          "  pm.collectionVariables.set(\"rest_lon\", \"73.04\");",
+          "  // A coordinate of this session's own, not a fixed one. Dispatch gives an order to the NEAREST free rider, and a\n  // development stack keeps every rider that earlier runs registered at the old spot (57 at the time of writing), so a\n  // fixed location handed the order to somebody else's rider and the saga folders stalled on a 403. Riders more than\n  // the search radius away are never candidates.\n  pm.collectionVariables.set(\"rest_lat\", (10 + Math.random() * 40).toFixed(4));",
+          "  pm.collectionVariables.set(\"rest_lon\", (60 + Math.random() * 60).toFixed(4));",
           "}"
         ]
       }
@@ -258,6 +258,10 @@
     {
       "key": "ai_conversation_id",
       "value": ""
+    },
+    {
+      "key": "ai_llm_provider",
+      "value": ""
     }
   ],
   "item": [
@@ -415,7 +419,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"temporal_reachable is True\", () => pm.expect(String(pm.response.json().body.temporal_reachable)).to.eql(String(\"True\")));"
+                  "pm.test(\"temporal_reachable is True\", () => pm.expect(String(pm.response.json().body.temporal_reachable)).to.eql(\"true\"));"
                 ]
               }
             }
@@ -483,7 +487,7 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"owner_id\", pm.response.json().body.id);",
-                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"restaurant_admin\")));"
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.roles[0])).to.eql(String(\"restaurant_admin\")));"
                 ]
               }
             }
@@ -595,7 +599,7 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"rider_user_id\", pm.response.json().body.id);",
-                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"rider\")));"
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.roles[0])).to.eql(String(\"rider\")));"
                 ]
               }
             }
@@ -670,7 +674,7 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"admin_id\", pm.response.json().body.id);",
-                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.role)).to.eql(String(\"system_admin\")));"
+                  "pm.test(\"role resolved from roles table\", () => pm.expect(String(pm.response.json().body.roles[0])).to.eql(String(\"system_admin\")));"
                 ]
               }
             }
@@ -1292,7 +1296,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"returned the same user\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{owner_id}}\")));"
+                  "pm.test(\"returned the same user\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(pm.collectionVariables.get(\"owner_id\"))));"
                 ]
               }
             }
@@ -1606,8 +1610,8 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"rest_id\", pm.response.json().body.id);",
-                  "pm.test(\"defaults to active\", () => pm.expect(String(pm.response.json().body.is_active)).to.eql(String(\"True\")));",
-                  "pm.test(\"owner taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.owner_id)).to.eql(String(\"{{owner_id}}\")));"
+                  "pm.test(\"defaults to active\", () => pm.expect(String(pm.response.json().body.is_active)).to.eql(\"true\"));",
+                  "pm.test(\"owner taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.owner_id)).to.eql(String(pm.collectionVariables.get(\"owner_id\"))));"
                 ]
               }
             }
@@ -2098,7 +2102,7 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"order_id\", pm.response.json().body.id);",
-                  "pm.test(\"customer taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.customer_id)).to.eql(String(\"{{cust_id}}\")));",
+                  "pm.test(\"customer taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.customer_id)).to.eql(String(pm.collectionVariables.get(\"cust_id\"))));",
                   "pm.test(\"server-recalculated unit price\", () => pm.expect(String(pm.response.json().body.items[0].unit_price)).to.eql(String(13.5)));",
                   "pm.test(\"server-recalculated total\", () => pm.expect(String(pm.response.json().body.total_amount)).to.eql(String(27.0)));",
                   "pm.test(\"initial status is 'created' (the row create_order_activity returned; the order is already confirmed by now, see Fetch order by id)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(String(\"created\")));"
@@ -2146,7 +2150,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"replay returned the SAME order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));"
+                  "pm.test(\"replay returned the SAME order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(pm.collectionVariables.get(\"order_id\"))));"
                 ]
               }
             }
@@ -2174,7 +2178,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"returned the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(\"{{order_id}}\")));",
+                  "pm.test(\"returned the same order\", () => pm.expect(String(pm.response.json().body.id)).to.eql(String(pm.collectionVariables.get(\"order_id\"))));",
                   "pm.test(\"already 'confirmed' when the checkout response arrived (D58: checkout waits through payment)\", () => pm.expect(String(pm.response.json().body.status)).to.eql(\"confirmed\"));"
                 ]
               }
@@ -3155,8 +3159,8 @@
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.collectionVariables.set(\"rider_id\", pm.response.json().body.id);",
-                  "pm.test(\"rider taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.user_id)).to.eql(String(\"{{rider_user_id}}\")));",
-                  "pm.test(\"rider starts available\", () => pm.expect(String(pm.response.json().body.is_available)).to.eql(String(\"True\")));"
+                  "pm.test(\"rider taken from the token, not the body\", () => pm.expect(String(pm.response.json().body.user_id)).to.eql(String(pm.collectionVariables.get(\"rider_user_id\"))));",
+                  "pm.test(\"rider starts available\", () => pm.expect(String(pm.response.json().body.is_available)).to.eql(\"true\"));"
                 ]
               }
             }
@@ -3821,7 +3825,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"the order awaiting a decision is this one\", () => pm.expect(String(pm.response.json().body[0].id)).to.eql(String(\"{{order_id}}\")));",
+                  "pm.test(\"the order awaiting a decision is this one\", () => pm.expect(String(pm.response.json().body[0].id)).to.eql(String(pm.collectionVariables.get(\"order_id\"))));",
                   "pm.test(\"the kitchen is not shown what was paid\", () => pm.expect(pm.response.json().body[0]).to.not.have.property(\"total_amount\"));",
                   "pm.test(\"nor who ordered it\", () => pm.expect(pm.response.json().body[0]).to.not.have.property(\"customer_id\"));"
                 ]
@@ -3978,7 +3982,7 @@
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
                   "pm.test(\"decision recorded as accepted\", () => pm.expect(String(pm.response.json().body.decision)).to.eql(String(\"accepted\")));",
-                  "pm.test(\"and it actually changed something\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(String(\"True\")));"
+                  "pm.test(\"and it actually changed something\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(\"true\"));"
                 ]
               }
             }
@@ -4006,7 +4010,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "pm.test(\"second accept is a no-op\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(String(\"False\")));"
+                  "pm.test(\"second accept is a no-op\", () => pm.expect(String(pm.response.json().body.changed)).to.eql(\"false\"));"
                 ]
               }
             }
@@ -5139,8 +5143,10 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
+                  "if (!pm.collectionVariables.get(\"payment_id\")) { pm.test.skip(\"set the collection variable payment_id first: the client never learns it from any response (see this request's description)\"); } else {",
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
-                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "}"
                 ]
               }
             }
@@ -5230,7 +5236,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"tags are normalized (case, duplicates, first-seen order)\", () => pm.expect(b.categories[0].items[0].dietary_tags).to.eql([\"halal\",\"pakistani\",\"spicy\"]));"
+                  "{ const b = pm.response.json().body; pm.test(\"tags are normalized (case, duplicates, first-seen order)\", () => pm.expect(b.categories[0].items[0].dietary_tags).to.eql([\"halal\",\"pakistani\",\"spicy\"])); }"
                 ]
               }
             }
@@ -5322,8 +5328,8 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"the closest match is the karahi\", () => pm.expect(b.matches[0].item_name).to.eql(\"Zesty Chicken Karahi\"));",
-                  "const b = pm.response.json().body; pm.test(\"each match carries a price, tags and a similarity score\", () => pm.expect(b.matches[0]).to.include.all.keys(\"price\",\"dietary_tags\",\"similarity_score\"));"
+                  "{ const b = pm.response.json().body; pm.test(\"the closest match is the karahi\", () => pm.expect(b.matches[0].item_name).to.eql(\"Zesty Chicken Karahi\")); }",
+                  "{ const b = pm.response.json().body; pm.test(\"each match carries a price, tags and a similarity score\", () => pm.expect(b.matches[0]).to.include.all.keys(\"price\",\"dietary_tags\",\"similarity_score\")); }"
                 ]
               }
             }
@@ -5364,8 +5370,8 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"nothing above the price is returned\", () => pm.expect(b.matches.every(m => m.price <= 15)).to.eql(true));",
-                  "const b = pm.response.json().body; pm.test(\"the expensive steak is excluded\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Wagyu Steak\"));"
+                  "{ const b = pm.response.json().body; pm.test(\"nothing above the price is returned\", () => pm.expect(b.matches.every(m => m.price <= 15)).to.eql(true)); }",
+                  "{ const b = pm.response.json().body; pm.test(\"the expensive steak is excluded\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Wagyu Steak\")); }"
                 ]
               }
             }
@@ -5406,7 +5412,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"only the vegan dish remains\", () => pm.expect(b.matches.map(m => m.item_name)).to.eql([\"Garden Quinoa Salad\"]));"
+                  "{ const b = pm.response.json().body; pm.test(\"only the vegan dish remains\", () => pm.expect(b.matches.map(m => m.item_name)).to.eql([\"Garden Quinoa Salad\"])); }"
                 ]
               }
             }
@@ -5447,7 +5453,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"the sold-out biryani is absent\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Sold Out Biryani\"));"
+                  "{ const b = pm.response.json().body; pm.test(\"the sold-out biryani is absent\", () => pm.expect(b.matches.map(m => m.item_name)).to.not.include(\"Sold Out Biryani\")); }"
                 ]
               }
             }
@@ -5488,7 +5494,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"empty lists, not a 404\", () => pm.expect(b.matches).to.eql([]));"
+                  "{ const b = pm.response.json().body; pm.test(\"empty lists, not a 404\", () => pm.expect(b.matches).to.eql([])); }"
                 ]
               }
             }
@@ -5726,10 +5732,10 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"every source answered\", () => pm.expect(b.sources_failed).to.eql([]));",
-                  "const b = pm.response.json().body; pm.test(\"restaurants carry a distance, nearest first\", () => { const d = b.restaurants.map(r => r.distance_km); pm.expect(d).to.eql([...d].sort((a, c) => a - c)); });",
-                  "const b = pm.response.json().body; pm.test(\"courier availability was looked up\", () => pm.expect(b.courier_availability.length).to.be.above(0));",
-                  "const b = pm.response.json().body; pm.test(\"the customer profile is present\", () => pm.expect(b.customer_profile).to.include.all.keys(\"total_orders\",\"delivered_orders\",\"favourite_vendors\"));"
+                  "{ const b = pm.response.json().body; pm.test(\"every source answered\", () => pm.expect(b.sources_failed).to.eql([])); }",
+                  "{ const b = pm.response.json().body; pm.test(\"restaurants carry a distance, nearest first\", () => { const d = b.restaurants.map(r => r.distance_km); pm.expect(d).to.eql([...d].sort((a, c) => a - c)); }); }",
+                  "{ const b = pm.response.json().body; pm.test(\"courier availability was looked up\", () => pm.expect(b.courier_availability.length).to.be.above(0)); }",
+                  "{ const b = pm.response.json().body; pm.test(\"the customer profile is present\", () => pm.expect(b.customer_profile).to.include.all.keys(\"total_orders\",\"delivered_orders\",\"favourite_vendors\")); }"
                 ]
               }
             }
@@ -5890,7 +5896,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"zero orders and no favourites\", () => { pm.expect(b.customer_profile.total_orders).to.eql(0); pm.expect(b.customer_profile.favourite_vendors).to.eql([]); });"
+                  "{ const b = pm.response.json().body; pm.test(\"zero orders and no favourites\", () => { pm.expect(b.customer_profile.total_orders).to.eql(0); pm.expect(b.customer_profile.favourite_vendors).to.eql([]); }); }"
                 ]
               }
             }
@@ -5971,22 +5977,33 @@
               }
             }
           ]
-        }
-      ]
-    },
-    {
-      "id": "7297b494-0f60-4755-9db8-e6c04b99040a",
-      "name": "11. AI Assistant (Week 5)",
-      "description": "The streaming assistant, order explanations, order reviews and the restaurant-admin authoring tools (D63, D64). Run after folders 2-4 and 6-8 and 10 (it uses `{{order_id}}`, `{{rest_id}}`, `{{ai_rest_id}}` and the tokens). The assistant needs a chat provider: `ANTHROPIC_API_KEY`, `LLM_PROVIDER=ollama`, or `LLM_PROVIDER=fake` for deterministic runs. The assertions are provider-agnostic: they check structure, ownership and the grounding contract, not wording. Cases that need a deterministic model (the guardrail replacing a fabricated dish, the exact wording) live in scripts/smoke-test.sh only.",
-      "item": [
+        },
         {
-          "id": "e5a86a4b-99e5-4096-8e85-2a810350f03d",
-          "name": "AI health names the chat provider",
+          "id": "307b4b9d-26bc-428c-a4af-1ef95cd171e8",
+          "name": "min_score drops weak matches",
           "request": {
-            "method": "GET",
-            "header": [],
-            "url": "{{base_url}}/api/v1/ai/health",
-            "description": "`llm_provider` is `anthropic`, `ollama` or (for tests) `fake`; the key is never reported."
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "description": "`min_score` is a cosine floor applied in SQL beside the HNSW ordering. 0.99 is higher than any real match, so nothing survives. Without it a semantic search always returns its nearest rows, however weak.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"a spicy chicken dish\",\"restaurant_id\":\"{{ai_rest_id}}\",\"top_k\":5,\"min_score\":0.99}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
           },
           "response": [],
           "event": [
@@ -5997,8 +6014,81 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"a provider is named\", () => pm.expect(b.llm_provider).to.be.a(\"string\"));",
-                  "const b = pm.response.json().body; pm.test(\"conversation memory is reachable\", () => pm.expect(b.conversation_store_reachable).to.eql(true));"
+                  "{ const b = pm.response.json().body; pm.test(\"nothing clears an impossible floor, and that is a 200 not a 404\", () => { pm.expect(b.matches).to.eql([]); pm.expect(b.restaurants).to.eql([]); }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "dfad2a95-b6e7-470b-9c67-6f9bbcd6bd10",
+          "name": "min_score outside 0..1 -> 422",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/search",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"query\":\"pizza\",\"min_score\":1.5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "7297b494-0f60-4755-9db8-e6c04b99040a",
+      "name": "11. AI Assistant (Week 5)",
+      "description": "The streaming assistant, order explanations, order reviews and the restaurant-admin authoring tools (D63-D65). Run after folders 2-4, 6-8 and 10: it uses `{{order_id}}` (delivered, folder 7), `{{rej_order_id}}` (rejected and refunded, folder 8), `{{rest_id}}`, `{{ai_rest_id}}` and the tokens. Run the health request first: it records which chat provider is behind the service. The assistant needs one: `ANTHROPIC_API_KEY`, or `LLM_PROVIDER=ollama` for a deterministic run. Assertions are written so they hold on ANY provider by checking what the client would SHOW (the guardrail's replacement if the model's text was rejected). Stream requests have a Visualize tab that renders the answer, the intent and whether it was grounded.",
+      "item": [
+        {
+          "id": "e5a86a4b-99e5-4096-8e85-2a810350f03d",
+          "name": "AI health names the chat provider",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/ai/health",
+            "description": "`llm_provider` is `anthropic` or `ollama`; the key is never reported. This request stores it as `{{ai_llm_provider}}`, which later requests use to switch on the checks that need a deterministic model. Run it first."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "{ const b = pm.response.json().body; pm.test(\"a provider is named\", () => pm.expect(b.llm_provider).to.be.a(\"string\")); }",
+                  "{ const b = pm.response.json().body; pm.test(\"conversation memory is reachable\", () => pm.expect(b.conversation_store_reachable).to.eql(true)); }",
+                  "{ const b = pm.response.json().body; pm.collectionVariables.set(\"ai_llm_provider\", b.llm_provider); pm.test(\"provider and model reported: \" + b.llm_provider + \" / \" + b.llm_model, () => pm.expect(b.llm_model).to.be.a(\"string\")); }"
                 ]
               }
             }
@@ -6020,7 +6110,7 @@
               }
             ],
             "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Recommend%20a%20spicy%20chicken%20dish%20under%20%2415",
-            "description": "Server-Sent Events. Postman shows the stream once it has ended. Needs ANTHROPIC_API_KEY (or LLM_PROVIDER=ollama/fake) on the AI service; without one the answer is a 503. The wording varies by model, so these tests check structure and the grounding contract, not text."
+            "description": "Server-Sent Events. Postman shows the stream once it has ended. Needs ANTHROPIC_API_KEY (or LLM_PROVIDER=ollama) on the AI service; without one the answer is a 503. The wording varies by model, so these tests check structure and the grounding contract, not text."
           },
           "response": [],
           "event": [
@@ -6030,9 +6120,10 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
-                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); });",
-                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the final chunk names the intent and the conversation\", () => { const f = events[events.length - 1]; pm.expect(f.intent).to.be.a(\"string\"); pm.expect(f.conversation_id).to.be.a(\"string\"); pm.collectionVariables.set(\"ai_conversation_id\", f.conversation_id); });",
-                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"a replaced (ungrounded) answer carries its replacement\", () => { const f = events[events.length - 1]; if (f.grounded === false) pm.expect(f.replacement).to.be.a(\"string\"); });"
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the final chunk names the intent and the conversation\", () => { const f = events[events.length - 1]; pm.expect(f.intent).to.be.a(\"string\"); pm.expect(f.conversation_id).to.be.a(\"string\"); pm.collectionVariables.set(\"ai_conversation_id\", f.conversation_id); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"a replaced (ungrounded) answer carries its replacement\", () => { const f = events[events.length - 1]; if (f.grounded === false) pm.expect(f.replacement).to.be.a(\"string\"); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
                 ]
               }
             }
@@ -6064,7 +6155,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
-                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the conversation id is continued\", () => pm.expect(events[events.length - 1].conversation_id).to.eql(pm.collectionVariables.get(\"ai_conversation_id\")));"
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"the conversation id is continued\", () => pm.expect(events[events.length - 1].conversation_id).to.eql(pm.collectionVariables.get(\"ai_conversation_id\"))); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
                 ]
               }
             }
@@ -6096,7 +6188,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
-                  "const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"routed as out of scope\", () => pm.expect(events[events.length - 1].intent).to.eql(\"out_of_scope\"));"
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"routed as out of scope\", () => pm.expect(events[events.length - 1].intent).to.eql(\"out_of_scope\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
                 ]
               }
             }
@@ -6230,8 +6323,8 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"an explanation is returned for that order\", () => { pm.expect(b.order_id).to.eql(pm.collectionVariables.get(\"order_id\")); pm.expect(b.explanation).to.be.a(\"string\").and.not.empty; });",
-                  "const b = pm.response.json().body; pm.test(\"no internals leak\", () => pm.expect(b.explanation.toLowerCase()).to.not.match(/workflow|traceback|exception/));",
+                  "{ const b = pm.response.json().body; pm.test(\"an explanation is returned for that order\", () => { pm.expect(b.order_id).to.eql(pm.collectionVariables.get(\"order_id\")); pm.expect(b.explanation).to.be.a(\"string\").and.not.empty; }); }",
+                  "{ const b = pm.response.json().body; pm.test(\"no internals leak\", () => pm.expect(b.explanation.toLowerCase()).to.not.match(/workflow|traceback|exception/)); }",
                   "pm.test(\"envelope message matches the spec\", () => pm.expect(pm.response.json().message).to.eql(\"Order explanation generated successfully\"));"
                 ]
               }
@@ -6393,7 +6486,7 @@
                 "exec": [
                   "pm.test(\"status is 201\", () => pm.response.to.have.status(201));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"the rating is stored against the order's restaurant\", () => { pm.expect(b.rating).to.eql(4); pm.expect(b.restaurant_id).to.eql(pm.collectionVariables.get(\"rest_id\")); });"
+                  "{ const b = pm.response.json().body; pm.test(\"the rating is stored against the order's restaurant\", () => { pm.expect(b.rating).to.eql(4); pm.expect(b.restaurant_id).to.eql(pm.collectionVariables.get(\"rest_id\")); }); }"
                 ]
               }
             }
@@ -6558,7 +6651,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"a description is returned\", () => { pm.expect(b.description).to.be.a(\"string\").and.not.empty; pm.expect(b.grounded).to.be.a(\"boolean\"); });"
+                  "{ const b = pm.response.json().body; pm.test(\"a description is returned\", () => { pm.expect(b.description).to.be.a(\"string\").and.not.empty; pm.expect(b.grounded).to.be.a(\"boolean\"); }); }"
                 ]
               }
             }
@@ -6600,7 +6693,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"promo text is returned\", () => pm.expect(b.promo_text).to.be.a(\"string\").and.not.empty);"
+                  "{ const b = pm.response.json().body; pm.test(\"promo text is returned\", () => pm.expect(b.promo_text).to.be.a(\"string\").and.not.empty); }"
                 ]
               }
             }
@@ -6642,7 +6735,7 @@
                 "exec": [
                   "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
                   "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
-                  "const b = pm.response.json().body; pm.test(\"counts come from the database\", () => { pm.expect(b.review_count).to.be.at.least(1); pm.expect(b.average_rating).to.be.a(\"number\"); });"
+                  "{ const b = pm.response.json().body; pm.test(\"counts come from the database\", () => { pm.expect(b.review_count).to.be.at.least(1); pm.expect(b.average_rating).to.be.a(\"number\"); }); }"
                 ]
               }
             }
@@ -6746,6 +6839,418 @@
             "body": {
               "mode": "raw",
               "raw": "{\"restaurant_id\":\"{{ai_rest_id}}\",\"offer\":\"10% off karahi\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d3fe9d28-3161-4bf0-a7d4-bd3aa543bca5",
+          "name": "Assistant stream: an impossible budget -> 'nothing matches', no model call",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Recommend%20a%20dish%20under%20%240.50",
+            "description": "Nothing clears the similarity floor, so the model is never asked to answer. Holds whatever the provider."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(\"\"); const last = events[events.length - 1] || {}; const shown = (last.replacement || streamed).trim(); pm.test(\"an honest nothing-matches reply\", () => pm.expect(shown).to.match(/couldn.t find anything/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"and it is not flagged: it is a fixed answer\", () => pm.expect(events[events.length - 1].grounded).to.eql(true)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "477891d0-c994-4bee-9bca-42b0f9916684",
+          "name": "Assistant stream: a restaurant owner cannot use it -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=spicy%20food",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "5f0daa47-711b-4b99-a658-c41de02eb368",
+          "name": "Assistant stream: latitude without longitude -> 422",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=spicy%20food&latitude=33.7",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "74f6d543-e314-4b5a-91a3-c4dbedc113e9",
+          "name": "Assistant stream: a malformed conversation id -> 422",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=spicy%20food&conversation_id=..%2Fx",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "a2949553-587c-4a23-bbef-150f9f7e4108",
+          "name": "Assistant stream: why was my rejected order cancelled, was I charged?",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Why%20was%20order%20{{rej_order_id}}%20cancelled%2C%20and%20was%20I%20charged%3F",
+            "description": "Needs folder 8 first (`{{rej_order_id}}` is the order the kitchen rejected). Whatever the provider says, what the client SHOWS must be grounded: if the guardrail rejected the model's text, the replacement is written from the recorded facts. Those facts: cancelled, cause = the restaurant was unable to accept it, money = refunded."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(\"\"); const last = events[events.length - 1] || {}; const shown = (last.replacement || streamed).trim(); pm.test(\"routed as order tracking\", () => pm.expect(last.intent).to.eql(\"order_tracking\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(\"\"); const last = events[events.length - 1] || {}; const shown = (last.replacement || streamed).trim(); pm.test(\"what the client shows says the order was cancelled and the payment refunded\", () => { pm.expect(shown).to.match(/cancel/i); pm.expect(shown).to.match(/refund/i); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(\"\"); const last = events[events.length - 1] || {}; const shown = (last.replacement || streamed).trim(); pm.test(\"and never claims it was not charged or gives a delivery verdict\", () => { pm.expect(shown).to.not.match(/not (been )?charged/i); pm.expect(shown).to.not.match(/\\b(late|on time|early|slow)\\b/i); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "1aa34efa-5d01-421e-91f0-ee347bdec317",
+          "name": "Assistant stream: 'is my order late?' gets facts, never a verdict",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Is%20my%20order%20late%3F",
+            "description": "The platform records no promised delivery time, so there is nothing to judge lateness against. Claude and local models both tried to answer 'it isn't late'; the guardrail rejects that and the client is shown a summary of what happened. Check what is SHOWN, not what streamed."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(\"\"); const last = events[events.length - 1] || {}; const shown = (last.replacement || streamed).trim(); pm.test(\"what the client shows contains no late / on time / early / slow verdict\", () => pm.expect(shown).to.not.match(/\\b(late|delayed|on[ -]time|early|slow)\\b/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "070c2c02-60c9-4ebd-a88e-83c282510cd1",
+          "name": "Explain a rejected order: cause and refund",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "Needs folder 8. The kitchen rejected this order, the saga refunded it and then cancelled it. The explanation states the recorded cause and what happened to the money, and never an amount, a time or a verdict.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{rej_order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "{ const b = pm.response.json().body; pm.test(\"it says the order was cancelled\", () => pm.expect(b.explanation).to.match(/cancel/i)); }",
+                  "{ const b = pm.response.json().body; pm.test(\"a rule-written explanation says the payment was refunded\", () => { if (b.grounded === false) pm.expect(b.explanation).to.match(/refunded/i); else pm.expect(b.grounded).to.eql(true); }); }",
+                  "{ const b = pm.response.json().body; pm.test(\"no verdict, no internals\", () => pm.expect(b.explanation).to.not.match(/\\b(late|on[ -]time|early|slow)\\b|workflow|traceback|exception/i)); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4f3d12d2-7893-4548-9064-3d3ba2cab14d",
+          "name": "Explain a delivered order: no invented cause or refund",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/explain-order",
+            "description": "`{{order_id}}` is delivered by folder 7, so this is the delivered case: no cause, no refund, no 'no recorded reason' (that phrase is only for a cancelled order with no cause).",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\"}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "{ const b = pm.response.json().body; pm.test(\"a delivered order is explained as delivered, without inventing a cause or a refund\", () => { pm.expect(b.explanation).to.match(/deliver/i); pm.expect(b.explanation).to.not.match(/refund|cancel|recorded reason/i); }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "de45bb86-9100-4ffa-a7e0-28e46cc4ac00",
+          "name": "Internal: order explain-context is refused at the gateway -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/internal/{{order_id}}/explain-context",
+            "description": "Internal-key only and deliberately absent from `route_permissions`, so even an admin's bearer is refused (D57). The AI Service reaches it directly with the internal key."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "89c250a1-71b4-4c02-a60c-f5850ae63d12",
+          "name": "Internal: latest-order lookup is refused at the gateway -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/internal/customers/{{cust_id}}/latest-order",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "f0106b01-72c6-469d-be0f-41c3f0942252",
+          "name": "Internal: restaurant reviews read is refused at the gateway -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/internal/restaurants/{{rest_id}}/reviews",
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d6425a5f-776b-454b-8355-761d7b78208e",
+          "name": "Internal: courier distance is refused at the gateway -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/riders/internal/order-courier",
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\":\"{{order_id}}\",\"latitude\":33.7,\"longitude\":73.0}",
               "options": {
                 "raw": {
                   "language": "json"

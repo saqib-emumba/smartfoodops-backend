@@ -55,9 +55,9 @@ flowchart TB
 
     subgraph READ ["READ PATH - ai-service"]
         Assistant["apis/assistant.py<br/>SSE stream"]
-        Graph["agents/graph.py<br/>LangGraph"]
+        Graph["assistant/agents/graph.py<br/>LangGraph"]
         RAG["rag_context.py<br/>assembles context"]
-        LLM(["Chat model<br/>Claude, Ollama or fake"])
+        LLM(["Chat model<br/>Claude or Ollama"])
         Guard["guardrails.py<br/>checks the answer"]
     end
 
@@ -147,11 +147,11 @@ Runs whenever a restaurant publishes a menu. Nothing here involves a language mo
 |---|---|---|
 | 1 | Owner publishes a menu. Items may carry `dietary_tags` from a fixed vocabulary of 40 (diets, allergens, cuisines, dish types, meal styles). Owners declare tags and nothing is inferred | [menu/apis/menus.py](../services/menu/apis/menus.py), [common/dietary.py](../services/common/dietary.py) |
 | 2 | After the database commit and cache invalidation, the Menu Service announces `menu.published` on Kafka. Best-effort: a Kafka failure is logged and never fails the publish | [common/events/menu.py](../services/common/events/menu.py), [common/kafka.py](../services/common/kafka.py) |
-| 3 | The worker consumes the event (group `ai-ingestion`), validates it against the schema registry, and **re-reads** the menu and restaurant over internal-key routes. The event is a hint to re-read, not the data | [ai/ingestion.py](../services/ai/ingestion.py) (`IngestionConsumer`), [ai/clients/menu.py](../services/ai/clients/menu.py), [ai/clients/restaurant.py](../services/ai/clients/restaurant.py) |
-| 4 | Each dish becomes one sentence: `Dish: Zesty Chicken Karahi at AI Test Kitchen ($12.50) \| Category: … \| Description: … \| Options: … \| Tags: halal, spicy \| Availability: In Stock`. A segment with nothing to say is omitted rather than filled with a placeholder. The restaurant also gets one document (name, address, sections, union of tags, open or closed) | [ai/chunking.py](../services/ai/chunking.py) (`item_chunk`, `restaurant_chunk`) |
-| 5 | All chunks for the restaurant are embedded in **one batch** into 384 numbers by a local model (all-MiniLM-L6-v2 on onnxruntime, baked into the image, no key, no network). The `Embedder` interface means a document and the query that should match it can never use different models | [ai/embeddings.py](../services/ai/embeddings.py) (`build_embedder`, `embed_timed`) |
+| 3 | The worker consumes the event (group `ai-ingestion`), validates it against the schema registry, and **re-reads** the menu and restaurant over internal-key routes. The event is a hint to re-read, not the data | [ai/ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) (`IngestionConsumer`), [ai/clients/menu.py](../services/ai/clients/menu.py), [ai/clients/restaurant.py](../services/ai/clients/restaurant.py) |
+| 4 | Each dish becomes one sentence: `Dish: Zesty Chicken Karahi at AI Test Kitchen ($12.50) \| Category: … \| Description: … \| Options: … \| Tags: halal, spicy \| Availability: In Stock`. A segment with nothing to say is omitted rather than filled with a placeholder. The restaurant also gets one document (name, address, sections, union of tags, open or closed) | [ai/retrieval/chunking.py](../services/ai/retrieval/chunking.py) (`item_chunk`, `restaurant_chunk`) |
+| 5 | All chunks for the restaurant are embedded in **one batch** into 384 numbers by a local model (all-MiniLM-L6-v2 on onnxruntime, baked into the image, no key, no network). The `Embedder` interface means a document and the query that should match it can never use different models | [ai/retrieval/embeddings.py](../services/ai/retrieval/embeddings.py) (`build_embedder`, `embed_timed`) |
 | 6 | In **one transaction** the restaurant's old documents are deleted, the new ones inserted and the event marked processed. If the stored `source_version` and embedding model both match, the menu is skipped, so re-ingesting is harmless | [ai/repositories/documents.py](../services/ai/repositories/documents.py) (`replace_restaurant`, `current_version`), [db/vector/init.sql](../db/vector/init.sql) |
-| 7 | Failure handling: a transient failure retries with backoff (5 attempts) then dead-letters; a schema-invalid event goes straight to the DLQ `sfo.menu.events.v1.dlq`. At startup the worker also backfills every published menu, so a lost event is a delay, not a hole | [ai/ingestion.py](../services/ai/ingestion.py) (`_ingest_with_retry`, `_to_dlq`, `_startup_backfill`) |
+| 7 | Failure handling: a transient failure retries with backoff (5 attempts) then dead-letters; a schema-invalid event goes straight to the DLQ `sfo.menu.events.v1.dlq`. At startup the worker also backfills every published menu, so a lost event is a delay, not a hole | [ai/ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) (`_ingest_with_retry`, `_to_dlq`, `_startup_backfill`) |
 
 The index is an **HNSW** index on cosine distance (`vector_cosine_ops`), which finds near neighbours without scanning
 every row. A published menu is searchable about a second later.
@@ -175,7 +175,7 @@ File: [ai/apis/search.py](../services/ai/apis/search.py) → [ai/repositories/ve
 
 ### `POST /api/v1/ai/rag-context` — three sources in one call
 
-File: [ai/rag_context.py](../services/ai/rag_context.py) (`RagContextAssembler`), [ai/apis/rag.py](../services/ai/apis/rag.py)
+File: [ai/retrieval/rag_context.py](../services/ai/retrieval/rag_context.py) (`RagContextAssembler`), [ai/apis/rag.py](../services/ai/apis/rag.py)
 
 | Source | From | Time budget |
 |---|---|---|
@@ -193,19 +193,19 @@ for anyone).
 ## 5. The read path, part 2: the assistant graph
 
 Endpoint: `GET /api/v1/ai/assistant/stream?q=…&conversation_id=…&latitude=…&longitude=…`
-File: [ai/apis/assistant.py](../services/ai/apis/assistant.py) → [ai/agents/graph.py](../services/ai/agents/graph.py) (`Assistant`)
+File: [ai/apis/assistant.py](../services/ai/apis/assistant.py) → [ai/assistant/agents/graph.py](../services/ai/assistant/agents/graph.py) (`Assistant`)
 
-The graph is built with LangGraph. The chat model comes from [ai/llm.py](../services/ai/llm.py) (`build_chat_model`), which
+The graph is built with LangGraph. The chat model comes from [ai/llm/provider.py](../services/ai/llm/provider.py) (`build_chat_model`), which
 returns a LangChain model for the configured provider.
 
 | Stage | Model? | What it does | File |
 |---|---|---|---|
-| **Memory** | no | Loads this user's earlier messages for this conversation (max 12, 1 hour) from Redis | [ai/memory.py](../services/ai/memory.py) |
-| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/agents/router.py](../services/ai/agents/router.py), prompt in [ai/agents/prompts.py](../services/ai/agents/prompts.py) |
-| **Retrieve (food)** | no | Calls the RAG assembler with the router's budget and tags, the similarity floor (`ASSISTANT_MIN_SCORE` 0.30), and a follow-up-aware query (a short follow-up like "and vegan?" is joined to the previous question). Fetches 18 candidates, **drops repeats** (same dish, restaurant name and price), keeps the best 6 | [ai/agents/graph.py](../services/ai/agents/graph.py), [ai/agents/context.py](../services/ai/agents/context.py) |
-| **Retrieve (order)** | no | Gathers order facts (section 7) | [ai/order_explainer.py](../services/ai/order_explainer.py) |
-| **Generate** | yes | The model writes from the context only. Each fragment is sent to the client as it is produced | [ai/llm.py](../services/ai/llm.py) (`stream_model`), prompts in [ai/agents/prompts.py](../services/ai/agents/prompts.py) |
-| **Guardrail** | no | Checks the finished answer (section 6). A failing answer is replaced by one written by rules from the same context | [ai/guardrails.py](../services/ai/guardrails.py), [ai/agents/context.py](../services/ai/agents/context.py) (`render_food_fallback`) |
+| **Memory** | no | Loads this user's earlier messages for this conversation (max 12, 1 hour) from Redis | [ai/assistant/memory.py](../services/ai/assistant/memory.py) |
+| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/assistant/agents/router.py](../services/ai/assistant/agents/router.py), prompt in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
+| **Retrieve (food)** | no | Calls the RAG assembler with the router's budget and tags, the similarity floor (`ASSISTANT_MIN_SCORE` 0.30), and a follow-up-aware query (a short follow-up like "and vegan?" is joined to the previous question). Fetches 18 candidates, **drops repeats** (same dish, restaurant name and price), keeps the best 6 | [ai/assistant/agents/graph.py](../services/ai/assistant/agents/graph.py), [ai/assistant/agents/context.py](../services/ai/assistant/agents/context.py) |
+| **Retrieve (order)** | no | Gathers order facts (section 7) | [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) |
+| **Generate** | yes | The model writes from the context only. Each fragment is sent to the client as it is produced | [ai/llm/provider.py](../services/ai/llm/provider.py) (`stream_model`), prompts in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
+| **Guardrail** | no | Checks the finished answer (section 6). A failing answer is replaced by one written by rules from the same context | [ai/llm/guardrails.py](../services/ai/llm/guardrails.py), [ai/assistant/agents/context.py](../services/ai/assistant/agents/context.py) (`render_food_fallback`) |
 
 **Retrieval always runs before generation, because the edges say so.** A tool-calling agent could skip retrieval and answer
 from the model's general knowledge. This graph cannot.
@@ -236,7 +236,7 @@ data: {"token": "", "done": true, "conversation_id": "…", "intent": "food_disc
 ## 6. The guardrails
 
 The prompt *asks* the model to behave. The guardrails are what make it true. All live in
-[ai/guardrails.py](../services/ai/guardrails.py), and each one exists because a real model once did the thing it catches.
+[ai/llm/guardrails.py](../services/ai/llm/guardrails.py), and each one exists because a real model once did the thing it catches.
 
 **Food answers** (`verify_food_answer`): the generation prompt makes the model write every dish and restaurant name in
 **bold**, exactly as given, so the names an answer asserts are its bold spans.
@@ -249,7 +249,7 @@ The prompt *asks* the model to behave. The guardrails are what make it true. All
 | Name families | Relaxes the name check: "Desi Dhaba" passes when it is the shared stem of at least two real names | Claude abbreviated three branches |
 | Denials | A name inside a denial ("I can't find **X**") is not treated as a claim that X exists. The negation must be within three words before the name | Claude echoed the restaurant the customer asked about |
 
-**Order explanations** (`check_explanation` in [ai/order_explainer.py](../services/ai/order_explainer.py)):
+**Order explanations** (`check_explanation` in [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py)):
 
 | Check | Rejects |
 |---|---|
@@ -273,7 +273,7 @@ exempt from some checks, so "X is not only at Y" would slip through.
 ## 7. Order explanations
 
 Two doors, one engine: `POST /api/v1/ai/explain-order` ([ai/apis/explain.py](../services/ai/apis/explain.py)) and an order
-question inside the assistant stream. Both call `OrderExplainer` in [ai/order_explainer.py](../services/ai/order_explainer.py).
+question inside the assistant stream. Both call `OrderExplainer` in [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py).
 Only the customer who placed the order (or an admin) may ask.
 
 **Where the facts come from** (the AI Service never touches another service's database):
@@ -307,7 +307,7 @@ refund, anything from a log's free-text `detail`, any rider identity.
 
 ## 8. Partner tools, reviews and attribution
 
-**Partner tools** — [ai/apis/partner.py](../services/ai/apis/partner.py), [ai/partner.py](../services/ai/partner.py)
+**Partner tools** — [ai/apis/partner.py](../services/ai/apis/partner.py), [ai/assistant/partner.py](../services/ai/assistant/partner.py)
 `POST /api/v1/ai/partner/describe-dish`, `/promo`, `/review-summary`, for `restaurant_admin` and **only for a restaurant they
 own** (checked against the Restaurant Service as the caller). Plain chains (prompt, model, check), because there is no
 retrieval to force. Generated copy may not contain a number the owner did not supply; otherwise a plain rendering of the input
@@ -320,7 +320,7 @@ once only (`UNIQUE (order_id)`). The AI Service reads a restaurant's reviews ove
 **Attribution (did the assistant lead to an order?)**
 - Every answer is logged to `assistant_interactions`: customer, conversation, routed intent, outcome, and the restaurant and dish
   ids it named. **Never the question or the answer text.** File: [ai/repositories/interactions.py](../services/ai/repositories/interactions.py).
-- A second consumer in the same worker, [ai/attribution.py](../services/ai/attribution.py) (group `ai-attribution`), reads
+- A second consumer in the same worker, [ai/ingestion/attribution.py](../services/ai/ingestion/attribution.py) (group `ai-attribution`), reads
   `order.created`. If the same customer ordered from a restaurant the assistant named to them within 24 hours, that interaction is
   marked converted and the order's value is added to `sfo_ai_attributed_revenue_total`.
 - This is **attribution, not proof of cause**, and it is restaurant-level because order events carry no line items.
@@ -345,17 +345,32 @@ once only (`UNIQUE (order_id)`). The AI Service reads a restaurant's reviews ove
 
 | File | Role |
 |---|---|
-| [main.py](../services/ai/main.py), [deps.py](../services/ai/deps.py), [assistant_deps.py](../services/ai/assistant_deps.py) | App composition. `assistant_deps` builds the chat model, Redis and the assistant lazily, so a missing key stops only the assistant endpoints |
+| [main.py](../services/ai/main.py), [deps.py](../services/ai/deps.py), [assistant/deps.py](../services/ai/assistant/deps.py) | App composition. `assistant/deps.py` builds the chat model, Redis and the assistant lazily, so a missing key stops only the assistant endpoints |
 | [apis/](../services/ai/apis/) | HTTP edge: `search`, `rag`, `assistant` (SSE), `explain`, `partner`, `health` |
-| [agents/graph.py](../services/ai/agents/graph.py) | The LangGraph: router, retrieve, generate, guardrail |
-| [agents/router.py](../services/ai/agents/router.py) · [agents/context.py](../services/ai/agents/context.py) · [agents/prompts.py](../services/ai/agents/prompts.py) | Router parsing · context builder and fallback · every prompt the model is sent |
-| [guardrails.py](../services/ai/guardrails.py) | All answer checks |
-| [order_explainer.py](../services/ai/order_explainer.py) | Order facts, derivations, rule-written summary, `check_explanation` |
-| [llm.py](../services/ai/llm.py) · [fake_llm.py](../services/ai/fake_llm.py) | Provider factory, metered calls, failure mapping · deterministic test model |
-| [rag_context.py](../services/ai/rag_context.py) · [repositories/vectors.py](../services/ai/repositories/vectors.py) | Three-source assembler · hybrid SQL |
-| [ingestion.py](../services/ai/ingestion.py) · [chunking.py](../services/ai/chunking.py) · [embeddings.py](../services/ai/embeddings.py) · [repositories/documents.py](../services/ai/repositories/documents.py) | The write path |
-| [memory.py](../services/ai/memory.py) · [partner.py](../services/ai/partner.py) · [attribution.py](../services/ai/attribution.py) · [metrics.py](../services/ai/metrics.py) · [config.py](../services/ai/config.py) | Redis memory · partner chains · attribution · Prometheus metrics · settings |
+| [assistant/agents/graph.py](../services/ai/assistant/agents/graph.py) | The LangGraph: router, retrieve, generate, guardrail |
+| [router.py](../services/ai/assistant/agents/router.py) · [context.py](../services/ai/assistant/agents/context.py) · [prompts.py](../services/ai/assistant/agents/prompts.py) (all in `assistant/agents/`) | Router parsing · context builder and fallback · every prompt the model is sent |
+| [assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) · [assistant/partner.py](../services/ai/assistant/partner.py) · [assistant/memory.py](../services/ai/assistant/memory.py) | Order facts, derivations, rule-written summary, `check_explanation` · partner chains · Redis conversation memory |
+| [llm/provider.py](../services/ai/llm/provider.py) · [llm/guardrails.py](../services/ai/llm/guardrails.py) | Provider factory, metered calls, failure mapping · all answer checks |
+| [retrieval/rag_context.py](../services/ai/retrieval/rag_context.py) · [repositories/vectors.py](../services/ai/repositories/vectors.py) | Three-source assembler · hybrid SQL |
+| [ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) · [retrieval/chunking.py](../services/ai/retrieval/chunking.py) · [retrieval/embeddings.py](../services/ai/retrieval/embeddings.py) · [repositories/documents.py](../services/ai/repositories/documents.py) | The write path (the worker runs as `python -m ai.ingestion`, via `ingestion/__main__.py`) |
+| [ingestion/attribution.py](../services/ai/ingestion/attribution.py) · [metrics.py](../services/ai/metrics.py) · [config.py](../services/ai/config.py) | Attribution consumer · Prometheus metrics · settings |
 | [clients/](../services/ai/clients/) · [schemas/](../services/ai/schemas/) | Sibling-service HTTP clients · request and response shapes |
+
+Packages: `assistant/` (Week 5 features), `llm/` (model access and checks), `retrieval/` (embeddings, chunking, RAG),
+`ingestion/` (Kafka consumers), plus `apis/`, `clients/`, `repositories/`, `schemas/`.
+
+```mermaid
+flowchart LR
+    main["main.py · deps.py<br/>config.py · metrics.py"] --> apis["apis/<br/>search · rag · assistant<br/>explain · partner · health"]
+    apis --> assistant["assistant/<br/>agents/ (LangGraph)<br/>order_explainer · partner<br/>memory · deps"]
+    apis --> retrieval["retrieval/<br/>embeddings · chunking<br/>rag_context · geo"]
+    assistant --> llm["llm/<br/>provider · guardrails"]
+    assistant --> retrieval
+    assistant --> clients["clients/ · repositories/ · schemas/"]
+    retrieval --> clients
+    worker["ingestion/<br/>menu_ingestion · attribution<br/>(python -m ai.ingestion)"] --> retrieval
+    worker --> clients
+```
 
 **Changed in other services:** [order/apis/internal_explain.py](../services/order/apis/internal_explain.py),
 [order/apis/reviews.py](../services/order/apis/reviews.py), [rider/apis/dispatch.py](../services/rider/apis/dispatch.py),
@@ -370,7 +385,7 @@ once only (`UNIQUE (order_id)`). The AI Service reads a restaurant's reviews ove
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LLM_PROVIDER` | `anthropic` | `anthropic`, `ollama`, or `fake` (deterministic test model). **A value in `.env` beats the default; a variable in your shell beats `.env`** |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` or `ollama`. **A value in `.env` beats the default; a variable in your shell beats `.env`** |
 | `ANTHROPIC_API_KEY` | none | Needed for `anthropic`. Without it only the assistant endpoints answer 503 |
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `http://host.docker.internal:11434` / `llama3.1` | The model **must be one you have pulled**; the service warns at startup if not |
@@ -406,9 +421,8 @@ Pick **one**, then run the two commands after it.
 
 | Option | Use it for | Command |
 |---|---|---|
-| **A. Deterministic test model** | Fast, free, repeatable. Wording is canned, but every branch behaves as in production, including the guardrails | `LLM_PROVIDER=fake docker compose up -d ai-service` |
-| **B. Local Ollama** | Real language, no key, nothing leaves your machine | `ollama pull llama3.2:3b` once, then `LLM_PROVIDER=ollama OLLAMA_MODEL=llama3.2:3b docker compose up -d ai-service` |
-| **C. Claude** | Best answers. Needs `ANTHROPIC_API_KEY` in `.env` | `LLM_PROVIDER=anthropic docker compose up -d ai-service` |
+| **A. Local Ollama** | Real language, no key, nothing leaves your machine | `ollama pull llama3.2:3b` once, then `LLM_PROVIDER=ollama OLLAMA_MODEL=llama3.2:3b docker compose up -d ai-service` |
+| **B. Claude** | Best answers. Needs `ANTHROPIC_API_KEY` in `.env` | `LLM_PROVIDER=anthropic docker compose up -d ai-service` |
 
 After **any** recreate of the AI service, reload the gateway (it resolves addresses once at start, so otherwise it answers 502)
 and confirm the provider:
@@ -586,30 +600,25 @@ now true and `sfo_ai_attributed_orders_total` has moved (the worker logs the mat
 | Ask with `q=a` | `422` (a question must be 2–500 characters) |
 | `docker stop sfo-redis`, then ask | Still answers; follow-ups lose context. Then `docker start sfo-redis` |
 | Start the service with no usable provider | `503 The assistant is not configured…`; **search and RAG still work** |
-| With **option A (fake)**, add a marker to a question | Forces a model failure so you can watch the guardrail catch it: |
 
-The fake model's markers (append to the question):
-
-| Marker | The fake model then says | The guardrail should |
-|---|---|---|
-| `[force-ungrounded]` | A dish and price that exist nowhere | Flag it, `grounded: false`, supply a replacement from real data |
-| `[force-mispair]` | A real dish at a restaurant that does not offer it | Flag the pairing |
-| `[force-refund]` (include an order id) | "you were refunded in full" on an order with no refund | Flag the money claim |
-| `[force-no-reason]` (include an order id) | "no recorded reason" for a cancellation | Flag the denied cause, or the false cancellation |
-| `[force-verdict]` (include an order id) | "your order is on time" | Flag the verdict |
+The guardrail's own failure cases (a made-up dish, a wrong refund claim, a lateness verdict) cannot be triggered on demand
+with a real model, so they are not probed by any test. To see one fire, watch
+`sfo_ai_guardrail_violations_total` while asking questions, or read the rules in [llm/guardrails.py](../services/ai/llm/guardrails.py).
 
 ### Step 10: the automated suite
 
+The same flows are available as a Postman collection (folders 10 and 11, with a Visualize tab for each streamed answer), runnable in the app or with Newman. How: [postman/README.md](../postman/README.md#testing-the-ai-assistant-with-postman).
+
 ```bash
-LLM_PROVIDER=fake docker compose up -d ai-service && docker exec sfo-api-gateway nginx -s reload
+LLM_PROVIDER=anthropic docker compose up -d ai-service && docker exec sfo-api-gateway nginx -s reload
 ./scripts/smoke-test.sh --fast         # about 3 minutes
 ./scripts/smoke-test.sh                # about 20 minutes, includes the order saga
 ```
 
 The assistant section ("AI assistant and explanations (Week 5)") asserts access control, validation, the review rules, the
-refund and not-charged claims against the Payment database, every guardrail via the markers above, memory in Redis, and the
-metrics reaching Prometheus. Its checks on *wording* run only with the fake model and are skipped, visibly, otherwise, because a
-real model's phrasing varies. Option B and C are tested by hand with the steps above.
+refund and not-charged claims against the Payment database, memory in Redis, and the metrics reaching Prometheus. It does
+not assert what the assistant *says*, because a real model's phrasing varies: that is what Steps 2 to 9 and the Postman
+collection are for.
 
 ---
 

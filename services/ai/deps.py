@@ -14,8 +14,8 @@ from common.bootstrap import bootstrap
 from ai import config
 from ai.clients.analytics import AnalyticsServiceClient
 from ai.clients.rider import RiderServiceClient
-from ai.embeddings import build_embedder
-from ai.rag_context import RagContextAssembler
+from ai.retrieval.embeddings import build_embedder
+from ai.retrieval.rag_context import RagContextAssembler
 from ai.repositories.vectors import VectorRepository
 
 runtime = bootstrap(

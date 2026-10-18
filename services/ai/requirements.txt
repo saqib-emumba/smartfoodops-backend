@@ -22,7 +22,7 @@ fastjsonschema==2.22.2
 
 # Week 5 (D63). langgraph orchestrates the router / retrieval / generation / guardrail flow;
 # langchain-core is its model and message abstraction. Exactly one chat provider package is
-# imported at runtime (`ai.llm.build_chat_model`), but both are installed so switching
+# imported at runtime (`ai.llm.provider.build_chat_model`), but both are installed so switching
 # LLM_PROVIDER is a deploy, not a rebuild.
 langgraph==1.2.15
 langchain-core==1.6.10

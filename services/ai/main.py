@@ -17,7 +17,7 @@ from common.lifespan import compose_lifespan
 from common.responses import install_error_handlers
 from common.telemetry import instrument_app
 from ai import config, deps
-from ai import assistant_deps
+from ai.assistant import deps as assistant_deps
 from ai.apis import assistant, explain, health, partner, rag, search
 
 @asynccontextmanager

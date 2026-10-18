@@ -13,5 +13,5 @@ class ExplainOrderResponse(BaseModel):
     order_id: UUID
     explanation: str
     # False when the model's wording was replaced by one written from the facts alone because it
-    # quoted a figure the facts did not contain (see ai/guardrails.py).
+    # quoted a figure the facts did not contain (see ai/llm/guardrails.py).
     grounded: bool

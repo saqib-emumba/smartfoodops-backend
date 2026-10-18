@@ -5,7 +5,7 @@ envelope — an event stream has no single body to envelop — so its shape is t
 lines of `{"token": str, "done": bool}`, with a final chunk (`done: true`, empty token) that also
 carries `conversation_id`, `intent` and `grounded`.
 
-If the grounding check rejects the finished answer (see `ai/guardrails.py`), the tokens already
+If the grounding check rejects the finished answer (see `ai/llm/guardrails.py`), the tokens already
 sent cannot be recalled, so the final chunk carries `replacement` — the plain, rule-written answer
 — and the client is expected to show it in place of what streamed.
 
@@ -26,8 +26,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from common.auth import CurrentUser, require_permission
 from common.errors import unprocessable
-from ai import assistant_deps, config
-from ai.memory import CONVERSATION_ID_PATTERN
+from ai import config
+from ai.assistant import deps as assistant_deps
+from ai.assistant.memory import CONVERSATION_ID_PATTERN
 from ai.metrics import (
     RECOMMENDING_INTERACTIONS_TOTAL,
     ASSISTANT_FIRST_TOKEN_SECONDS,
@@ -80,7 +81,7 @@ async def assistant_stream(
     if (latitude is None) != (longitude is None):
         raise unprocessable("latitude and longitude must be given together")
     if conversation_id is None:
-        from ai.agents.graph import new_conversation_id
+        from ai.assistant.agents.graph import new_conversation_id
 
         conversation_id = new_conversation_id()
     elif not CONVERSATION_ID_PATTERN.match(conversation_id):

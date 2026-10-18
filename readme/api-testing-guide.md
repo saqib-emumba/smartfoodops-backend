@@ -1183,14 +1183,12 @@ Metrics are on the *SmartFoodOps — AI Retrieval* Grafana dashboard (<http://lo
 
 ## 10. The AI assistant (Week 5)
 
-> For how the pipeline works and a fuller, ordered test script (choosing a model, memory, order explanations, the guardrail markers, metrics), see [ai-pipeline-guide.md](ai-pipeline-guide.md).
+> For how the pipeline works and a fuller, ordered test script (choosing a model, memory, order explanations, metrics), see [ai-pipeline-guide.md](ai-pipeline-guide.md).
 
 A streaming conversational assistant, order explanations, order reviews and the restaurant-admin
 authoring tools. The assistant needs a chat model: put `ANTHROPIC_API_KEY` in the root `.env` and
-recreate the service (`docker compose up -d ai-service`), or run it with `LLM_PROVIDER=ollama`. For a
-deterministic run with no key (the same model the smoke test uses) start it as
-`LLM_PROVIDER=fake docker compose up -d ai-service`; wording is then canned, but every branch behaves
-as it does for real. Without any of these, only the assistant endpoints answer `503`. Uses `$CUSTOMER`,
+recreate the service (`docker compose up -d ai-service`), or run it with `LLM_PROVIDER=ollama`.
+Without either, only the assistant endpoints answer `503`. Uses `$CUSTOMER`,
 `$OWNER` and the restaurant from section 9 (`$AI_REST`).
 
 ```bash
@@ -1200,8 +1198,7 @@ curl -N -H "Authorization: Bearer $CUSTOMER" -H 'Accept: text/event-stream' \
 # -> data: {"token": "Based", "done": false} ... then a last chunk:
 #    data: {"token": "", "done": true, "conversation_id": "...", "intent": "food_discovery", "grounded": true}
 
-# Watch the tokens arrive over time rather than at the end (the gateway must not buffer them):
-LLM_PROVIDER=fake FAKE_LLM_TOKEN_DELAY_SECONDS=0.4 docker compose up -d ai-service
+# Watch the tokens arrive over time (the gateway must not buffer them): each line is stamped when it arrives
 curl -sN -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=Recommend+sushi" \
   | while IFS= read -r l; do [ -n "$l" ] && echo "$(date +%S.%N | cut -c1-5) $l"; done
 
@@ -1220,16 +1217,10 @@ curl -s -w '\n[%{http_code}]\n' -H "Authorization: Bearer $OWNER" "$BASE/api/v1/
 curl -s -w '\n[%{http_code}]\n' -H "Authorization: Bearer $CUSTOMER" "$BASE/api/v1/ai/assistant/stream?q=a"        # 422
 ```
 
-**See the guardrail work.** With the fake model, a question containing `[force-ungrounded]` makes it
-name a dish and price that exist nowhere. The tokens still stream (they cannot be recalled), but the final
-chunk says so and supplies the answer to show instead:
-
-```bash
-curl -N -H "Authorization: Bearer $CUSTOMER" \
-  "$BASE/api/v1/ai/assistant/stream?q=Recommend+a+dish+%5Bforce-ungrounded%5D"
-# -> ... data: {"token": "", "done": true, ..., "grounded": false,
-#              "replacement": "Here is what is on the menus right now: **...** at **...** ($...)."}
-```
+**The guardrail.** The tokens stream as the model writes them and cannot be recalled. When the finished answer
+fails a check (a dish, price or claim not in the retrieved facts), the final chunk says `"grounded": false` and carries
+a `replacement`, written by rules from the same facts, for the client to show instead. A real model rarely trips it, so
+watch `sfo_ai_guardrail_violations_total` rather than expecting to see one on demand.
 
 **Orders.** `$ORDER_ID` is an order you placed (section 4). Ask in plain words, or explicitly:
 

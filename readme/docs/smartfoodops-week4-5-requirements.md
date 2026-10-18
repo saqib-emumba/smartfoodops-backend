@@ -46,7 +46,7 @@ Build the data parsing, chunking, embedding, vector storage, and multi-source re
 
 #### B. Automated Embedding Pipeline
 - **Embedding Model Integration:** Generate dense, high-dimensional vector embeddings using standard embedding models (e.g., OpenAI `text-embedding-3-small` 1536-dim or HuggingFace `all-MiniLM-L6-v2` 384-dim).
-- **Asynchronous Pipeline Worker:** Build a background worker (`services/ai/ingestion.py`) that executes non-blocking ingestion whenever a menu publish or item update occurs in `sfo_menu_core`.
+- **Asynchronous Pipeline Worker:** Build a background worker (`services/ai/ingestion/menu_ingestion.py`) that executes non-blocking ingestion whenever a menu publish or item update occurs in `sfo_menu_core`.
 
 #### C. Vector Database Storage & Indexing
 - **Vector Database Engine:** Containerize and configure a vector database (PGVector extension on PostgreSQL `db-vector-postgres` or Qdrant/ChromaDB).
@@ -61,7 +61,7 @@ Build the data parsing, chunking, embedding, vector storage, and multi-source re
 - **Hybrid Vector Filtering:** Support combined queries combining vector cosine similarity with SQL metadata constraints (e.g., `base_price <= 15.00 AND is_available = true`).
 
 #### E. Multi-Engine RAG Context Retrieval Engine
-- **Multi-Source Context Assembly:** Construct a context aggregator (`services/ai/rag_context.py`) that fetches and joins context from three decoupled storage engines:
+- **Multi-Source Context Assembly:** Construct a context aggregator (`services/ai/retrieval/rag_context.py`) that fetches and joins context from three decoupled storage engines:
   1. **Vector Database:** Top-$K$ semantically relevant menu items and cuisines.
   2. **Analytics Projections (`sfo_analytics_core`):** Customer order history and favorite vendors (Decision **D44**).
   3. **Redis Spatial Index (`riders:geo`):** Real-time courier proximity and driver availability (Decision **D49**).
@@ -247,10 +247,10 @@ To maintain platform observability and satisfy evaluation criteria, Part B intro
 
 | Milestone | Feature | Component / Service | Core Dependency | Acceptance Criteria |
 | :--- | :--- | :--- | :--- | :--- |
-| **Week 4** | Relational Menu Ingestion | `services/ai/ingestion.py` | `sfo_menu_core` (D50) | Ingests normalized categories, items, and option groups into text chunks. |
+| **Week 4** | Relational Menu Ingestion | `services/ai/ingestion/menu_ingestion.py` | `sfo_menu_core` (D50) | Ingests normalized categories, items, and option groups into text chunks. |
 | **Week 4** | HNSW Vector Indexing | `db-vector-postgres` | PGVector | Stores 1536-dim embeddings with HNSW cosine similarity index. |
 | **Week 4** | Hybrid Semantic Search | `POST /api/v1/ai/search` | FastAPI + D35 Envelope | Returns top-$K$ dishes matching semantic meaning and SQL price filters. |
-| **Week 4** | Multi-Engine RAG | `services/ai/rag_context.py` | Analytics (D44) + Redis GEO (D49) | Joins vector top-$K$, past order history, and driver proximity. |
+| **Week 4** | Multi-Engine RAG | `services/ai/retrieval/rag_context.py` | Analytics (D44) + Redis GEO (D49) | Joins vector top-$K$, past order history, and driver proximity. |
 | **Week 5** | Conversational Assistant | `GET /api/v1/ai/assistant/stream` | LangGraph / LangChain | Streams token-by-token responses answering user meal queries. |
 | **Week 5** | Order Delay Reasoning | `POST /api/v1/ai/explain-order` | `order_tracking_logs` | Provides human-readable delay explanations grounded in tracking logs. |
 | **Week 5** | Zero-Hallucination Guardrails | AI Assistant Prompts | System Prompts | Restricts suggestions strictly to retrieved active menus and restaurants. |

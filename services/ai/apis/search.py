@@ -17,7 +17,7 @@ from opentelemetry import trace
 from common.auth import CurrentUser, require_permission
 from common.responses import Envelope, ok
 from ai import deps
-from ai.embeddings import embed_timed
+from ai.retrieval.embeddings import embed_timed
 from ai.metrics import SEARCH_LATENCY_SECONDS, SEARCH_REQUESTS_TOTAL
 from ai.schemas.search import ItemMatch, RestaurantMatch, SearchRequest, SearchResponse
 

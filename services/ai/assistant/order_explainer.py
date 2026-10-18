@@ -301,7 +301,7 @@ def check_explanation(text: str, facts: dict):
     The one check both `explain` and the assistant's order path run, so the two cannot disagree about what
     counts as grounded.
     """
-    from ai.guardrails import verify_cause, verify_money, verify_no_verdict, verify_quantities, verify_status
+    from ai.llm.guardrails import verify_cause, verify_money, verify_no_verdict, verify_quantities, verify_status
 
     verdict = verify_quantities(text, quantities=quantities_in(facts))
     for extra in (
@@ -326,8 +326,8 @@ async def explain(model, facts: dict) -> tuple[str, bool]:
 
     from langchain_core.messages import HumanMessage, SystemMessage
 
-    from ai.agents import prompts
-    from ai.llm import call_model
+    from ai.assistant.agents import prompts
+    from ai.llm.provider import call_model
     from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 
     text = await call_model(

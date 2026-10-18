@@ -2381,10 +2381,10 @@ instead.
 (`vector(384)`, vectors from two models are not comparable, a change is a re-ingest); a chat model carries no
 such state. Generation uses Claude (`claude-sonnet-5-5`) by default, and `LLM_PROVIDER=ollama` swaps in a
 self-hosted model with no code change. The embedder stays local and custom (D59) and is not replaced by a
-LangChain wrapper: nothing in the graph needs one and Week 4 is built and verified. `LLM_PROVIDER=fake`
-selects a deterministic test double (`ai/fake_llm.py`) that follows a `[ROLE:...]` tag in each prompt; it
-exists so the smoke test can drive every branch, including the guardrail's replacement, with no key and no
-network, and is never a default.
+LangChain wrapper: nothing in the graph needs one and Week 4 is built and verified. A deterministic
+test double (`LLM_PROVIDER=fake`) existed while the assistant was built, so the smoke test could drive every branch
+with no key; it was removed afterwards, so the smoke test no longer asserts what the assistant says, and the
+guardrail's failure cases are no longer probed by any automated test.
 
 **Conversation memory is Redis, not a LangGraph checkpointer.** A capped list per `ai:conv:{user_id}:{id}`
 with a one-hour TTL, loaded before the graph runs and saved after it ends. The stock checkpointers need
@@ -2522,7 +2522,7 @@ and letting the model infer causes from raw logs.
 
 **Decided:** every assistant answer is logged to `assistant_interactions` in the vector database: the
 customer, conversation, routed intent, outcome and the restaurant and dish ids it named — never the question
-or the answer. A second consumer in the existing `ai-ingestion-worker` (`ai/attribution.py`, group
+or the answer. A second consumer in the existing `ai-ingestion-worker` (`ai/ingestion/attribution.py`, group
 `ai-attribution`) reads `order.created` and, if the same customer ordered from a restaurant named to them in
 the last `ATTRIBUTION_WINDOW_HOURS` (24), marks that interaction converted and adds the order's value to
 `sfo_ai_attributed_revenue_total`. The dashboard's acceptance rate is attributed orders per answer that named

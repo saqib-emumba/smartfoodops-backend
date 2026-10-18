@@ -10,14 +10,14 @@ from functools import lru_cache
 
 from common.errors import service_unavailable
 from ai import config, deps
-from ai.agents.graph import Assistant
+from ai.assistant.agents.graph import Assistant
 from ai.clients.order import OrderServiceClient
 from ai.clients.restaurant import RestaurantServiceClient
 from ai.clients.rider import RiderServiceClient
-from ai.llm import build_chat_model
-from ai.memory import ConversationStore
-from ai.order_explainer import OrderExplainer
-from ai.partner import PartnerTools
+from ai.llm.provider import build_chat_model
+from ai.assistant.memory import ConversationStore
+from ai.assistant.order_explainer import OrderExplainer
+from ai.assistant.partner import PartnerTools
 from ai.repositories.interactions import InteractionRepository
 
 orders = OrderServiceClient(deps.logger)

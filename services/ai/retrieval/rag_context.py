@@ -31,9 +31,9 @@ from opentelemetry import trace
 from ai import config
 from ai.clients.analytics import AnalyticsServiceClient
 from ai.clients.rider import RiderServiceClient
-from ai.embeddings import Embedder, embed_timed
+from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import RAG_LATENCY_SECONDS, RAG_REQUESTS_TOTAL, RAG_SOURCE_FAILURES_TOTAL
-from ai.geo import haversine_km
+from ai.retrieval.geo import haversine_km
 from ai.repositories.vectors import VectorRepository
 from ai.schemas.rag import (
     CourierAvailability,

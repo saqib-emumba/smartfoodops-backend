@@ -20,9 +20,9 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ai import config
-from ai.agents import prompts
+from ai.assistant.agents import prompts
 from ai.clients.order import OrderServiceClient
-from ai.llm import call_model
+from ai.llm.provider import call_model
 from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 from ai.schemas.partner import (
     DescribeDishRequest,

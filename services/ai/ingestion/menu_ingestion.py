@@ -31,10 +31,10 @@ from prometheus_client import start_http_server
 
 from common.kafka import SchemaRegistryValidator, build_producer, extract_trace_context
 from ai import config
-from ai.chunking import item_chunk, restaurant_chunk
+from ai.retrieval.chunking import item_chunk, restaurant_chunk
 from ai.clients.menu import MenuServiceClient
 from ai.clients.restaurant import RestaurantServiceClient
-from ai.embeddings import Embedder, embed_timed
+from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import DOCUMENTS_INDEXED, INGESTION_EVENTS_TOTAL, INGESTION_LAST_EVENT_SECONDS
 from ai.repositories.documents import DocumentRepository
 
@@ -353,7 +353,7 @@ async def main(backfill_only: bool) -> None:
         )
         # The attribution consumer (Week 5, D63) shares this process: it is a few lines of SQL per
         # order, so a container of its own would cost more than it protects.
-        from ai.attribution import AttributionConsumer
+        from ai.ingestion.attribution import AttributionConsumer
         from ai.repositories.interactions import InteractionRepository
 
         attribution = AttributionConsumer(
@@ -376,11 +376,3 @@ async def main(backfill_only: bool) -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="AI Service ingestion worker")
-    parser.add_argument(
-        "--backfill", action="store_true",
-        help="ingest every published menu once, then exit (instead of consuming events)",
-    )
-    asyncio.run(main(parser.parse_args().backfill))

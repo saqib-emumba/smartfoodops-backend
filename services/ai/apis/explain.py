@@ -2,7 +2,7 @@
 
 The facts come from the Order Service (the order, its transition trail, the running saga's own
 stage), the Restaurant Service (a name and coordinates) and the Rider Service (how far the assigned
-courier is) — see `ai/order_explainer.py`. The model only phrases them; the figures it may quote are
+courier is) — see `ai/assistant/order_explainer.py`. The model only phrases them; the figures it may quote are
 checked against them afterwards.
 """
 
@@ -10,9 +10,9 @@ from fastapi import APIRouter, Depends
 
 from common.auth import CurrentUser, require_permission
 from common.responses import Envelope, ok
-from ai import assistant_deps
+from ai.assistant import deps as assistant_deps
 from ai.metrics import EXPLAIN_REQUESTS_TOTAL
-from ai.order_explainer import explain
+from ai.assistant.order_explainer import explain
 from ai.schemas.explain import ExplainOrderRequest, ExplainOrderResponse
 
 router = APIRouter(prefix="/api/v1/ai")

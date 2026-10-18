@@ -7,8 +7,8 @@ multi-agent framework with zero-hallucination guardrails — built on the Week 4
 ([week4-ai-retrieval-plan.md](week4-ai-retrieval-plan.md)).
 
 **Status:** All six phases are implemented. The full smoke run and `--fast` pass (see §5). The smoke test's
-assertions about what the assistant *says* run against the deterministic test double (`LLM_PROVIDER=fake`), because
-a real model's wording varies. The assistant was also run by hand on a real local model (`llama3.2:3b` through
+assertions about what the assistant *says* were first run against a deterministic test double, since removed (see §4),
+because a real model's wording varies. The assistant was also run by hand on a real local model (`llama3.2:3b` through
 Ollama) and on Claude (`claude-sonnet-5-5`); each found real problems that are fixed and recorded in §5.
 
 For how the pipeline works end to end, with diagrams, the files involved and a test script, see
@@ -45,7 +45,7 @@ Exploration found six gaps the spec assumes away:
 | Conversation memory | Redis db 3, capped list per `{user}:{conversation}`, one-hour TTL | The stock LangGraph checkpointers need psycopg3 or Redis Stack; `MemorySaver` is unbounded and lost on restart |
 | Order facts | One internal Order Service route (order + reduced trail + saga stage) | The Order Service already holds the Temporal client and the tables (D01) |
 | Conversion telemetry | Log answers; attribute `order.created` events from Kafka | Changes nothing in checkout; the Order Service never learns the assistant exists (D65) |
-| Test model | `LLM_PROVIDER=fake`, keyed on a `[ROLE:...]` tag in each prompt | Lets the smoke test drive every branch, including the guardrail, with no key |
+| Test model | A deterministic `fake` provider, used while building, later removed | It let the smoke test drive every branch, including the guardrail, with no key; removing it trades that coverage for a smaller codebase |
 
 Deviations from the spec's wording, deliberately:
 
@@ -81,8 +81,8 @@ Cross-cutting rules that apply to every phase (unchanged from Week 4):
 
 ### Phase 1 — LLM foundation (done)
 
-- [llm.py](../services/ai/llm.py): `build_chat_model()` returns a LangChain `BaseChatModel` for the
-  provider `LLM_PROVIDER` names (`anthropic`, `ollama`, `fake`); `call_model` and `stream_model` wrap every
+- [llm/provider.py](../services/ai/llm/provider.py): `build_chat_model()` returns a LangChain `BaseChatModel` for the
+  provider `LLM_PROVIDER` names (`anthropic`, `ollama`); `call_model` and `stream_model` wrap every
   call with metrics, a span, and the failure contract — any provider error is a plain `503` to the caller,
   with the kind (`timeout`, `rate_limit`, `auth`, `unavailable`) on `sfo_ai_llm_failures_total` and the detail
   in the log only.
@@ -91,7 +91,7 @@ Cross-cutting rules that apply to every phase (unchanged from Week 4):
   `starlette>=0.49`, while the shared chassis pins `fastapi==0.115.6` (`starlette<0.42`), and upgrading FastAPI
   would touch every service for the sake of one.
 - `ANTHROPIC_API_KEY` is read with `required()` in one place and compose passes it to `ai-service` only. Lazy
-  construction ([assistant_deps.py](../services/ai/assistant_deps.py)) keeps the ingestion worker's startup,
+  construction ([assistant/deps.py](../services/ai/assistant/deps.py)) keeps the ingestion worker's startup,
   and search and RAG, independent of it: without a key only the assistant endpoints answer `503`.
 
 Verified: the image builds, `ChatAnthropic` constructs with a dummy key, and the service without a key
@@ -118,7 +118,7 @@ logs a warning and answers `503` on the assistant, `200` on search.
 Verified: every internal route is `401` without the key and `403` through the gateway for an admin's bearer;
 the real cancelled order in the dev database explains as `kitchen_at_capacity`.
 
-### Phase 3 — The graph (done): `services/ai/agents/`
+### Phase 3 — The graph (done): `services/ai/assistant/agents/`
 
 - **Router** classifies into `food_discovery`, `order_tracking`, `restaurant_support`, `out_of_scope` and
   extracts a budget, dietary tags (intersected with the shared vocabulary) and an order id, as JSON parsed
@@ -127,11 +127,11 @@ the real cancelled order in the dev database explains as `kitchen_at_capacity`.
   assistant's `min_score` and a follow-up-aware query. For orders it is `OrderExplainer.facts`. Nothing above the
   floor ends the run without calling the model.
 - **Generation** streams the model's text through LangGraph's stream writer.
-- **Guardrail** ([guardrails.py](../services/ai/guardrails.py)): the generation prompt makes every dish and
+- **Guardrail** ([guardrails.py](../services/ai/llm/guardrails.py)): the generation prompt makes every dish and
   restaurant name bold and exact, so the asserted names are the bold spans; each must be in the context, every
   `$` price must match one, and an order explanation's "N minutes" / "N km" must be a figure in the facts. A
   failing answer is replaced by one rendered from the context by rules.
-- **Memory** ([memory.py](../services/ai/memory.py)): Redis, per user and conversation, one hour.
+- **Memory** ([memory.py](../services/ai/assistant/memory.py)): Redis, per user and conversation, one hour.
 
 Verified: with the test double, a food question is routed, retrieved against, streamed and grounded; an
 off-topic one is declined without a dish; an impossible filter is "nothing matches" with no model call; a model
@@ -177,9 +177,13 @@ owner's restaurant and a customer for the tools; a review summary reports the da
   a second consumer in the ingestion worker matches `order.created` to a recent recommendation by the same
   customer for the same restaurant. [add_assistant_interactions.sql](../db/vector/add_assistant_interactions.sql).
 - **Smoke test:** a new *AI assistant and explanations (Week 5)* section. Access control, validation and the
-  review rules run whatever the provider; the wording checks run only under `LLM_PROVIDER=fake` and are skipped,
-  visibly, otherwise.
-- **Postman:** folder 11 (21 requests), provider-agnostic assertions.
+  review rules run whatever the provider. The wording checks that needed the `fake` provider were removed with it.
+- **Postman:** folders 10 and 11 (22 and 33 requests), assertions that hold on any provider because they check what a client
+  would show. Run end to end with Newman against Claude: **191 requests, 445 assertions, 0 failed.** That run also found
+  and fixed script bugs that had been in the older folders since they were written (booleans compared to `"True"`,
+  `{{var}}` written inside script text, `body.role` where the API returns `roles`), and a rider-dispatch problem (every
+  session used the same coordinates, so a used stack handed the order to another run's rider). See
+  [postman/README.md](../postman/README.md#testing-the-ai-assistant-with-postman).
 - **Docs:** D63 to D65, README (a section, env vars, endpoint and service tables, migrations, layout), the RBAC
   design and auth guide tables, the architecture diagram, the ERD (`ORDER_REVIEWS`, `ASSISTANT_INTERACTIONS`; all
   all 25 tables match, column for column), a new [ai_assistant_sequence_diagram.md](diagrams/ai_assistant_sequence_diagram.md), and
@@ -190,11 +194,11 @@ was stamped and `sfo_ai_attributed_orders_total` / `sfo_ai_attributed_revenue_to
 
 ## 5. Verification
 
-Run on the dev stack with the AI service on `LLM_PROVIDER=fake` (no API key was available):
+Run on the dev stack. Current counts; the fake model has since been removed:
 
-- `./scripts/smoke-test.sh` — **677 passed, 0 failed** (648 before the follow-ups below added assertions). (The three `compensation_failed` timing failures that
+- `./scripts/smoke-test.sh` — **601 passed, 0 failed** after the fake model and its wording checks were removed (677 before). (The three `compensation_failed` timing failures that
   appeared in earlier Week 4 runs did not occur.)
-- `./scripts/smoke-test.sh --fast` — **482 passed, 0 failed.**
+- `./scripts/smoke-test.sh --fast` — **424 passed, 0 failed** (482 before).
 - A follow-up (explanations also quote the recorded dispatch estimate, and split the wait into the restaurant's time
   and the courier search) was verified on a real delivered order against its raw trail timestamps, on an in-flight
   order waiting on the kitchen, and by unit-checking six timelines (accepted, rejected, instant, waiting on the
@@ -249,7 +253,7 @@ stream the checked text, at the cost of first-token latency.
 ### Run against Claude (`claude-sonnet-5-5`)
 
 With a real key, the assistant was run on Claude. It is much better than the 3B local model, and still found six
-real problems, each now fixed and covered by a unit check and, where the fake model can reproduce it, a smoke test.
+real problems, each now fixed and covered by a unit check (and, while it existed, a smoke test on the fake model).
 
 What held without changes: streaming and routing; about 5 s per food answer and 3 s per order answer; honesty about
 what it cannot confirm ("I can't confirm a margherita pizza there", then real alternatives); the tag disclaimers
@@ -272,7 +276,7 @@ distinct-rows step only partly relieves.
 
 ## 6. Known limits
 
-- **Claude was tested by hand, not in CI:** the smoke test's wording assertions need the deterministic model, so Claude
+- **Claude was tested by hand, not in CI:** the smoke test no longer asserts wording (the fake model that allowed it was removed), so Claude
   and a local 3B model were each run by hand (section 5) and their findings turned into checks. The guardrail's
   false-alarm rate on Claude is observed from a few dozen questions, not measured; `ASSISTANT_MIN_SCORE` (0.30) is calibrated on the seed menus with MiniLM only.
 - **The guardrail has a ceiling** (D63): it catches an invented or mismatched name, price or figure, a denied cause and

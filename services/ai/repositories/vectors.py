@@ -15,7 +15,7 @@ transaction only and never leak into another request sharing the pooled connecti
 
 from common.repository import Repository
 from ai import config
-from ai.embeddings import as_vector
+from ai.retrieval.embeddings import as_vector
 
 _SETTINGS = (
     "SET LOCAL hnsw.iterative_scan = relaxed_order",

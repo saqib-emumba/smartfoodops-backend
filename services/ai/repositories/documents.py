@@ -14,7 +14,7 @@ below are kept as explicit documentation of the column type, not as a workaround
 from psycopg2.extras import execute_values
 
 from common.repository import Repository
-from ai.embeddings import as_vector
+from ai.retrieval.embeddings import as_vector
 
 _EVENT_PROCESSED = """
     SELECT 1 AS seen FROM processed_events

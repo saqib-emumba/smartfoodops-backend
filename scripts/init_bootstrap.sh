@@ -1545,9 +1545,6 @@ services:
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
-      # Only meaningful with LLM_PROVIDER=fake: seconds between streamed tokens, so a test can see
-      # that the gateway forwards them as they are written rather than all at once.
-      FAKE_LLM_TOKEN_DELAY_SECONDS: ${FAKE_LLM_TOKEN_DELAY_SECONDS:-0}
     depends_on:
       db-vector-postgres:
         condition: service_healthy
@@ -1743,7 +1740,7 @@ scrape_configs:
     static_configs:
       - targets: ["ai-service:8009"]
 
-  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion.py::main (Week 4).
+  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion/menu_ingestion.py::main (Week 4).
   - job_name: "ai-ingestion-worker"
     static_configs:
       - targets: ["ai-ingestion-worker:9111"]

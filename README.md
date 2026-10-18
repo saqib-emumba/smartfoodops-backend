@@ -366,8 +366,7 @@ curl -s -X POST http://localhost/api/v1/ai/partner/review-summary -H "Authorizat
   example `ollama pull llama3.2:3b` and `OLLAMA_MODEL=llama3.2:3b` in `.env`. `LLM_PROVIDER` in `.env` wins over
   the default (`anthropic`), so a key alone does not switch providers: set `LLM_PROVIDER=anthropic` or delete that
   line. Without a usable provider, the assistant endpoints answer `503` and
-  search, RAG context and ingestion are unaffected. `LLM_PROVIDER=fake` selects a deterministic test double
-  — it is what the smoke test uses (`LLM_PROVIDER=fake docker compose up -d ai-service`), never a default.
+  search, RAG context and ingestion are unaffected.
 - **Grounded in code, not only in the prompt.** Retrieval always runs before generation, and the finished
   answer is checked: every dish or restaurant name in bold must exist in the retrieved context, every price
   must match one, and within a sentence a dish, its restaurant and its price must *belong together* (a real
@@ -522,8 +521,8 @@ service talks to which database.
 | `USER_POSTGRES_PASSWORD`, `RESTAURANT_POSTGRES_PASSWORD`, `ORDER_POSTGRES_PASSWORD`, `PAYMENT_POSTGRES_PASSWORD`, `MENU_POSTGRES_PASSWORD`, `RIDER_POSTGRES_PASSWORD`, `ANALYTICS_POSTGRES_PASSWORD`, `VECTOR_POSTGRES_PASSWORD` | yes | One per database. A missing key aborts **every** compose command with `set <KEY> in the root .env` |
 | `GRAFANA_ADMIN_PASSWORD` | yes | Grafana's own admin login, not a database password |
 | `EMBEDDING_PROVIDER`, `OPENAI_API_KEY` | no | `local` (default) embeds in-container with no key; `openai` calls the API and needs the key. Compose passes both through (Week 4, D59) |
-| `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | no — but the assistant endpoints answer `503` without a usable one | `anthropic` (default) calls Claude and needs the key; `ollama` uses a self-hosted server; `fake` is a deterministic test double for the smoke test. Passed to `ai-service` only (Week 5, D63) |
-| `AI_REDIS_URL`, `ASSISTANT_MIN_SCORE`, `ATTRIBUTION_WINDOW_HOURS`, `FAKE_LLM_TOKEN_DELAY_SECONDS` | no | Conversation memory Redis (default db 3); the cosine floor below which retrieval counts as "nothing matches" (0.30); the window for attributing an order to a recommendation (24h); a per-token delay for the fake model only (Week 5, D63/D65) |
+| `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | no — but the assistant endpoints answer `503` without a usable one | `anthropic` (default) calls Claude and needs the key; `ollama` uses a self-hosted server. Passed to `ai-service` only (Week 5, D63) |
+| `AI_REDIS_URL`, `ASSISTANT_MIN_SCORE`, `ATTRIBUTION_WINDOW_HOURS` | no | Conversation memory Redis (default db 3); the cosine floor below which retrieval counts as "nothing matches" (0.30); the window for attributing an order to a recommendation (24h)(Week 5, D63/D65) |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | yes | Celery's broker credentials (Week 3, D45) — required even though Kafka, not RabbitMQ, is the durable ledger |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
@@ -640,11 +639,10 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 677 assertions against http://localhost
+./scripts/smoke-test.sh            # 601 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 482 assertions, skips the saga sections and the policy-TTL wait
-# The Week 5 wording checks run only when the AI service uses the deterministic model:
-#   LLM_PROVIDER=fake docker compose up -d ai-service   (then reload the gateway)
+./scripts/smoke-test.sh --fast     # 424 assertions, skips the saga sections and the policy-TTL wait
+# What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 ```
@@ -732,7 +730,7 @@ copy-pasteable `curl` commands, grouped by service, with the expected response f
 
 For exercising the same contract from Postman instead of a terminal, import
 [postman/smartfoodops.postman_collection.json](postman/smartfoodops.postman_collection.json) —
-177 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
+195 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
 including a Collection-Runner-only happy path through the saga (self-looping status polls,
 since checkout is asynchronous). See [postman/README.md](postman/README.md) for import steps,
 run order, and what it can't check that the shell script can.
@@ -1457,13 +1455,16 @@ smartfoodops-backend/
 │   ├── notification/            # worker.py (Celery app + tasks), consumer.py (the
 │   │                            #   Kafka-to-Celery bridge), tasks.py, clients/user.py
 │   │                            #   Two containers, one image (Week 3, D45) — see below
-│   └── ai/                      # main.py, deps.py, ingestion.py (the worker), chunking.py,
-│                                #   embeddings.py, rag_context.py, apis/{search,rag,health}.py,
-│                                #   repositories/{vectors,documents}.py, clients/
-│                                #   Week 5: llm.py (provider factory), agents/{graph,router,context,
-│                                #   prompts}.py (the LangGraph), guardrails.py, order_explainer.py,
-│                                #   partner.py, memory.py (Redis), attribution.py, fake_llm.py (test
-│                                #   double), assistant_deps.py, apis/{assistant,explain,partner}.py
+│   └── ai/                      # main.py, deps.py, config.py, metrics.py, apis/{search,rag,
+│                                #   assistant,explain,partner,health}.py, clients/,
+│                                #   repositories/{vectors,documents,interactions}.py, schemas/
+│                                #   retrieval/   embeddings, chunking, rag_context, geo (Week 4)
+│                                #   ingestion/   menu_ingestion (the worker), attribution,
+│                                #                __main__ (`python -m ai.ingestion`)
+│                                #   llm/         provider (factory), guardrails (Week 5)
+│                                #   assistant/   agents/{graph,router,context,prompts} (the
+│                                #                LangGraph), order_explainer, partner, memory
+│                                #                (Redis), deps
 │                                #   Two containers, one image (Weeks 4-5, D59-D65)  (:8009)
 ├── scripts/
 │   ├── smoke-test.sh           # End-to-end assertions across the whole stack

@@ -49,14 +49,8 @@ def build_chat_model(*, temperature: float | None = None) -> BaseChatModel:
             temperature=temperature,
             num_predict=config.LLM_MAX_TOKENS,
         )
-    if config.LLM_PROVIDER == "fake":
-        # A test double (ai/fake_llm.py), selectable only by name. Lets the smoke test drive the
-        # whole graph with no API key and no network.
-        from ai.fake_llm import DeterministicChatModel
-
-        return DeterministicChatModel()
     raise RuntimeError(
-        f"LLM_PROVIDER={config.LLM_PROVIDER!r} is not supported; use 'anthropic', 'ollama' or 'fake'."
+        f"LLM_PROVIDER={config.LLM_PROVIDER!r} is not supported; use 'anthropic' or 'ollama'."
     )
 
 

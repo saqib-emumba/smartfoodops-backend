@@ -105,7 +105,7 @@ Verified: tags round-trip and normalize; one event lands on the topic per publis
 internal route is 401 without the key and 403 through the gateway with a bearer token;
 `--fast` smoke passed 294/294.
 
-### Phase 3 — Ingestion pipeline (done): `services/ai/ingestion.py`
+### Phase 3 — Ingestion pipeline (done): `services/ai/ingestion/menu_ingestion.py`
 
 A menu publish becomes up-to-date vectors within seconds, idempotently.
 
@@ -116,7 +116,7 @@ A menu publish becomes up-to-date vectors within seconds, idempotently.
   and a metrics server on port 9111, so an embedding job never competes with a search request.
   `AI_PROCESS_NAME` gives each process its own name for logs, traces and the Prometheus job.
 - **Per event:** fetch the menu and restaurant over the internal routes; build chunks
-  ([ai/chunking.py](../services/ai/chunking.py)); embed the dishes and the restaurant in one batch;
+  ([ai/retrieval/chunking.py](../services/ai/retrieval/chunking.py)); embed the dishes and the restaurant in one batch;
   replace the restaurant's documents and record the event as processed in one transaction.
   Re-ingesting is skipped when the stored `source_version` and embedding model both match.
 - **Chunk format:** `Dish: … at … ($…) | Category: … | Description: … | Options: … | Tags: … |
@@ -190,7 +190,7 @@ poor match; it is not in the spec and not built.
 
 ### Phase 5 — RAG context (done): `POST /api/v1/ai/rag-context`
 
-[services/ai/rag_context.py](../services/ai/rag_context.py) gathers three sources, each under its own
+[services/ai/retrieval/rag_context.py](../services/ai/retrieval/rag_context.py) gathers three sources, each under its own
 time budget (`config.RAG_*_TIMEOUT_SECONDS`):
 1. **Vector:** top-K items and restaurants for `prompt_query`, constrained by optional
    `max_price` and `dietary_filters` (the same search as Phase 4, plus restaurant coordinates).

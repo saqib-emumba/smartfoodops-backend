@@ -1,7 +1,6 @@
 """Every system prompt the AI Service sends, in one file so a reviewer can read what the model is told.
 
-Each begins with a `[ROLE:...]` tag. The model ignores it; `ai.fake_llm` keys on it, which is what
-lets the smoke test run the whole graph deterministically with no API key.
+Each begins with a `[ROLE:...]` tag, a label that makes a prompt easy to find in logs and traces.
 
 All of them treat what follows as data. Menu descriptions, dish names and customer reviews are
 text other people wrote, so a prompt that let them issue instructions would make the assistant

@@ -48,7 +48,7 @@ INGESTION_METRICS_PORT = 9111
 
 # --- Week 5: the chat model (D63) ---
 # "anthropic" calls Claude through the API and needs ANTHROPIC_API_KEY, read with `required()`
-# in `llm.build_chat_model` and nowhere else; "ollama" talks to a self-hosted Ollama server, so
+# in `llm.provider.build_chat_model` and nowhere else; "ollama" talks to a self-hosted Ollama server, so
 # nothing leaves the deployment. Selected by env, like EMBEDDING_PROVIDER.
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
@@ -74,7 +74,7 @@ CONVERSATION_MAX_MESSAGES = 12
 # prompt tokens, and a recommendation list nobody reads past five is not worth the latency.
 ASSISTANT_TOP_K = 6
 # How many candidates retrieval fetches before identical-looking ones are dropped and the best ASSISTANT_TOP_K
-# distinct ones kept: duplicates would otherwise crowd the context (agents/context.py `_distinct`).
+# distinct ones kept: duplicates would otherwise crowd the context (assistant/agents/context.py `_distinct`).
 ASSISTANT_CANDIDATES = 18
 # Cosine floor below which a match is treated as "nothing matches" (the Phase 4 open point). A
 # guess calibrated on the seed menus with all-MiniLM-L6-v2, where on-topic queries score well

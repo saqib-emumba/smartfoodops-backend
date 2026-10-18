@@ -60,7 +60,7 @@ scrape_configs:
     static_configs:
       - targets: ["ai-service:8009"]
 
-  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion.py::main (Week 4).
+  # Not a FastAPI process: a bare prometheus_client server in ai/ingestion/menu_ingestion.py::main (Week 4).
   - job_name: "ai-ingestion-worker"
     static_configs:
       - targets: ["ai-ingestion-worker:9111"]
