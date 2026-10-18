@@ -211,6 +211,8 @@ flowchart TB
 
 ## Notes on the edges
 
+- **Chat client:** the gateway also serves a static page, `chat-ui/index.html`, at `/chat/`. It is public (it is only HTML) and
+  calls the same gated routes as any client, with the signed-in customer's own bearer token.
 - **Gateway (D51/D57):** the dotted `auth_request` edge decides token validity and the route's permission from
   `route_permissions`/`role_permissions`; a `403` can come from it as readily as a `401`. A success sets
   `X-User-Id`/`X-User-Roles`/`X-User-Permissions`, which service-to-service calls carry instead of a bearer token (D52).

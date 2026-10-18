@@ -11,7 +11,7 @@ connection nor `temporalio`.
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from common.auth import require_internal
 from common.errors import not_found
@@ -70,13 +70,17 @@ async def explain_context(order_id: UUID) -> Envelope[OrderExplainContext]:
 
 
 @router.get("/internal/customers/{customer_id}/latest-order")
-def latest_order(customer_id: UUID) -> Envelope[dict]:
+def latest_order(customer_id: UUID, status: str | None = Query(None, pattern="^cancelled$")) -> Envelope[dict]:
     """The id of a customer's most recent order, so "why is my order late?" needs no id.
 
+    `status=cancelled` narrows it to the most recent cancelled order, for "why was my order cancelled?"
+    when a newer order is still in flight. Only that one status is offered: it is the only question the
+    assistant asks, and an open filter would be a new surface to validate.
+
     Only the id: the assistant then asks for the full explanation context, whose ownership check
-    still runs on the AI Service side. `404` when the customer has never ordered.
+    still runs on the AI Service side. `404` when the customer has no such order.
     """
-    order_id = deps.orders.latest_id_for_customer(customer_id)
+    order_id = deps.orders.latest_id_for_customer(customer_id, status)
     if order_id is None:
         raise not_found(f"Customer {customer_id} has no orders")
     return ok({"order_id": str(order_id)}, message="Latest order")

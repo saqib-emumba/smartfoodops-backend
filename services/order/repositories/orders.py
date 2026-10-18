@@ -30,6 +30,7 @@ from order.repositories.sql import (
     SELECT_KITCHEN_DECIDED_AT,
     SELECT_KITCHEN_QUEUE,
     SELECT_LATEST_FOR_CUSTOMER,
+    SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS,
     SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
     SELECT_LINE_ITEMS_FOR_ORDERS,
     TRANSITION_ORDER,
@@ -78,9 +79,12 @@ class OrderRepository(Repository):
         row = self.one(SELECT_KITCHEN_DECIDED_AT, (str(order_id),))
         return row["kitchen_decided_at"] if row else None
 
-    def latest_id_for_customer(self, customer_id: UUID) -> UUID | None:
-        """The id of this customer's most recent order, or None if they have never ordered."""
-        row = self.one(SELECT_LATEST_FOR_CUSTOMER, (str(customer_id),))
+    def latest_id_for_customer(self, customer_id: UUID, status: str | None = None) -> UUID | None:
+        """The id of this customer's most recent order (optionally the most recent in `status`), or None."""
+        if status is None:
+            row = self.one(SELECT_LATEST_FOR_CUSTOMER, (str(customer_id),))
+        else:
+            row = self.one(SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS, (str(customer_id), status))
         return row["id"] if row else None
 
     def find_by_idempotency_key(self, key: str) -> dict | None:

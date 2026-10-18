@@ -25,11 +25,12 @@ class OrderServiceClient(ServiceFacade):
             headers=internal_headers(),
         )
 
-    def latest_order_id(self, customer_id: str) -> str | None:
-        """The customer's most recent order id, or None if they have never ordered."""
+    def latest_order_id(self, customer_id: str, status: str | None = None) -> str | None:
+        """The customer's most recent order id (optionally the latest cancelled one), or None."""
         try:
             body = self._client.get(
-                f"/api/v1/orders/internal/customers/{customer_id}/latest-order",
+                f"/api/v1/orders/internal/customers/{customer_id}/latest-order"
+                + (f"?status={status}" if status else ""),
                 missing=f"Customer {customer_id} has no orders",
                 unreachable_hint="cannot look up the latest order",
                 headers=internal_headers(),

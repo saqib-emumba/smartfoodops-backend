@@ -341,6 +341,14 @@ GET /api/v1/ai/assistant/stream?q=...        (SSE, customers: ai:assistant)
                                                   generate (model, streams tokens) ─▶ guardrail ─▶ final chunk
 ```
 
+**Try it in a browser:** open <http://localhost/chat/>, create a customer account (or sign in with one) and ask
+away. For a customer with a real order history (delivered, cancelled and refunded, and in progress), run
+`./scripts/seed-demo.sh` and sign in as `demo.customer@smartfoodops.demo`; the questions to ask and what to expect are in
+[readme/interview-demo-guide.md](readme/interview-demo-guide.md). It is a single static page, [chat-ui/index.html](chat-ui/index.html), served by the gateway, so it needs no build
+step and no CORS. It shows the answer as it streams, keeps the conversation going, can send your location for distances,
+refreshes your session when the 15-minute token lapses, and shows when the guardrail replaced a draft. Only customers can
+use the assistant; an owner or rider account signs in and is told it may not.
+
 ```bash
 # Stream an answer (-N: do not buffer). Tokens arrive as `data: {"token": "...", "done": false}`;
 # the last chunk has done=true, the conversation_id, the routed intent, and `grounded`.
@@ -642,9 +650,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 619 assertions against http://localhost
+./scripts/smoke-test.sh            # 628 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 442 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 448 assertions, skips the saga sections and the policy-TTL wait
 # What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -1073,7 +1081,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `POST` | `/api/v1/riders/internal/nearby` | AI Service | Available-rider count and nearest distance around a point — aggregates only, never a rider id or position (D62) |
 | `GET` | `/api/v1/analytics/internal/customers/{customer_id}/summary` | AI Service | Order counts and favourite restaurants; zeros for a customer with no history (D62). Not routed by the gateway |
 | `GET` | `/api/v1/orders/internal/{order_id}/explain-context` | AI Service | The order, its reduced trail (status, service, reason code, time, and on the `assigned` row the dispatch estimate and distance — never `detail`, `raw_log` or a rider id) plus when the kitchen answered and the running workflows' stage (D64) |
-| `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order` | AI Service | A customer's most recent order id, so "why is my order late?" needs none |
+| `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order[?status=cancelled]` | AI Service | A customer's most recent order id (or most recent *cancelled* one), so "why is my order late?" and "why was my order cancelled?" need no id |
 | `GET` | `/api/v1/orders/internal/restaurants/{restaurant_id}/reviews` | AI Service | Review count, average and recent commented reviews — no customer id (D64) |
 | `POST` | `/api/v1/riders/internal/order-courier` | AI Service | Distance from a point to the rider carrying an order — never an id, position or ETA (D64) |
 | `POST` | `/api/v1/orders/internal/create` | worker | Re-price, verify and insert the order — the write behind checkout, reached only from `OrderWorkflow`'s create activity (D53, D58) |
@@ -1370,7 +1378,8 @@ the whole image.
 
 ```text
 smartfoodops-backend/
-├── api-gateway/nginx.conf     # Path-based routing + /health
+├── api-gateway/nginx.conf     # Path-based routing + /health + the static chat client at /chat/
+├── chat-ui/index.html         # A one-file chat client for the assistant (sign in as a customer, ask, watch it stream)
 ├── prometheus/prometheus.yml  # Scrape config — every FastAPI service, both Temporal ports,
 │                              #   the outbox relays' own metrics, RabbitMQ (Week 3)
 ├── grafana/provisioning/      # Datasource + dashboards, file-provisioned so `down -v`
@@ -1474,6 +1483,7 @@ smartfoodops-backend/
 │                                #                (Redis), deps
 │                                #   Two containers, one image (Weeks 4-5, D59-D65)  (:8009)
 ├── scripts/
+│   ├── seed-demo.sh            # A demo customer with delivered, cancelled and in-progress orders (see readme/interview-demo-guide.md)
 │   ├── smoke-test.sh           # End-to-end assertions across the whole stack
 │   ├── saga-resilience-test.sh # Concurrency, durability and lost-signal recovery
 │   └── init_bootstrap.sh       # Regenerates .env / db/*/init.sql / docker-compose.yml /

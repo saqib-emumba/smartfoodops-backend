@@ -195,6 +195,12 @@ SELECT_LATEST_FOR_CUSTOMER = """
     SELECT id FROM orders WHERE customer_id = %s ORDER BY created_at DESC LIMIT 1
 """
 
+# Same, narrowed to one status: "why was my order cancelled?" means the latest *cancelled* order, which
+# is not the latest order when a newer one is still in flight.
+SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS = """
+    SELECT id FROM orders WHERE customer_id = %s AND status = %s::order_status ORDER BY created_at DESC LIMIT 1
+"""
+
 SELECT_BY_STATUS = f"""
     SELECT {_COLUMNS} FROM orders WHERE status = %(status)s::order_status ORDER BY created_at
 """

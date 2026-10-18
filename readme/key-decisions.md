@@ -2495,6 +2495,14 @@ free-text `detail` or `raw_log`, which can carry technical error text. A refund 
 any amount, date or method for one. Ownership is checked in the AI Service (`require_self_or_admin` on the order's customer) before anything is
 generated.
 
+**Which order "my order" means.** With no id in the question, the latest order. A question about a cancellation or
+refund (`cancelled`, `cancellation`, `refund(ed)`, `rejected`, `money back`) means the latest *cancelled* order instead,
+through `GET /orders/internal/customers/{id}/latest-order?status=cancelled` (one status offered, validated). Found while
+preparing a demo: with a newer order in flight, "why was my order cancelled?" was answered about the in-flight order. If
+the customer has no cancelled order it falls back to the latest, so the answer honestly says that order was not cancelled.
+It is a keyword match on the question, not on the router's output, so a cancellation question phrased with none of those
+words still resolves to the latest order.
+
 **Reviews.** `order_reviews` (Order Service database): one rating (1–5) and an optional comment per
 *delivered* order, `UNIQUE (order_id)` so the engine rather than a check decides "once". Only the customer
 who placed the order may review it — not an admin on their behalf, because a review is the customer's

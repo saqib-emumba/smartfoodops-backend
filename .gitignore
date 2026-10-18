@@ -51,3 +51,6 @@ Thumbs.db
 
 # Claude Code personal overrides (not team-wide)
 .claude/settings.local.json
+
+# Local demo data ids written by scripts/seed-demo.sh
+.demo-state.json

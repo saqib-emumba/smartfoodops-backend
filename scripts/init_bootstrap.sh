@@ -1325,6 +1325,7 @@ services:
       - "80:80"
     volumes:
       - ./api-gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./chat-ui:/usr/share/nginx/chat:ro
     depends_on:
       - user-service
       - restaurant-service
@@ -2275,6 +2276,22 @@ http {
         # tool with no authentication of its own, so proxying it through the public gateway
         # would publish every workflow's history — including the arguments each was started
         # with. Reach it directly on the host instead.
+
+        # 💬 The chat client (chat-ui/index.html): a static page for signing in as a customer and talking to
+        # the assistant. Public, like the other static answers here, because it is only HTML; every API call
+        # it makes goes through the gated routes above with the user's own bearer token. Served from the
+        # gateway so the page and the API share an origin and no CORS is needed. `no-cache` so an edit shows
+        # on reload; the policy stops it being framed or loading anything from elsewhere.
+        location = /chat {
+            return 301 /chat/;
+        }
+        location /chat/ {
+            alias /usr/share/nginx/chat/;
+            index index.html;
+            add_header Cache-Control "no-cache";
+            add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'";
+            add_header X-Content-Type-Options nosniff;
+        }
 
         # Global health check endpoint. Enveloped the same as every service response
         # (D35), so a client does not need a special case for the one health probe that

@@ -99,8 +99,8 @@ class OrderExplainer:
         self._riders = riders
         self._logger = logger
 
-    async def latest_order_id(self, current_user: CurrentUser) -> str | None:
-        return await asyncio.to_thread(self._orders.latest_order_id, str(current_user.user_id))
+    async def latest_order_id(self, current_user: CurrentUser, status: str | None = None) -> str | None:
+        return await asyncio.to_thread(self._orders.latest_order_id, str(current_user.user_id), status)
 
     async def facts(self, order_id: str, current_user: CurrentUser) -> dict:
         """The grounded facts for one order. `403` unless it is the caller's own (or an admin's call)."""

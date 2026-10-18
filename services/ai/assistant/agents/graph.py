@@ -26,6 +26,7 @@ LangGraph's stream writer, which is how the endpoint sees tokens before the guar
 
 import asyncio
 import json
+import re
 from logging import Logger
 from typing import AsyncIterator, TypedDict
 from uuid import uuid4
@@ -64,6 +65,8 @@ _tracer = trace.get_tracer("ai.assistant")
 # to make sense, few enough that history never dominates the prompt.
 _HISTORY_FOR_ROUTER = 4
 _HISTORY_FOR_GENERATION = 6
+# A question about a cancellation or refund with no order id: the order meant is the latest *cancelled* one.
+_ABOUT_CANCELLATION = re.compile(r"\b(cancel+ed|cancel+ation|refund(?:ed)?|reject(?:ed)?|money back)\b", re.I)
 
 
 class AssistantState(TypedDict, total=False):
@@ -225,7 +228,13 @@ class Assistant:
 
     async def _retrieve_order(self, state: AssistantState):
         user = state["user"]
-        order_id = state.get("order_id") or await self._explainer.latest_order_id(user)
+        order_id = state.get("order_id")
+        if order_id is None and _ABOUT_CANCELLATION.search(state["question"]):
+            # "Why was my order cancelled?" with no id means the latest cancelled order, not the latest order
+            # (which may be one still in flight). None cancelled falls through to the latest, so the answer
+            # honestly says that order has not been cancelled rather than inventing a cancellation.
+            order_id = await self._explainer.latest_order_id(user, "cancelled")
+        order_id = order_id or await self._explainer.latest_order_id(user)
         if order_id is None:
             return {"answer": NO_ORDERS, "outcome": "no_results", "recommended_item_ids": [], "recommended_restaurant_ids": []}
         facts = await self._explainer.facts(order_id, user)

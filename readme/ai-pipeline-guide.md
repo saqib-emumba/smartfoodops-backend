@@ -304,7 +304,7 @@ Only the customer who placed the order (or an admin) may ask.
 | What the running saga is waiting on | Temporal **Queries** on the fulfilment and rider workflows, read-only and best-effort | [order/clients/orchestrator.py](../services/order/clients/orchestrator.py) (`progress`) |
 | Restaurant name and coordinates | Restaurant Service internal route | [ai/clients/restaurant.py](../services/ai/clients/restaurant.py) |
 | Courier distance to the restaurant | Rider Service `POST /riders/internal/order-courier`, a distance only, never an id | [rider/apis/dispatch.py](../services/rider/apis/dispatch.py), [ai/clients/rider.py](../services/ai/clients/rider.py) |
-| Customer's latest order (when none is named) | Order Service internal route | [order/apis/internal_explain.py](../services/order/apis/internal_explain.py) |
+| Customer's latest order, or latest *cancelled* order for a cancellation or refund question, when none is named | Order Service internal route | [order/apis/internal_explain.py](../services/order/apis/internal_explain.py) |
 
 **What is derived** (subtraction over timestamps the platform wrote itself):
 
@@ -421,6 +421,9 @@ Other constants (top-K, candidate count, time budgets, memory length) are in [ai
 ---
 
 ## 12. How to test the assistant
+
+**To try the assistant without curl**, open <http://localhost/chat/> ([chat-ui/index.html](../chat-ui/index.html)): register a customer, sign
+in and chat. The steps below are the scripted version, with the checks that tell you each part is working.
 
 Everything below goes through the gateway on `http://localhost`, exactly as a client would. Access tokens last **15 minutes**:
 if a call returns 401, log in again (step 2).

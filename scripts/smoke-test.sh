@@ -25,7 +25,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 442 of the 619
+# It is a real reduction in coverage, not just in runtime. --fast asserts 448 of the 628
 # checks (counts as of Week 5's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -210,9 +210,10 @@ riders_stuck_unavailable() {
   have_container sfo-rider-db || { echo "-"; return 0; }
   # `current_order_id IS NOT NULL` is the real signal: a rider still bound to an order whose
   # saga has finished. Availability alone is not, since a rider may legitimately be off
-  # shift, and the no-rider test grounds the fleet on purpose.
+  # shift, and the no-rider test grounds the fleet on purpose. The demo riders (scripts/seed-demo.sh) are
+  # excluded: an in-progress demo order legitimately keeps one bound for up to an hour.
   docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -tA -c \
-    "SELECT count(*) FROM riders WHERE current_order_id IS NOT NULL;" \
+    "SELECT count(*) FROM riders WHERE current_order_id IS NOT NULL AND vehicle_number NOT LIKE 'DEMO-%';" \
     2>/dev/null | tr -d '[:space:]'
 }
 
@@ -1651,6 +1652,13 @@ section "AI assistant and explanations (Week 5)"
 
 urlq() { python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
 
+# The chat client is a static page the gateway serves (chat-ui/index.html). Public, because it is only HTML;
+# every call it makes is gated like any other client's.
+CHAT_PAGE=$(curl -sS -m 10 -w $'\n%{http_code}' "$BASE_URL/chat/" 2>/dev/null)
+assert "the chat client is served at /chat/" "$(tail -n1 <<<"$CHAT_PAGE")" "200"
+assert "  and it is the assistant page" "$(grep -c 'SmartFoodOps Assistant' <<<"$CHAT_PAGE")" "1"
+assert "/chat redirects to /chat/" "$(curl -s -o /dev/null -w '%{http_code}' -m 10 "$BASE_URL/chat")" "301"
+
 # sse_ask <query-string> [curl args...] -> SSE_CODE, SSE_EVENTS (a JSON list of the `data:` events).
 # On a non-200 the body is the ordinary envelope, left in BODY for efield/jfield.
 sse_ask() {
@@ -1708,6 +1716,36 @@ expect "the restaurant reviews route is refused at the gateway -> 403" 403 GET \
 expect "the courier-distance route is refused at the gateway -> 403" 403 POST \
   /api/v1/riders/internal/order-courier \
   "{\"order_id\":\"$ORDER_ID\",\"latitude\":33.7,\"longitude\":73.0}" "${ADMIN_AUTH[@]}"
+
+# "Why was my order cancelled?" with no order id means the latest *cancelled* order, not the latest order (which
+# may still be in flight). The lookup is an internal-key route with an optional status, offered for one value. The
+# gateway refuses it (above), so it is called from inside the Order Service's container, where the key is in the
+# environment: `order_internal PATH` prints "<http code> <body>".
+order_internal() {
+  docker exec sfo-order-service python -c "
+import os,sys,urllib.request,urllib.error
+req=urllib.request.Request('http://localhost:8004'+sys.argv[1],headers={'X-Internal-Key':os.environ['INTERNAL_API_KEY']})
+try:
+    r=urllib.request.urlopen(req,timeout=10); print(r.status, r.read().decode())
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode())" "$1" 2>/dev/null
+}
+if have_container sfo-order-service; then
+  LATEST_URL="/api/v1/orders/internal/customers/$CUST_ID/latest-order"
+  assert "the latest-order lookup finds the customer's newest order" "$(order_internal "$LATEST_URL" | cut -d' ' -f1)" "200"
+  assert "an unsupported status filter -> 422" "$(order_internal "$LATEST_URL?status=delivered" | cut -d' ' -f1)" "422"
+  CANCELLED_REPLY=$(order_internal "$LATEST_URL?status=cancelled")
+  if (( FAST )); then
+    assert "no cancelled order yet -> 404" "$(cut -d' ' -f1 <<<"$CANCELLED_REPLY")" "404"
+  else
+    assert "the latest-cancelled lookup finds a cancelled order" "$(cut -d' ' -f1 <<<"$CANCELLED_REPLY")" "200"
+    LATEST_CANCELLED=$(python3 -c "import json,sys; print(json.loads(sys.argv[1].split(' ',1)[1])['body']['order_id'])" "$CANCELLED_REPLY" 2>/dev/null)
+    expect "  and that order really is cancelled" 200 GET "/api/v1/orders/$LATEST_CANCELLED" "" "${CUST_AUTH[@]}"
+    assert "  status" "$(jfield "['status']")" "cancelled"
+  fi
+else
+  printf '  %sSKIP%s  latest-order lookup (docker/sfo-order-service not reachable)\n' "$DIM" "$RESET"
+fi
 
 # --- reviews (D64) -----------------------------------------------------------------------------
 expect "review without a token -> 401" 401 POST "/api/v1/orders/$ORDER_ID/review" '{"rating":5}'
