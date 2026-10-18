@@ -13,9 +13,12 @@ from pgvector.psycopg2 import register_vector
 from common.bootstrap import bootstrap
 from ai import config
 from ai.clients.analytics import AnalyticsServiceClient
+from ai.clients.menu import MenuServiceClient
+from ai.clients.restaurant import RestaurantServiceClient
 from ai.clients.rider import RiderServiceClient
 from ai.retrieval.embeddings import build_embedder
 from ai.retrieval.rag_context import RagContextAssembler
+from ai.retrieval.retriever import Retriever
 from ai.repositories.vectors import VectorRepository
 
 runtime = bootstrap(
@@ -32,11 +35,16 @@ db = runtime.db
 embedder = build_embedder()
 
 vectors = VectorRepository(db, logger=logger)
+restaurants = RestaurantServiceClient(logger)
+# Search finds candidates by vector, then reads their facts live from the Menu and Restaurant
+# Services (D66); the vector tables hold none of them.
+retriever = Retriever(vectors, MenuServiceClient(logger), restaurants)
 rag = RagContextAssembler(
-    vectors,
+    retriever,
     embedder,
     AnalyticsServiceClient(logger),
     RiderServiceClient(logger),
+    restaurants,
     logger=logger,
 )
 

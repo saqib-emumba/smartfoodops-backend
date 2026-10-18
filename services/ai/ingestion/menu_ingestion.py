@@ -16,10 +16,9 @@ and exits; the long-running worker does the same at startup, which is what makes
 a menu published before this existed a delay rather than a hole.
 """
 
-import argparse
 import asyncio
+import hashlib
 import json
-from datetime import datetime
 from logging import Logger
 
 import fastjsonschema
@@ -37,6 +36,10 @@ from ai.clients.restaurant import RestaurantServiceClient
 from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import DOCUMENTS_INDEXED, INGESTION_EVENTS_TOTAL, INGESTION_LAST_EVENT_SECONDS
 from ai.repositories.documents import DocumentRepository
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 _DLQ_SUFFIX = ".dlq"
 _MAX_ATTEMPTS = 5
@@ -83,64 +86,69 @@ class IngestionService:
                 self._docs.mark_processed(*tagged)
             return "removed"
 
-        version = datetime.fromisoformat(menu["updated_at"])
-        current = self._docs.current_version(restaurant_id)
-        if (
-            current is not None
-            and current["source_version"] == version
-            and current["embedding_model"] == self._embedder.name
-        ):
+        restaurant = self._restaurants.get_restaurant(restaurant_id)
+        model = self._embedder.name
+
+        # What each document should say now, keyed by the menu's own item id.
+        wanted: dict[str, str] = {}
+        for category in menu["categories"]:
+            for item in category["items"]:
+                wanted[item["item_id"]] = item_chunk(restaurant["name"], category["category_name"], item)
+        restaurant_text = restaurant_chunk(restaurant, menu["categories"])
+
+        # Re-embed only what the text says has changed (D66). A hash of the chunk is the whole test:
+        # a price edit changes that dish's chunk, a rename changes every dish's (the restaurant's name
+        # is in each), and a republish with nothing different changes none. The model is compared too,
+        # so switching `EMBEDDING_PROVIDER` re-embeds everything on the next backfill.
+        stored_items, stored_restaurant = self._docs.stored_hashes(restaurant_id)
+        changed = {
+            key: text
+            for key, text in wanted.items()
+            if stored_items.get(key) != {"chunk_hash": _hash(text), "embedding_model": model}
+        }
+        removed = [key for key in stored_items if key not in wanted]
+        restaurant_changed = stored_restaurant != {"chunk_hash": _hash(restaurant_text), "embedding_model": model}
+
+        if not changed and not removed and not restaurant_changed:
             if tagged:
                 self._docs.mark_processed(*tagged)
             return "skipped"
 
-        restaurant = self._restaurants.get_restaurant(restaurant_id)
-        item_rows, texts = [], []
-        for category in menu["categories"]:
-            for item in category["items"]:
-                text = item_chunk(restaurant["name"], category["category_name"], item)
-                texts.append(text)
-                item_rows.append(
-                    {
-                        "item_key": item["item_id"],
-                        "category_key": category["category_id"],
-                        "category_name": category["category_name"],
-                        "item_name": item["name"],
-                        "restaurant_name": restaurant["name"],
-                        "base_price": item["base_price"],
-                        "is_available": item["is_available"],
-                        "dietary_tags": item.get("dietary_tags", []),
-                        "chunk_text": text,
-                        "embedding_model": self._embedder.name,
-                        "source_version": menu["updated_at"],
-                    }
-                )
-        restaurant_text = restaurant_chunk(restaurant, menu["categories"])
-
-        # One batch for the whole restaurant: the dishes and the restaurant document together.
-        vectors = embed_timed(self._embedder, texts + [restaurant_text])
-        for row, vector in zip(item_rows, vectors):
-            row["embedding"] = vector
-
-        self._docs.replace_restaurant(
+        # One batch for everything that changed: the dishes and, if needed, the restaurant document.
+        texts = list(changed.values()) + ([restaurant_text] if restaurant_changed else [])
+        vectors = embed_timed(self._embedder, texts) if texts else []
+        item_rows = [
             {
-                "restaurant_id": restaurant_id,
-                "name": restaurant["name"],
-                "address": restaurant.get("address"),
-                "latitude": restaurant.get("latitude"),
-                "longitude": restaurant.get("longitude"),
-                "is_active": restaurant.get("is_active", True),
+                "item_key": key,
+                "chunk_text": text,
+                "chunk_hash": _hash(text),
+                "embedding": vector,
+                "embedding_model": model,
+            }
+            for (key, text), vector in zip(changed.items(), vectors)
+        ]
+        restaurant_row = (
+            {
                 "chunk_text": restaurant_text,
+                "chunk_hash": _hash(restaurant_text),
                 "embedding": vectors[-1],
-                "embedding_model": self._embedder.name,
-                "source_version": menu["updated_at"],
-            },
-            item_rows,
+                "embedding_model": model,
+            }
+            if restaurant_changed
+            else None
+        )
+
+        self._docs.apply(
+            restaurant_id,
+            items=item_rows,
+            removed_keys=removed,
+            restaurant=restaurant_row,
             event=tagged,
         )
         self._logger.info(
-            "Indexed restaurant %s: %d dishes (menu version %s)",
-            restaurant_id, len(item_rows), menu["updated_at"],
+            "Indexed restaurant %s: %d dishes re-embedded, %d removed, %d unchanged%s",
+            restaurant_id, len(item_rows), len(removed), len(wanted) - len(item_rows),
+            ", restaurant document updated" if restaurant_changed else "",
         )
         return "ingested"
 

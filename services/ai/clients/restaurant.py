@@ -18,6 +18,31 @@ class RestaurantServiceClient(ServiceFacade):
             headers=internal_headers(),
         )
 
+    def names(self, restaurant_ids: list[str]) -> dict[str, dict]:
+        """`{restaurant_id: {name, is_active}}` for whichever of these still exist, read live.
+
+        Puts names on the analytics service's favourite-restaurant ids: its projection keeps only
+        ids, and the Restaurant Service is where a name lives. One lookup per id, in parallel; a
+        restaurant that is gone (a `404`) is simply absent from the result.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        from fastapi import HTTPException
+
+        def read(rid: str):
+            try:
+                row = self.get_restaurant(rid)
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    return rid, None
+                raise
+            return rid, {"name": row["name"], "is_active": row["is_active"]}
+
+        if not restaurant_ids:
+            return {}
+        with ThreadPoolExecutor(max_workers=min(8, len(restaurant_ids))) as pool:
+            return {rid: row for rid, row in pool.map(read, restaurant_ids) if row is not None}
+
     def verify_owner(self, restaurant_id: str, current_user: CurrentUser) -> dict:
         """Confirm the caller owns this restaurant (or is an admin), asserting their own identity.
 

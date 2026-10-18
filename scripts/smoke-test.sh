@@ -25,7 +25,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 424 of the 601
+# It is a real reduction in coverage, not just in runtime. --fast asserts 442 of the 619
 # checks (counts as of Week 5's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -1410,6 +1410,18 @@ jeval() { python3 -c "import json,sys; b=json.load(sys.stdin)['body']; print($1)
 # Poll /ai/search until a python predicate over `m` (the matches list) holds. Ingestion is
 # asynchronous (Kafka), so "the dish is searchable" is reached eventually, not by the time the
 # publish returns.
+# Search reads live facts (D66), so a search no longer tells you whether the *index* has caught up. To wait
+# for ingestion, poll the vector table itself: vec_wait <sql that selects 1 when ready> [seconds].
+vecsql() { docker exec sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core -tA -c "$1" 2>/dev/null | tr -d '[:space:]'; }
+vec_wait() {
+  local sql="$1" limit="${2:-30}" waited=0
+  while (( waited < limit )); do
+    [[ "$(vecsql "$sql")" == "1" ]] && return 0
+    sleep 1; waited=$((waited + 1))
+  done
+  return 1
+}
+
 ai_poll() {
   local body="$1" pred="$2" limit="${3:-20}" waited=0 got=""
   while (( waited < limit )); do
@@ -1506,17 +1518,67 @@ expect "a rider cannot ask for RAG context -> 403" 403 POST /api/v1/ai/rag-conte
 
 # --- ingestion follows the menu ---------------------------------------------------------------
 expect "republish the menu without the steak" 200 POST /api/v1/menus "$(ai_menu "$AI_ITEMS")" "${OWNER_AUTH[@]}"
-ai_poll "{\"query\":\"grilled wagyu beef steak\",\"restaurant_id\":\"$AI_REST\",\"top_k\":10}" \
-  "'Wagyu Steak' not in [x['item_name'] for x in m]" 30
+# Search is live, so the steak is already gone from results; wait until the *index* has dropped it too,
+# or the backfill check below could race the worker's own ingestion of this publish.
+if have_container sfo-vector-db; then
+  vec_wait "SELECT (count(*) = 0)::int FROM menu_item_documents WHERE restaurant_id='$AI_REST' AND item_key='wagyu';" 30 \
+    && ok "  the index dropped the steak" || bad "  the index dropped the steak" "still present after 30s"
+fi
 
 if have_container sfo-ai-ingestion-worker; then
   # Every menu is already current, so a full backfill has nothing to do: all skipped, none
-  # re-embedded. That is the idempotency the processed_events + source_version checks exist for.
+  # re-embedded. That is the idempotency the processed_events table and the chunk hashes exist for.
   BACKFILL=$(docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill 2>/dev/null | tail -1)
   assert "a backfill over current menus re-embeds nothing" \
     "$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); print(d.get('ingested',0)==0 and d.get('failed',0)==0)" "$BACKFILL" 2>/dev/null)" "True"
 else
   printf '  %sSKIP%s  ingestion backfill (docker/sfo-ai-ingestion-worker not reachable)\n' "$DIM" "$RESET"
+fi
+
+# --- the vector tables hold no copy of anyone's facts (D66) -----------------------------------
+if have_container sfo-vector-db; then
+  assert "menu_item_documents holds only the chunk, its hash and its embedding" \
+    "$(vecsql "SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns WHERE table_name='menu_item_documents';")" \
+    "chunk_hash,chunk_text,embedded_at,embedding,embedding_model,id,item_key,restaurant_id"
+  assert "restaurant_documents likewise: no name, address, location or active flag" \
+    "$(vecsql "SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns WHERE table_name='restaurant_documents';")" \
+    "chunk_hash,chunk_text,embedded_at,embedding,embedding_model,restaurant_id"
+
+  # Only the dish whose text changed is re-embedded: the hash of every other chunk is unchanged.
+  MARK=$(vecsql "SELECT clock_timestamp();" | sed 's/\(.\{10\}\)\(.*\)/\1 \2/')
+  expect "republish with one price changed" 200 POST /api/v1/menus \
+    "$(ai_menu "${AI_ITEMS//12.50/13.50}")" "${OWNER_AUTH[@]}"
+  vec_wait "SELECT count(*) FROM menu_item_documents WHERE restaurant_id='$AI_REST' AND item_key='karahi' AND chunk_text LIKE '%\$13.50%';" 30
+  assert "  the changed dish was re-embedded" \
+    "$(vecsql "SELECT count(*) FROM menu_item_documents WHERE restaurant_id='$AI_REST' AND item_key='karahi' AND chunk_text LIKE '%\$13.50%';")" "1"
+  assert "  and nothing else was" \
+    "$(vecsql "SELECT count(*) FROM menu_item_documents WHERE restaurant_id='$AI_REST' AND embedded_at > '$MARK'::timestamptz;")" "1"
+fi
+
+# Search reads price, availability and existence from the Menu Service, not from the index. With
+# the ingestion worker stopped the index is out of date on purpose, and search must still be right.
+if have_container sfo-ai-ingestion-worker; then
+  docker stop sfo-ai-ingestion-worker >/dev/null 2>&1
+  ok "stopped the ingestion worker, so the index cannot catch up"
+  expect "republish: the karahi costs 14.00 and the salad is gone" 200 POST /api/v1/menus \
+    "$(ai_menu "$(printf '%s' "${AI_ITEMS//12.50/14.00}" | python3 -c "
+import json,sys
+items=json.loads('['+sys.stdin.read()+']')
+print(json.dumps([i for i in items if i['item_id']!='salad'])[1:-1])")")" "${OWNER_AUTH[@]}"
+  expect "search right after, with the index stale" 200 POST /api/v1/ai/search \
+    "{\"query\":\"a spicy chicken dish\",\"restaurant_id\":\"$AI_REST\",\"top_k\":5}" "${CUST_AUTH[@]}"
+  assert "  quotes the live price, not the embedded one" \
+    "$(jeval "[m['price'] for m in b['matches'] if m['item_name']=='Zesty Chicken Karahi']")" "[14.0]"
+  expect "a dish removed from the menu is not returned, though its vector still exists" 200 POST /api/v1/ai/search \
+    "{\"query\":\"light crisp quinoa salad\",\"restaurant_id\":\"$AI_REST\",\"top_k\":10}" "${CUST_AUTH[@]}"
+  assert "  the salad is absent" "$(jeval "'Garden Quinoa Salad' not in [m['item_name'] for m in b['matches']]")" "True"
+  expect "put the menu back as it was" 200 POST /api/v1/menus "$(ai_menu "$AI_ITEMS")" "${OWNER_AUTH[@]}"
+  docker start sfo-ai-ingestion-worker >/dev/null 2>&1
+  # The restarted worker's startup backfill finds the karahi's text changed back and the salad missing.
+  vec_wait "SELECT (count(*) = 2)::int FROM menu_item_documents WHERE restaurant_id='$AI_REST' AND ((item_key='salad') OR (item_key='karahi' AND chunk_text LIKE '%\$12.50%'));" 90 \
+    && ok "restarted the ingestion worker; it caught up" || bad "restarted the ingestion worker; it caught up" "index still stale after 90s"
+else
+  printf '  %sSKIP%s  live-read check (docker/sfo-ai-ingestion-worker not reachable)\n' "$DIM" "$RESET"
 fi
 
 if have_container sfo-kafka; then

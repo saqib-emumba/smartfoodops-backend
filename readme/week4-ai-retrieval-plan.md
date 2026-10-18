@@ -6,6 +6,12 @@ store, an ingestion pipeline, hybrid semantic search, and a multi-source RAG con
 
 **Status:** All six phases are implemented and verified.
 
+> **Reshaped afterwards by [D66](key-decisions.md#d66--the-vector-tables-hold-only-the-chunk-and-its-embedding-facts-are-read-live).**
+> Phases 1, 3 and 4 below describe the tables, the ingestion and the search as first built. Since D66 the document tables hold
+> only ids, chunk text, a chunk hash and the embedding (no name, price, tag, availability or location); ingestion re-embeds
+> only dishes whose chunk hash changed; and search takes vector candidates and then reads the facts live from the Menu and
+> Restaurant Services instead of filtering in SQL. The notes marked *(D66)* below say what changed.
+
 Decision numbers D59 to D62 are cited in code comments already; the entries themselves are
 written in Phase 6 under a new `## Week 4 — semantic retrieval (AI layer)` section of
 [key-decisions.md](key-decisions.md).
@@ -68,7 +74,8 @@ An `ai-service` that is up, healthy, routed and scraped, with an empty, indexed 
   pgvector.)
 - [db/vector/init.sql](../db/vector/init.sql): `menu_item_documents` and `restaurant_documents`
   with `vector(384)` columns; HNSW `vector_cosine_ops` indexes; a GIN index on `dietary_tags`;
-  btree filter indexes; a `processed_events` dedup table.
+  btree filter indexes; a `processed_events` dedup table. *(D66: the metadata columns and the GIN and
+  filter indexes are gone; see `db/vector/slim_document_tables.sql`.)*
 - `services/ai/` (port 8009): `main.py`, `deps.py`, `config.py`, `embeddings.py`,
   `apis/health.py`, Dockerfile. The model is baked into the image at build time, so the
   container needs no network to start.
@@ -119,6 +126,8 @@ A menu publish becomes up-to-date vectors within seconds, idempotently.
   ([ai/retrieval/chunking.py](../services/ai/retrieval/chunking.py)); embed the dishes and the restaurant in one batch;
   replace the restaurant's documents and record the event as processed in one transaction.
   Re-ingesting is skipped when the stored `source_version` and embedding model both match.
+  *(D66: now a per-dish SHA-256 comparison; only changed dishes are embedded and written, removed dishes
+  are deleted, and there is no `source_version`.)*
 - **Chunk format:** `Dish: … at … ($…) | Category: … | Description: … | Options: … | Tags: … |
   Availability: In Stock`. Segments with nothing to say are omitted rather than filled with a
   placeholder, so nothing is asserted that the data does not hold. The label is `Tags:`, not the
@@ -154,6 +163,9 @@ Verified:
   `restaurant_id`. **Response:** `matches[]` (`item_id`, `item_name`, `restaurant_id`,
   `restaurant_name`, `category_name`, `price`, `dietary_tags`, `similarity_score`) and
   `restaurants[]`, in the D35 envelope with `Retrieved N matching item(s)`.
+- *(D66: superseded. [repositories/vectors.py](../services/ai/repositories/vectors.py) now returns nearest candidates
+  only, and [retrieval/retriever.py](../services/ai/retrieval/retriever.py) reads the facts live and applies the filters.
+  The next two bullets describe the original design.)*
 - **One statement per result kind** in [repositories/vectors.py](../services/ai/repositories/vectors.py):
   a cosine ordering (`<=>`, served by the HNSW index) beside ordinary WHERE clauses, so `top_k`
   applies to rows that already satisfy the filters. Items must be available, within `max_price`,

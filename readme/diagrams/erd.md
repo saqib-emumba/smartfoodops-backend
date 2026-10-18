@@ -23,7 +23,9 @@ Reflects the actual schema across all 8 physical databases (`db/*/init.sql`), in
 
 > **`sfo_vector_core` is the AI Service's own database (Week 4, D59).** It holds only *derived*
 > state — vector embeddings of the Menu and Restaurant Services' data — so it is rebuildable by
-> re-ingesting the menus and no other service reads it. Its `processed_events` table has the same
+> re-ingesting the menus and no other service reads it. Since D66 the two document tables hold **only**
+> the foreign ids, the embedded text, its hash and the vector: no name, price, tag, availability or
+> location is copied. Search reads those live from the Menu and Restaurant Services. Its `processed_events` table has the same
 > shape as the analytics one; it is drawn here as `AI_PROCESSED_EVENTS` because Mermaid entity names
 > are global. `MENU_ITEMS.dietary_tags` (D60) is the one source-side change.
 
@@ -286,36 +288,24 @@ erDiagram
         timestamptz updated_at
     }
 
-    %% ---- sfo_vector_core (Week 4, D59) ----
+    %% ---- sfo_vector_core (Week 4, D59; slimmed by D66) ----
     MENU_ITEM_DOCUMENTS {
         uuid id PK
         uuid restaurant_id "Unique with item_key -- References RESTAURANTS.id, cross-db, no engine FK"
         varchar item_key "Unique with restaurant_id -- the menu's own item_id, stable across publishes (the internal UUIDs are rewritten on every publish)"
-        varchar category_key
-        varchar category_name
-        varchar item_name
-        varchar restaurant_name "Denormalized so a match is self-describing"
-        numeric base_price
-        boolean is_available "Filtered on: only available dishes are ever returned"
-        text_array dietary_tags "GIN-indexed; filtered with array containment"
-        text chunk_text "The natural-language document that was embedded"
+        text chunk_text "The natural-language document that was embedded; quotes name, price and tags as of embedding time"
+        char chunk_hash "SHA-256 of chunk_text; unchanged hash means no re-embed (D66)"
         vector embedding "vector(384), HNSW vector_cosine_ops index"
         varchar embedding_model "Compared on ingest, so switching model re-embeds"
-        timestamptz source_version "menus.updated_at this row was built from"
         timestamptz embedded_at
     }
 
     RESTAURANT_DOCUMENTS {
         uuid restaurant_id PK "References RESTAURANTS.id, cross-db, no engine FK"
-        varchar name
-        text address "Nullable"
-        numeric latitude "Nullable -- feeds courier-availability lookups in RAG context"
-        numeric longitude "Nullable"
-        boolean is_active "A deactivated restaurant drops out of search"
         text chunk_text
+        char chunk_hash "SHA-256 of chunk_text"
         vector embedding "vector(384), HNSW vector_cosine_ops index"
         varchar embedding_model
-        timestamptz source_version
         timestamptz embedded_at
     }
 

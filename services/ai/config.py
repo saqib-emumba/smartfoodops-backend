@@ -24,10 +24,22 @@ EMBEDDING_DIMENSIONS = 384
 LOCAL_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
-# How many nearest-neighbour candidates an HNSW scan keeps while a WHERE clause filters
-# them. The default (40) can leave a filtered query short of `top_k` rows; see
-# repositories/vectors.py for why this is raised per query rather than globally.
+# How many nearest-neighbour candidates an HNSW scan keeps while a WHERE clause (a restaurant
+# scope or a similarity floor) filters them. The default (40) can leave a filtered query short of
+# its LIMIT; see repositories/vectors.py.
 HNSW_EF_SEARCH = 100
+
+# Search reads price, availability, tags and activity live from the Menu and Restaurant Services
+# (D66), so the vector store is asked for more candidates than `top_k` and the filters discard
+# some. Raising this makes a restrictive filter ("vegan under $5") more likely to still find
+# `top_k` results, at the price of reading more restaurants. The wave is how many restaurants are
+# read in parallel before checking whether enough results have been found; the workers bound the
+# fan-out of calls to the sibling services.
+SEARCH_CANDIDATES = int(os.getenv("SEARCH_CANDIDATES", "100"))
+# One wider second pass, made only when the first leaves a result short and its candidates were full.
+SEARCH_MAX_CANDIDATES = int(os.getenv("SEARCH_MAX_CANDIDATES", "500"))
+SEARCH_HYDRATE_WAVE = 8
+SEARCH_HYDRATE_WORKERS = 8
 
 # How long the RAG assembler waits on each source before giving up on it (D62). Tight on purpose:
 # the caller is a language model's prompt being built, and an answer that is one source short

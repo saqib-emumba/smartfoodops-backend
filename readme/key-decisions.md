@@ -2188,6 +2188,10 @@ the decisions behind it.
 
 ### D59 — The AI Service holds its own pgvector database and embeds locally
 
+> **Partly superseded by [D66](#d66--the-vector-tables-hold-only-the-chunk-and-its-embedding-facts-are-read-live).** The
+> document tables no longer copy any name, price, tag, availability or location, and search no longer filters in
+> SQL. The embedder, pgvector, HNSW and the two-container shape below are unchanged.
+
 **Decided:** a ninth service, `ai-service` (port 8009), owns `sfo_vector_core` — a PostgreSQL 15
 database running the **pgvector** extension (`pgvector/pgvector:pg15`; the plain `postgres:15-alpine`
 every other database uses has no pgvector). Two document tables, `menu_item_documents` and
@@ -2229,8 +2233,9 @@ connection, so the shared pool in `common` needed no change.
   matches (0.2–0.5 in testing). There is no minimum-similarity threshold; Week 5 will need one before
   an assistant can honestly say "nothing matches".
 - **The restaurant document is only as fresh as its last menu publish.** A rename or deactivation
-  reaches the index on the next publish or a backfill that finds a changed menu — there is no
-  restaurant change event.
+  reaches the *embedded text* on the next publish or a backfill that finds a changed menu — there is no
+  restaurant change event. (D66: the name, address and active flag *returned* by a search are read live, so
+  only what the vector means can lag.)
 - **A third deployable thing that must stay in step.** The ingestion worker is a second process to run,
   monitor and restart; `sfo_ai_ingestion_last_event_timestamp_seconds` exists for the day it wedges.
 - **Both processes must register the type.** The API and the worker each call
@@ -2546,6 +2551,58 @@ loses a data point and nothing else, and the attribution is idempotent so redeli
   deployment attributes from then on.
 - **`assistant_interactions` is the one non-derived table in the vector database.** Losing it loses
   telemetry, never an order or a menu; the database header says so.
+
+### D66 — The vector tables hold only the chunk and its embedding; facts are read live
+
+**Decided:** `menu_item_documents` and `restaurant_documents` keep only what this service produces: the
+Menu Service's own ids (`restaurant_id`, `item_key`), the embedded `chunk_text`, its SHA-256 `chunk_hash`,
+the `vector(384)` and the model name. The dish's name, category, price, availability and tags, and the
+restaurant's name, address, coordinates and active flag, are **not** stored. Search finds candidates by
+vector alone (`SEARCH_CANDIDATES`, default 100) and then reads the live menu and restaurant for those
+candidates' restaurants, in rank order, eight at a time and in parallel, over the existing internal-key
+routes. A candidate survives only if its dish still exists and is available, is within `max_price`,
+carries every requested tag, and its restaurant is active. If fewer than `top_k` survive and the candidate
+list was full, one wider pass (`SEARCH_MAX_CANDIDATES`, default 500) is made. Ingestion became incremental:
+each chunk's hash is compared with the stored one and only changed dishes are re-embedded; dishes that left
+the menu are deleted.
+
+Code: `retrieval/retriever.py` (the new step), `repositories/vectors.py` (candidates only),
+`repositories/documents.py` and `ingestion/menu_ingestion.py` (hash diff), `db/vector/init.sql` and the
+hand-run migration `db/vector/slim_document_tables.sql` (drop, recreate, `--backfill`).
+
+**Instead of:** the D59 design, where the index carried a filterable copy of the menu and one SQL
+statement did vector ordering and the filters together. That kept `top_k` exact and search one round trip,
+and it also meant two copies of every price and tag, with the index one publish behind the source whenever
+anything changed in between.
+
+**Why:** a copy of another service's data is a second thing to keep true, and the platform already has a
+rule about that (D01: one owner per fact). Reading the facts at answer time removes the whole class of
+"the assistant quoted a price that has changed" without any invalidation logic, and an assistant that
+recommends a sold-out dish is the failure the grounding rules (D63) exist to prevent. The vector store is
+left holding only what no other service can supply. The mentor review of this change put it the same way.
+
+**Costs, named so they are chosen rather than discovered:**
+
+- **`top_k` is no longer exact.** The database used to apply the filters before `LIMIT`; now they apply to
+  the candidates. A selective filter ("vegan under $5") can leave fewer than `top_k` results when most
+  candidates fail it; the wider second pass narrows this and does not remove it. Past `SEARCH_MAX_CANDIDATES`
+  the answer is "fewer than asked", not "none exist".
+- **Search depends on the Menu and Restaurant Services.** Before, search needed only its own database; now
+  a failure of either (other than `404`) fails the vector source, which RAG reports in `sources_failed`
+  (D62). A `404` drops that restaurant's candidates instead, since the vector is outliving its source.
+- **Latency.** Measured on the dev stack (178 restaurants, 414 dishes): typical searches 110–250 ms, a
+  restrictive tag filter 0.6–1.2 s, an impossible filter about 1.5 s because it reads every restaurant. The
+  Menu read is the internal route, straight from Postgres, not the cached public one (that route needs a
+  caller's identity). A batch read and a short-lived cache are the obvious next step and are not built.
+- **A still-stale embedding.** The text that was embedded (`chunk_text`) quotes a name, price and tags as of
+  ingestion; a menu publish re-embeds exactly the dishes whose text changed, so this lags by one
+  ingestion, not one publish. A restaurant rename has no event; it reaches the embeddings on the next
+  publish or backfill, while the name a search *returns* is live.
+- **Dishes removed from the index.** Still only by a `404` from the Menu Service (no route deletes a menu
+  today), so a deleted menu's vectors would remain until the route exists; they are never returned, because
+  nothing live backs them.
+- **A republish no longer re-embeds the menu.** Previously every publish replaced every row; now an
+  unchanged dish costs nothing. This also makes `--backfill` cheap to run often.
 
 ## Open questions
 

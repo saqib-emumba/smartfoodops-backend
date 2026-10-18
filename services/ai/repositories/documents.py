@@ -1,10 +1,10 @@
-"""PostgreSQL access for the vector store's document tables (Week 4, D59).
+"""PostgreSQL access for the vector store's document tables (Week 4, D59, reshaped by D66).
 
-Writes are a per-restaurant *replace*: delete the restaurant's item documents and insert the new
-set, in one transaction, matching the Menu Service's own publish semantics (a full replace, D50).
-A diff against the existing rows would have to reason about renamed, re-keyed and removed items;
-replacing sidesteps all three, and the cost — re-embedding every item of a restaurant — is small
-at a menu's size and only paid when its `source_version` actually changed.
+The tables hold a chunk, its hash and its embedding, keyed by the Menu Service's own ids — no copy
+of any name, price or tag. Ingestion therefore only has to decide one thing per document: has the
+*text* changed? `stored_hashes` returns what is there; the caller embeds only what differs and
+`apply` writes just that, plus the removal of dishes that left the menu, in one transaction. A
+restaurant whose menu was republished unchanged costs a read and nothing else.
 
 Embeddings go in as numpy arrays: `ai.deps.register_vector_types` registers pgvector's psycopg2
 adapter once at startup, after which an array is a valid `vector` parameter. The `::vector` casts
@@ -27,44 +27,46 @@ _MARK_PROCESSED = """
     ON CONFLICT (consumer_group, event_id) DO NOTHING
 """
 
-# The version a restaurant's documents were built from, and by which model. Comparing the model
-# too means switching `EMBEDDING_PROVIDER` re-embeds on the next backfill instead of leaving two
+# What is stored for a restaurant, to decide what needs re-embedding. Comparing the model as well as
+# the hash means switching `EMBEDDING_PROVIDER` re-embeds on the next backfill instead of leaving two
 # incompatible vector spaces side by side.
-_CURRENT_VERSION = """
-    SELECT source_version, embedding_model
+_STORED_ITEMS = """
+    SELECT item_key, chunk_hash, embedding_model
+      FROM menu_item_documents
+     WHERE restaurant_id = %s
+"""
+_STORED_RESTAURANT = """
+    SELECT chunk_hash, embedding_model
       FROM restaurant_documents
      WHERE restaurant_id = %s
 """
 
 _DELETE_ITEMS = "DELETE FROM menu_item_documents WHERE restaurant_id = %s"
+_DELETE_SOME_ITEMS = "DELETE FROM menu_item_documents WHERE restaurant_id = %s AND item_key = ANY(%s)"
 _DELETE_RESTAURANT = "DELETE FROM restaurant_documents WHERE restaurant_id = %s"
 
-_INSERT_ITEMS = """
+_UPSERT_ITEMS = """
     INSERT INTO menu_item_documents
-        (restaurant_id, item_key, category_key, category_name, item_name, restaurant_name,
-         base_price, is_available, dietary_tags, chunk_text, embedding, embedding_model,
-         source_version)
+        (restaurant_id, item_key, chunk_text, chunk_hash, embedding, embedding_model)
     VALUES %s
+    ON CONFLICT (restaurant_id, item_key) DO UPDATE SET
+        chunk_text = EXCLUDED.chunk_text,
+        chunk_hash = EXCLUDED.chunk_hash,
+        embedding = EXCLUDED.embedding,
+        embedding_model = EXCLUDED.embedding_model,
+        embedded_at = CURRENT_TIMESTAMP
 """
-_ITEM_TEMPLATE = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s::timestamptz)"
+_ITEM_TEMPLATE = "(%s, %s, %s, %s, %s::vector, %s)"
 
 _UPSERT_RESTAURANT = """
     INSERT INTO restaurant_documents
-        (restaurant_id, name, address, latitude, longitude, is_active, chunk_text, embedding,
-         embedding_model, source_version)
-    VALUES (%(restaurant_id)s, %(name)s, %(address)s, %(latitude)s, %(longitude)s,
-            %(is_active)s, %(chunk_text)s, %(embedding)s::vector, %(embedding_model)s,
-            %(source_version)s::timestamptz)
+        (restaurant_id, chunk_text, chunk_hash, embedding, embedding_model)
+    VALUES (%(restaurant_id)s, %(chunk_text)s, %(chunk_hash)s, %(embedding)s::vector, %(embedding_model)s)
     ON CONFLICT (restaurant_id) DO UPDATE SET
-        name = EXCLUDED.name,
-        address = EXCLUDED.address,
-        latitude = EXCLUDED.latitude,
-        longitude = EXCLUDED.longitude,
-        is_active = EXCLUDED.is_active,
         chunk_text = EXCLUDED.chunk_text,
+        chunk_hash = EXCLUDED.chunk_hash,
         embedding = EXCLUDED.embedding,
         embedding_model = EXCLUDED.embedding_model,
-        source_version = EXCLUDED.source_version,
         embedded_at = CURRENT_TIMESTAMP
 """
 
@@ -82,54 +84,60 @@ class DocumentRepository(Repository):
                 _MARK_PROCESSED, {"group": group, "event_id": event_id, "event_type": event_type}
             )
 
-    def current_version(self, restaurant_id: str) -> dict | None:
-        """`{source_version, embedding_model}` this restaurant was last indexed under, or None."""
-        return self.one(_CURRENT_VERSION, (restaurant_id,))
+    def stored_hashes(self, restaurant_id: str) -> tuple[dict[str, dict], dict | None]:
+        """`({item_key: {chunk_hash, embedding_model}}, restaurant {chunk_hash, embedding_model} | None)`."""
+        items = {
+            row["item_key"]: {"chunk_hash": row["chunk_hash"].strip(), "embedding_model": row["embedding_model"]}
+            for row in self.all(_STORED_ITEMS, (restaurant_id,))
+        }
+        stored = self.one(_STORED_RESTAURANT, (restaurant_id,))
+        if stored is not None:
+            stored = {"chunk_hash": stored["chunk_hash"].strip(), "embedding_model": stored["embedding_model"]}
+        return items, stored
 
-    def replace_restaurant(
+    def apply(
         self,
-        restaurant: dict,
-        items: list[dict],
+        restaurant_id: str,
         *,
+        items: list[dict],
+        removed_keys: list[str],
+        restaurant: dict | None,
         event: tuple[str, str, str] | None = None,
     ) -> None:
-        """Replace one restaurant's documents, and record `event` as processed, atomically.
+        """Write only what changed, and record `event` as processed, atomically.
 
-        `event` is `(group, event_id, event_type)`. Recording it in the same transaction as the
-        write is what makes a crash between the two harmless: either both land or neither does,
-        so a redelivered event can never be marked done without its effect, or applied twice.
+        `items` are new or changed dishes (`item_key`, `chunk_text`, `chunk_hash`, `embedding`,
+        `embedding_model`); `removed_keys` are dishes no longer on the menu; `restaurant` is the
+        restaurant document if it changed, else None. `event` is `(group, event_id, event_type)`.
+        Recording it in the same transaction as the write is what makes a crash between the two
+        harmless: either both land or neither does, so a redelivered event can never be marked
+        done without its effect, or applied twice.
         """
         with self._db.cursor(commit=True) as cur:
-            restaurant_id = restaurant["restaurant_id"]
-            cur.execute(_DELETE_ITEMS, (restaurant_id,))
+            if removed_keys:
+                cur.execute(_DELETE_SOME_ITEMS, (restaurant_id, removed_keys))
             if items:
                 execute_values(
                     cur,
-                    _INSERT_ITEMS,
+                    _UPSERT_ITEMS,
                     [
                         (
                             restaurant_id,
                             doc["item_key"],
-                            doc["category_key"],
-                            doc["category_name"],
-                            doc["item_name"],
-                            doc["restaurant_name"],
-                            doc["base_price"],
-                            doc["is_available"],
-                            doc["dietary_tags"],
                             doc["chunk_text"],
+                            doc["chunk_hash"],
                             as_vector(doc["embedding"]),
                             doc["embedding_model"],
-                            doc["source_version"],
                         )
                         for doc in items
                     ],
                     template=_ITEM_TEMPLATE,
                 )
-            cur.execute(
-                _UPSERT_RESTAURANT,
-                {**restaurant, "embedding": as_vector(restaurant["embedding"])},
-            )
+            if restaurant is not None:
+                cur.execute(
+                    _UPSERT_RESTAURANT,
+                    {**restaurant, "restaurant_id": restaurant_id, "embedding": as_vector(restaurant["embedding"])},
+                )
             if event is not None:
                 group, event_id, event_type = event
                 cur.execute(

@@ -15,7 +15,8 @@ starts `OrderWorkflow` and answers after payment, with the post-payment work in 
 owner-declared menu tags, D61 `menu.published` feeding an ingestion worker, D62 the RAG context
 assembler; and for Week 5 — D63 the streaming assistant as a LangGraph with a code-enforced grounding
 check, D64 order explanations, reviews and partner tools over internal routes, D65 conversion
-attributed from `order.created`).
+attributed from `order.created`, D66 the vector tables keep only the chunk and its embedding while search reads facts live from the
+Menu and Restaurant Services).
 
 The AI layer (pink) is two containers from one image: `ai-service` answers search and RAG-context
 requests (gated at the gateway like every other route, `ai:search` / `ai:rag_context`), and
@@ -139,7 +140,8 @@ flowchart TB
     AISvc -->|order history| AnalyticsSvc
     AISvc -->|couriers| RiderSvc
     AISvc -->|order facts, reviews| OrderSvc
-    AISvc -->|ownership| RestaurantSvc
+    AISvc -->|ownership, live facts| RestaurantSvc
+    AISvc -->|live menu facts| MenuSvc
     AISvc -.->|generate| LLM
     AIWorker -->|menu + restaurant| MenuSvc
     AIWorker -->|restaurant| RestaurantSvc
@@ -217,7 +219,8 @@ flowchart TB
   stage Queries for order explanations (D64), and the kitchen decision is an Update on `FulfillmentWorkflow`.
 - **Eventing (D38, D53, D61):** Kafka carries facts, Temporal owns decisions. Each service publishes through a
   `KafkaGateway` called from an internal endpoint a Temporal activity invokes. The Menu publish is best-effort.
-- **AI (D59-D65):** reads go over internal-key routes, never other services' databases. RAG context degrades, naming the
+- **AI (D59-D66):** the vector tables hold only ids, chunk text, hash and embedding (D66); search finds candidates by vector
+  and reads each dish's and restaurant's facts live from the Menu and Restaurant Services. Reads go over internal-key routes, never other services' databases. RAG context degrades, naming the
   failed source, if Analytics or Rider is down. The worker also consumes `order.created` to attribute orders to
   recommendations (D65). Conversation memory is Redis db 3 (D63). The chat model is the one dependency outside the stack.
 - **Data (D01, D49):** one database per service; the vectors are derived state in the AI Service's own database; rider

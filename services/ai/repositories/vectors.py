@@ -1,119 +1,75 @@
-"""Hybrid vector + SQL search over the document tables (Week 4, D59).
+"""Nearest-neighbour candidates from the document tables (Week 4, D59, reshaped by D66).
 
-One statement per result kind, each combining a cosine ordering (`<=>`, served by the HNSW index)
-with ordinary WHERE clauses on the structured metadata. Doing both in the database — rather than
-fetching nearest neighbours and filtering them in Python — is what keeps `top_k` honest: the
-limit applies to rows that already satisfy the constraints.
+The tables hold only ids, chunk text and embeddings, so this repository can answer one question —
+*which documents are closest in meaning to this vector?* — and nothing about price, availability,
+tags or whether a restaurant is open. Those are read live from the Menu and Restaurant Services by
+`ai.retrieval.retriever`, which asks this class for more candidates than it needs and filters them.
 
-**Filtered HNSW.** An HNSW scan visits a fixed number of candidates (`ef_search`) and *then*
-the WHERE clause removes some. With a selective filter that can leave fewer than `top_k` rows
-even though more matches exist. pgvector 0.8's iterative scan fixes this: with
-`hnsw.iterative_scan` on, the scan keeps walking the graph until the LIMIT is satisfied or
-`hnsw.max_scan_tuples` is reached. Both settings are `SET LOCAL`, so they apply to this
-transaction only and never leak into another request sharing the pooled connection.
+`min_score` bounds the cosine *distance*, the same expression the HNSW index orders by, so a
+similarity floor costs nothing extra. `restaurant_id` scopes a search to one restaurant; that is
+a filter, so the iterative scan (pgvector 0.8) is switched on to keep it from leaving the result
+short. Both settings are `SET LOCAL`: they apply to this transaction only and never leak into
+another request sharing the pooled connection.
 """
 
 from common.repository import Repository
 from ai import config
 from ai.retrieval.embeddings import as_vector
 
-_SETTINGS = (
-    "SET LOCAL hnsw.iterative_scan = relaxed_order",
-    # An int from our own config, never user input — safe to format into the statement.
-    f"SET LOCAL hnsw.ef_search = {int(config.HNSW_EF_SEARCH)}",
-)
 
-
-def _item_predicates(alias: str, *, max_price, tags) -> tuple[str, dict]:
-    """The structured constraints, as SQL against `alias` plus their parameters."""
-    clauses = [f"{alias}.is_available"]
-    params: dict = {}
-    if max_price is not None:
-        clauses.append(f"{alias}.base_price <= %(max_price)s")
-        params["max_price"] = max_price
-    if tags:
-        clauses.append(f"{alias}.dietary_tags @> %(tags)s::text[]")
-        params["tags"] = list(tags)
-    return " AND ".join(clauses), params
+def _settings(limit: int) -> tuple[str, ...]:
+    # Ints from our own config and arguments, never user input — safe to format into a statement.
+    # `ef_search` must be at least the LIMIT or the index cannot return that many rows.
+    return (
+        "SET LOCAL hnsw.iterative_scan = relaxed_order",
+        f"SET LOCAL hnsw.ef_search = {max(int(config.HNSW_EF_SEARCH), int(limit))}",
+    )
 
 
 class VectorRepository(Repository):
-    def search(
+    def nearest_items(
         self,
         vector: list[float],
         *,
-        top_k: int,
-        max_price: float | None = None,
-        tags: list[str] | None = None,
+        limit: int,
         restaurant_id: str | None = None,
         min_score: float | None = None,
-    ) -> tuple[list[dict], list[dict]]:
-        """`(item_matches, restaurant_matches)` nearest to `vector`, best first.
+    ) -> list[dict]:
+        """`[{item_key, restaurant_id, score}]` nearest to `vector`, best first. `score` is cosine similarity."""
+        return self._nearest(
+            "menu_item_documents", "item_key, restaurant_id", vector, limit, restaurant_id, min_score
+        )
 
-        Items must be available, within `max_price`, carry every tag in `tags`, and belong to an
-        active restaurant. Restaurants must be active and have at least one item that passes the
-        same constraints — a restaurant with nothing the customer could actually order under
-        their filters is not a useful result. `score` is cosine similarity (1 - distance); with
-        `min_score`, rows below it are dropped, so a weak match is absent rather than ranked last.
-        """
-        item_where, params = _item_predicates("d", max_price=max_price, tags=tags)
-        params.update({"vector": as_vector(vector), "top_k": top_k})
-        item_scope = ""
-        restaurant_scope = ""
+    def nearest_restaurants(
+        self,
+        vector: list[float],
+        *,
+        limit: int,
+        restaurant_id: str | None = None,
+        min_score: float | None = None,
+    ) -> list[dict]:
+        """`[{restaurant_id, score}]` nearest to `vector`, best first."""
+        return self._nearest("restaurant_documents", "restaurant_id", vector, limit, restaurant_id, min_score)
+
+    def _nearest(self, table, columns, vector, limit, restaurant_id, min_score) -> list[dict]:
+        clauses, params = [], {"vector": as_vector(vector), "limit": limit}
         if min_score is not None:
-            # Distance is the HNSW-ordered expression, so bounding it keeps the index scan usable.
             # `1 - score` because `<=>` is cosine *distance*.
-            item_scope += " AND d.embedding <=> %(vector)s::vector <= %(max_distance)s"
-            restaurant_scope += " AND r.embedding <=> %(vector)s::vector <= %(max_distance)s"
+            clauses.append("embedding <=> %(vector)s::vector <= %(max_distance)s")
             params["max_distance"] = 1.0 - min_score
         if restaurant_id is not None:
-            item_scope += " AND d.restaurant_id = %(restaurant_id)s"
-            restaurant_scope += " AND r.restaurant_id = %(restaurant_id)s"
+            clauses.append("restaurant_id = %(restaurant_id)s")
             params["restaurant_id"] = str(restaurant_id)
-
-        items_sql = f"""
-            SELECT d.item_key, d.item_name, d.restaurant_id, d.restaurant_name,
-                   d.category_name, d.base_price, d.dietary_tags,
-                   r.latitude, r.longitude,
-                   1 - (d.embedding <=> %(vector)s::vector) AS score
-              FROM menu_item_documents d
-              JOIN restaurant_documents r
-                ON r.restaurant_id = d.restaurant_id AND r.is_active
-             WHERE {item_where} {item_scope}
-             ORDER BY d.embedding <=> %(vector)s::vector
-             LIMIT %(top_k)s
-        """
-        match_where, _ = _item_predicates("m", max_price=max_price, tags=tags)
-        restaurants_sql = f"""
-            SELECT r.restaurant_id, r.name, r.address, r.latitude, r.longitude,
-                   1 - (r.embedding <=> %(vector)s::vector) AS score
-              FROM restaurant_documents r
-             WHERE r.is_active {restaurant_scope}
-               AND EXISTS (SELECT 1 FROM menu_item_documents m
-                            WHERE m.restaurant_id = r.restaurant_id AND {match_where})
-             ORDER BY r.embedding <=> %(vector)s::vector
-             LIMIT %(top_k)s
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"""
+            SELECT {columns}, 1 - (embedding <=> %(vector)s::vector) AS score
+              FROM {table}
+              {where}
+             ORDER BY embedding <=> %(vector)s::vector
+             LIMIT %(limit)s
         """
         with self._db.cursor() as cur:
-            for statement in _SETTINGS:
+            for statement in _settings(limit):
                 cur.execute(statement)
-            cur.execute(items_sql, params)
-            items = [dict(row) for row in cur.fetchall()]
-            cur.execute(restaurants_sql, params)
-            restaurants = [dict(row) for row in cur.fetchall()]
-        return items, restaurants
-
-    def restaurant_names(self, restaurant_ids: list[str]) -> dict[str, dict]:
-        """`{restaurant_id: {name, is_active}}` for whichever of these are indexed.
-
-        Used to put names on the analytics service's favourite-restaurant ids: the projection
-        keeps only ids, and the vector store is where this service already holds names.
-        """
-        if not restaurant_ids:
-            return {}
-        rows = self.all(
-            "SELECT restaurant_id, name, is_active FROM restaurant_documents"
-            " WHERE restaurant_id = ANY(%(ids)s::uuid[])",
-            {"ids": restaurant_ids},
-        )
-        return {str(row["restaurant_id"]): {"name": row["name"], "is_active": row["is_active"]} for row in rows}
+            cur.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]

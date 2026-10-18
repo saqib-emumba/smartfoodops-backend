@@ -1169,12 +1169,14 @@ docker stop sfo-rider-service
 docker start sfo-rider-service
 ```
 
-Re-index everything (safe to repeat; menus already current are skipped), and look at the store:
+Re-index everything (safe to repeat; dishes whose text is unchanged are skipped), and look at the store. The tables hold
+only ids, the embedded text, its hash and the vector — names, prices and tags are read live from the Menu and Restaurant
+Services at search time (D66):
 
 ```bash
 docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill     # prints outcome counts
 docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core \
-  -c "SELECT restaurant_name, item_name, base_price, dietary_tags FROM menu_item_documents LIMIT 5;"
+  -c "SELECT restaurant_id, item_key, left(chunk_text, 80) AS chunk FROM menu_item_documents LIMIT 5;"
 ```
 
 Metrics are on the *SmartFoodOps — AI Retrieval* Grafana dashboard (<http://localhost:3000>).

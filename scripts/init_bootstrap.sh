@@ -794,49 +794,44 @@ CREATE TABLE IF NOT EXISTS processed_events (
     PRIMARY KEY (consumer_group, event_id)
 );
 
--- One row per menu item: the natural-language chunk, its embedding, and the structured
--- metadata a search filters on. `vector(384)` is all-MiniLM-L6-v2's output width; switching
--- to a model of another width (OpenAI's text-embedding-3-small is 1536) means changing this
--- column and re-ingesting, which is deliberate rather than automatic.
+-- One row per menu item: the natural-language chunk and its embedding, and nothing else of the
+-- Menu Service's. A dish's name, price, availability, tags and category, and a restaurant's name,
+-- address, location and active flag, are NOT stored here: search finds candidates by vector, then
+-- reads those facts live from the Menu and Restaurant Services (D66), so there is no second copy
+-- to go stale. What *is* stored is what only this service produces: the text that was embedded
+-- (`chunk_text`, which does quote the name, price and tags as of embedding time — it is the thing
+-- the vector means, not a source of facts), its SHA-256 (`chunk_hash`, how ingestion knows a dish
+-- is unchanged and need not be re-embedded) and the model that made the vector.
 --
--- `item_key` / `category_key` are the client-supplied keys the Menu Service stores and the
--- order API accepts (`item_id` on the wire) — the internal UUIDs it generates are rewritten
--- on every menu publish (a publish is a full replace), so they are useless as a stable id.
--- `source_version` is `menus.updated_at` of the menu this row was built from, which is how
--- ingestion skips a menu it has already embedded.
+-- `vector(384)` is all-MiniLM-L6-v2's output width; switching to a model of another width
+-- (OpenAI's text-embedding-3-small is 1536) means changing this column and re-ingesting, which
+-- is deliberate rather than automatic.
+--
+-- `item_key` is the client-supplied key the Menu Service stores and the order API accepts
+-- (`item_id` on the wire) — the internal UUIDs it generates are rewritten on every menu publish
+-- (a publish is a full replace), so they are useless as a stable id.
 CREATE TABLE IF NOT EXISTS menu_item_documents (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     restaurant_id UUID NOT NULL,
     item_key VARCHAR(255) NOT NULL,
-    category_key VARCHAR(255) NOT NULL,
-    category_name VARCHAR(255) NOT NULL,
-    item_name VARCHAR(255) NOT NULL,
-    restaurant_name VARCHAR(255) NOT NULL,
-    base_price NUMERIC(10, 2) NOT NULL,
-    is_available BOOLEAN NOT NULL,
-    dietary_tags TEXT[] NOT NULL DEFAULT '{}',
     chunk_text TEXT NOT NULL,
+    chunk_hash CHAR(64) NOT NULL,
     embedding vector(384) NOT NULL,
     embedding_model VARCHAR(128) NOT NULL,
-    source_version TIMESTAMPTZ NOT NULL,
     embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (restaurant_id, item_key)
 );
 
 -- One row per restaurant, so a query like "a quiet Italian place" can match a restaurant
--- directly instead of only through its dishes. `is_active` rides along so a deactivated
--- restaurant stops appearing without waiting for its menu to be re-published.
+-- directly instead of only through its dishes. Same rule as above: the restaurant's own facts
+-- (name, address, location, whether it is active) are read from the Restaurant Service at
+-- search time.
 CREATE TABLE IF NOT EXISTS restaurant_documents (
     restaurant_id UUID PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    address TEXT,
-    latitude NUMERIC(9, 6),
-    longitude NUMERIC(9, 6),
-    is_active BOOLEAN NOT NULL,
     chunk_text TEXT NOT NULL,
+    chunk_hash CHAR(64) NOT NULL,
     embedding vector(384) NOT NULL,
     embedding_model VARCHAR(128) NOT NULL,
-    source_version TIMESTAMPTZ NOT NULL,
     embedded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -851,11 +846,8 @@ CREATE INDEX IF NOT EXISTS idx_restaurant_documents_embedding
     ON restaurant_documents USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
--- The structured half of a hybrid query: price and availability constraints, tag containment
--- (`dietary_tags @> ARRAY[...]`) and per-restaurant replacement during ingestion.
+-- Per-restaurant diffing during ingestion, and a search scoped to one restaurant.
 CREATE INDEX IF NOT EXISTS idx_menu_item_documents_restaurant ON menu_item_documents(restaurant_id);
-CREATE INDEX IF NOT EXISTS idx_menu_item_documents_filter ON menu_item_documents(is_available, base_price);
-CREATE INDEX IF NOT EXISTS idx_menu_item_documents_tags ON menu_item_documents USING gin (dietary_tags);
 
 -- Assistant usage log and conversion attribution (Week 5, D63) — the one table here that is not
 -- derived from a menu. One row per assistant answer: who asked (an id, never the question or the

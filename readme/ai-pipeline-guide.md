@@ -46,12 +46,12 @@ flowchart TB
     subgraph WRITE ["WRITE PATH - keeps the index fresh"]
         MenuSvc["Menu Service<br/>publishes menu"]
         KafkaMenu[("Kafka<br/>menu.published")]
-        Worker["ai-ingestion-worker<br/>ingestion.py"]
+        Worker["ai-ingestion-worker<br/>menu_ingestion.py"]
         Chunk["chunking.py<br/>dish to one sentence"]
         Embed["embeddings.py<br/>local MiniLM, 384 numbers"]
     end
 
-    VectorDB[("pgvector<br/>menu_item_documents<br/>restaurant_documents<br/>HNSW cosine index")]
+    VectorDB[("pgvector<br/>menu_item_documents<br/>restaurant_documents<br/>chunk, hash, embedding only")]
 
     subgraph READ ["READ PATH - ai-service"]
         Assistant["apis/assistant.py<br/>SSE stream"]
@@ -61,6 +61,7 @@ flowchart TB
         Guard["guardrails.py<br/>checks the answer"]
     end
 
+    RestSvc["Restaurant Service<br/>name, location, active"]
     Analytics["Analytics Service<br/>order history"]
     Rider["Rider Service<br/>courier counts and distance"]
     OrderSvc["Order Service<br/>trail, saga stage, reviews"]
@@ -77,7 +78,9 @@ flowchart TB
     Graph <-->|"history"| Redis
     Graph -->|"router prompt"| LLM
     Graph --> RAG
-    RAG -->|"nearest dishes plus SQL filters"| VectorDB
+    RAG -->|"nearest candidates by vector"| VectorDB
+    RAG -->|"live facts and filters<br/>internal routes"| MenuSvc
+    RAG -->|"live restaurant facts"| RestSvc
     RAG --> Analytics
     RAG --> Rider
     Graph -->|"order questions"| OrderSvc
@@ -150,11 +153,16 @@ Runs whenever a restaurant publishes a menu. Nothing here involves a language mo
 | 3 | The worker consumes the event (group `ai-ingestion`), validates it against the schema registry, and **re-reads** the menu and restaurant over internal-key routes. The event is a hint to re-read, not the data | [ai/ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) (`IngestionConsumer`), [ai/clients/menu.py](../services/ai/clients/menu.py), [ai/clients/restaurant.py](../services/ai/clients/restaurant.py) |
 | 4 | Each dish becomes one sentence: `Dish: Zesty Chicken Karahi at AI Test Kitchen ($12.50) \| Category: … \| Description: … \| Options: … \| Tags: halal, spicy \| Availability: In Stock`. A segment with nothing to say is omitted rather than filled with a placeholder. The restaurant also gets one document (name, address, sections, union of tags, open or closed) | [ai/retrieval/chunking.py](../services/ai/retrieval/chunking.py) (`item_chunk`, `restaurant_chunk`) |
 | 5 | All chunks for the restaurant are embedded in **one batch** into 384 numbers by a local model (all-MiniLM-L6-v2 on onnxruntime, baked into the image, no key, no network). The `Embedder` interface means a document and the query that should match it can never use different models | [ai/retrieval/embeddings.py](../services/ai/retrieval/embeddings.py) (`build_embedder`, `embed_timed`) |
-| 6 | In **one transaction** the restaurant's old documents are deleted, the new ones inserted and the event marked processed. If the stored `source_version` and embedding model both match, the menu is skipped, so re-ingesting is harmless | [ai/repositories/documents.py](../services/ai/repositories/documents.py) (`replace_restaurant`, `current_version`), [db/vector/init.sql](../db/vector/init.sql) |
+| 6 | The stored hashes are compared with the new chunks' SHA-256 (and the embedding model). Only dishes whose chunk changed are embedded and written; dishes that left the menu are deleted; the event is marked processed in the **same transaction**. If nothing changed, the menu is skipped, so re-ingesting is harmless and a one-price edit re-embeds one dish | [ai/repositories/documents.py](../services/ai/repositories/documents.py) (`stored_hashes`, `apply`), [ai/ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) (`ingest`), [db/vector/init.sql](../db/vector/init.sql) |
 | 7 | Failure handling: a transient failure retries with backoff (5 attempts) then dead-letters; a schema-invalid event goes straight to the DLQ `sfo.menu.events.v1.dlq`. At startup the worker also backfills every published menu, so a lost event is a delay, not a hole | [ai/ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) (`_ingest_with_retry`, `_to_dlq`, `_startup_backfill`) |
 
 The index is an **HNSW** index on cosine distance (`vector_cosine_ops`), which finds near neighbours without scanning
 every row. A published menu is searchable about a second later.
+
+**What is stored, and what is not (D66).** The two tables hold the Menu Service's ids, the embedded text, its hash and the
+vector, and nothing else of the menu's or restaurant's. A dish's price, availability, tags and category and a restaurant's
+name, address, location and active flag are read live at search time (section 4). The chunk text does quote the name, price
+and tags as they were when it was embedded, because that is what the vector means; it is never what a search returns.
 
 ---
 
@@ -162,16 +170,28 @@ every row. A published menu is searchable about a second later.
 
 Two endpoints, both customer-only, both in the standard response envelope (D35).
 
-### `POST /api/v1/ai/search` — hybrid search
+### `POST /api/v1/ai/search` — vector match, then live facts
 
-File: [ai/apis/search.py](../services/ai/apis/search.py) → [ai/repositories/vectors.py](../services/ai/repositories/vectors.py)
+File: [ai/apis/search.py](../services/ai/apis/search.py) → [ai/retrieval/retriever.py](../services/ai/retrieval/retriever.py) → [ai/repositories/vectors.py](../services/ai/repositories/vectors.py)
 
 1. The query is embedded with the same model as the documents.
-2. **One SQL statement** orders by cosine distance (`<=>`, served by the HNSW index) and applies ordinary WHERE clauses:
-   available items only, restaurant active, `base_price <= max_price`, every requested tag present (array containment), and an
-   optional minimum similarity (`min_score`).
-3. Filtering happens *inside* the query, so `top_k` applies to rows that already pass the rules, and a sold-out dish can
-   never be returned. `SET LOCAL hnsw.iterative_scan` makes a selective filter still fill `top_k`.
+2. **Candidates by vector alone**: `vectors.py` returns the 100 nearest dishes (and, separately, restaurants) by cosine distance
+   (`<=>`, served by the HNSW index), with an optional minimum similarity (`min_score`) and an optional restaurant scope.
+   It knows ids and scores, nothing about price or stock.
+3. **Live facts**: `retriever.py` reads the live menu and restaurant for those candidates' restaurants, in rank order, eight
+   at a time and in parallel, over the internal-key routes of the Menu and Restaurant Services
+   ([ai/clients/menu.py](../services/ai/clients/menu.py), [ai/clients/restaurant.py](../services/ai/clients/restaurant.py)).
+4. **Filters**: a dish is kept only if it still exists, is available, is within `max_price`, and carries every requested tag,
+   and its restaurant is active. The name, price, category, tags and coordinates in the response come from this live read.
+   A restaurant is returned only if at least one of its dishes passes the same filters.
+5. **Stopping**: as soon as `top_k` dishes survive and no restaurant not yet read could place one above the k-th, it stops.
+   If fewer than `top_k` survive and the candidate list was full, it makes one wider pass (500 candidates). A restaurant
+   whose menu or record is gone (`404`) drops its candidates; any other failure of a sibling service fails the search.
+
+The trade, compared with filtering inside one SQL statement: `top_k` is no longer exact when a selective filter discards most
+candidates, search now depends on two more services being up, and it costs more (about 110–250 ms typically, up to about
+1.5 s when a filter matches nothing, on the dev stack). In return a price or availability change is visible to search at
+once, with no copy to go stale (D66).
 
 ### `POST /api/v1/ai/rag-context` — three sources in one call
 
@@ -331,7 +351,7 @@ once only (`UNIQUE (order_id)`). The AI Service reads a restaurant's reviews ove
 
 | Store | What | Owner |
 |---|---|---|
-| `sfo_vector_core` (Postgres + pgvector, port 5439) | `menu_item_documents`, `restaurant_documents` (vectors, derived and rebuildable), `processed_events` (dedup), `assistant_interactions` (usage log) | AI Service |
+| `sfo_vector_core` (Postgres + pgvector, port 5439) | `menu_item_documents`, `restaurant_documents` (ids, chunk, hash and vector only; derived and rebuildable), `processed_events` (dedup), `assistant_interactions` (usage log) | AI Service |
 | Redis db 3 | `ai:conv:{user_id}:{conversation_id}`: a capped list, 12 messages, 1 hour TTL. A Redis outage means no history, never a failed answer | AI Service |
 | `sfo_order_core` | `order_reviews`; the existing `order_tracking_logs` and `orders.kitchen_decided_at` that explanations read | Order Service |
 | Kafka | `sfo.menu.events.v1` (+ DLQ), group `ai-ingestion`; `sfo.order.events.v1`, group `ai-attribution` | shared |
@@ -351,7 +371,7 @@ once only (`UNIQUE (order_id)`). The AI Service reads a restaurant's reviews ove
 | [router.py](../services/ai/assistant/agents/router.py) · [context.py](../services/ai/assistant/agents/context.py) · [prompts.py](../services/ai/assistant/agents/prompts.py) (all in `assistant/agents/`) | Router parsing · context builder and fallback · every prompt the model is sent |
 | [assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) · [assistant/partner.py](../services/ai/assistant/partner.py) · [assistant/memory.py](../services/ai/assistant/memory.py) | Order facts, derivations, rule-written summary, `check_explanation` · partner chains · Redis conversation memory |
 | [llm/provider.py](../services/ai/llm/provider.py) · [llm/guardrails.py](../services/ai/llm/guardrails.py) | Provider factory, metered calls, failure mapping · all answer checks |
-| [retrieval/rag_context.py](../services/ai/retrieval/rag_context.py) · [repositories/vectors.py](../services/ai/repositories/vectors.py) | Three-source assembler · hybrid SQL |
+| [retrieval/rag_context.py](../services/ai/retrieval/rag_context.py) · [retrieval/retriever.py](../services/ai/retrieval/retriever.py) · [repositories/vectors.py](../services/ai/repositories/vectors.py) | Three-source assembler · vector match then live filters · nearest-candidate SQL |
 | [ingestion/menu_ingestion.py](../services/ai/ingestion/menu_ingestion.py) · [retrieval/chunking.py](../services/ai/retrieval/chunking.py) · [retrieval/embeddings.py](../services/ai/retrieval/embeddings.py) · [repositories/documents.py](../services/ai/repositories/documents.py) | The write path (the worker runs as `python -m ai.ingestion`, via `ingestion/__main__.py`) |
 | [ingestion/attribution.py](../services/ai/ingestion/attribution.py) · [metrics.py](../services/ai/metrics.py) · [config.py](../services/ai/config.py) | Attribution consumer · Prometheus metrics · settings |
 | [clients/](../services/ai/clients/) · [schemas/](../services/ai/schemas/) | Sibling-service HTTP clients · request and response shapes |
@@ -390,6 +410,8 @@ flowchart LR
 | `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | |
 | `OLLAMA_BASE_URL` / `OLLAMA_MODEL` | `http://host.docker.internal:11434` / `llama3.1` | The model **must be one you have pulled**; the service warns at startup if not |
 | `ASSISTANT_MIN_SCORE` | `0.30` | Cosine floor below which retrieval counts as "nothing matches" |
+| `SEARCH_CANDIDATES` | `100` | Nearest vectors a search reads live before filtering (D66) |
+| `SEARCH_MAX_CANDIDATES` | `500` | The single wider retry when a selective filter leaves a search short |
 | `ATTRIBUTION_WINDOW_HOURS` | `24` | How long a recommendation can be credited with an order |
 | `AI_REDIS_URL` | `redis://cache-redis:6379/3` | Conversation memory |
 | `EMBEDDING_PROVIDER` | `local` | `openai` needs `OPENAI_API_KEY` and a re-ingest |
@@ -502,7 +524,7 @@ Then try these. **Read the last line of each output:** `grounded: true` means th
 
 | Ask | What it proves | Expect |
 |---|---|---|
-| `ask 'Recommend a spicy halal dish under $15'` | Router extracts budget and tags; hybrid retrieval; grounded generation | The karahi at `$12.00`, in bold, with a "confirm with the restaurant" note about the halal tag. `intent: food_discovery` |
+| `ask 'Recommend a spicy halal dish under $15'` | Router extracts budget and tags; vector retrieval with live filters; grounded generation | The karahi at `$12.00`, in bold, with a "confirm with the restaurant" note about the halal tag. `intent: food_discovery` |
 | `ask 'I want something vegan and light'` | A tag filter | The Garden Quinoa Salad |
 | `ask 'Do you have a margherita pizza at Pipeline Test Grill?'` | It will not invent a dish | An honest "can't confirm", or alternatives from *other* restaurants. Never a pizza at this grill |
 | `ask 'Recommend a dish under $0.50'` | The similarity floor, no model call | "I couldn't find anything on the current menus…" |

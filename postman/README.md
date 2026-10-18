@@ -67,7 +67,8 @@ resets collection variables, so start from folder 1 again after a restart.
 is best run after 6–8, because a *delivered* order is what gives the customer order history in the
 RAG context. Its first search waits ~2.5s in a pre-request script: the menu published just before
 is indexed asynchronously by the ingestion worker, via Kafka. The cases that need a container
-stopped (a degraded analytics or rider source) or Kafka inspected (the dead-letter queue) are in
+stopped (a degraded analytics or rider source, or the ingestion worker, to prove search reads price and availability live
+rather than from the index, D66), the vector tables' columns inspected, or Kafka inspected (the dead-letter queue) are in
 `scripts/smoke-test.sh` only — Postman cannot stop a container.
 
 **Folder 11 (AI Assistant) needs folders 2–4, 6–8 and 10 first** and a chat provider on the AI service. See

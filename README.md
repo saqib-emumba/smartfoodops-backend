@@ -103,7 +103,7 @@ Arrows between services are **HTTP calls, not shared tables**. Each service owns
 | `orchestrator-service` | 8007 | nothing — no database at all | — | Temporal only; health and `/metrics` alone since D47, and the gateway proxies just its `/health` |
 | `orchestrator-worker` | — | nothing — no database either | — | Payment, Rider **and Order** Services (D36) — the saga still does not call the Restaurant Service at all (D32) |
 | `analytics-service` | 8008 | `processed_events`, `order_projections` | `sfo_analytics_core` @ `sfo-analytics-db` (5438) | Kafka only — no sibling calls (D44); since D62 it also serves an internal-key customer-history read, so it now holds the internal key |
-| `ai-service` | 8009 | the vector documents (`menu_item_documents`, `restaurant_documents`) and the assistant usage log (`assistant_interactions`) | `sfo_vector_core` @ `sfo-vector-db` (5439, pgvector) | Analytics, Rider, Order and Restaurant Services (internal routes); Redis db 3 (conversation memory); a chat model (Claude by default, Ollama selectable); embeds queries with a local model (D59–D65) |
+| `ai-service` | 8009 | the vector documents (`menu_item_documents`, `restaurant_documents`: ids, chunk text, hash and embedding only, D66) and the assistant usage log (`assistant_interactions`) | `sfo_vector_core` @ `sfo-vector-db` (5439, pgvector) | Menu, Analytics, Rider, Order and Restaurant Services (internal routes); Redis db 3 (conversation memory); a chat model (Claude by default, Ollama selectable); embeds queries with a local model (D59–D65) |
 | `ai-ingestion-worker` | — | the same vector database | `sfo_vector_core` (5439) | Kafka (`menu.published`), Menu + Restaurant Services (internal routes) — keeps the vectors in step with the menus (D61); also consumes `order.created` to attribute orders to assistant recommendations (D65) |
 | `notification-consumer` | — | nothing — no database | — | Kafka (reads), User Service (resolves contact details, D45), RabbitMQ (enqueues) |
 | `notification-worker` | — | nothing — no database | — | RabbitMQ only — no sibling calls, no JWT keys |
@@ -290,7 +290,8 @@ owner publishes a menu ─▶ menu-service ─▶ menu.published (Kafka, best-ef
 ```
 
 ```bash
-# Hybrid search: meaning from the vector, hard constraints from SQL. Customers only (ai:search).
+# Semantic search: candidates by vector, then price, tags and availability checked against the live
+# Menu and Restaurant Services (D66). Customers only (ai:search).
 curl -s -X POST http://localhost/api/v1/ai/search -H "Authorization: Bearer $CUSTOMER" \
   -H 'Content-Type: application/json' \
   -d '{"query":"something spicy and light","max_price":15,"dietary_filters":["halal"],"top_k":5}'
@@ -307,15 +308,17 @@ curl -s -X POST http://localhost/api/v1/ai/rag-context -H "Authorization: Bearer
   [services/common/dietary.py](services/common/dietary.py)); nothing is inferred. An unknown tag is a
   `422` on publish and on search. A filter requires **every** tag asked for, so send one
   cuisine per search. Allergen tags are the restaurant's claim, not a guarantee.
-- **Grounded by construction.** Search only returns available dishes of active restaurants, and a
+- **Grounded by construction.** Search only returns dishes that are, *right now*, available on a live menu of an
+  active restaurant (the facts are read from the Menu and Restaurant Services after the vector match, D66), and a
   RAG context that could not read a source (analytics, courier, vector) names it in
   `sources_failed` and still returns the rest — silence would read to a model as "none".
 - **Embeddings.** The model is baked into the image, so the container needs no network and no key.
   `EMBEDDING_PROVIDER=openai` (with `OPENAI_API_KEY`) switches to OpenAI; the vector columns are
   `vector(384)`, so a different model means re-ingesting (`python -m ai.ingestion --backfill`
-  after truncating the document tables).
+  after truncating the document tables). Ingestion is incremental: a chunk whose SHA-256 is unchanged is not
+  re-embedded, so republishing a menu re-embeds only the dishes whose text changed.
 - **Re-index everything:** `docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill`
-  (all current menus are skipped, so it is safe to re-run). The worker also does this at startup.
+  (menus whose chunks are all unchanged are skipped, so it is safe to re-run). The worker also does this at startup.
 - **Observability.** `sfo_ai_*` metrics (search/RAG latency and outcomes, RAG source failures,
   documents indexed, ingestion events) are scraped from `ai-service:8009` and
   `ai-ingestion-worker:9111` and shown on the *SmartFoodOps — AI Retrieval* Grafana dashboard.
@@ -522,7 +525,7 @@ service talks to which database.
 | `GRAFANA_ADMIN_PASSWORD` | yes | Grafana's own admin login, not a database password |
 | `EMBEDDING_PROVIDER`, `OPENAI_API_KEY` | no | `local` (default) embeds in-container with no key; `openai` calls the API and needs the key. Compose passes both through (Week 4, D59) |
 | `LLM_PROVIDER`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL` | no — but the assistant endpoints answer `503` without a usable one | `anthropic` (default) calls Claude and needs the key; `ollama` uses a self-hosted server. Passed to `ai-service` only (Week 5, D63) |
-| `AI_REDIS_URL`, `ASSISTANT_MIN_SCORE`, `ATTRIBUTION_WINDOW_HOURS` | no | Conversation memory Redis (default db 3); the cosine floor below which retrieval counts as "nothing matches" (0.30); the window for attributing an order to a recommendation (24h)(Week 5, D63/D65) |
+| `AI_REDIS_URL`, `ASSISTANT_MIN_SCORE`, `ATTRIBUTION_WINDOW_HOURS`, `SEARCH_CANDIDATES`, `SEARCH_MAX_CANDIDATES` | no | Conversation memory Redis (default db 3); the cosine floor below which retrieval counts as "nothing matches" (0.30); the window for attributing an order to a recommendation (24h); how many nearest vectors a search reads live before filtering (100) and the single wider retry when a selective filter leaves it short (500) (Week 5, D63/D65; D66) |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | yes | Celery's broker credentials (Week 3, D45) — required even though Kafka, not RabbitMQ, is the durable ledger |
 | `*_SERVICE_URL` | no | Compose sets these explicitly per service; the copies here are for the host-run flow below |
 
@@ -639,9 +642,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 601 assertions against http://localhost
+./scripts/smoke-test.sh            # 619 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 424 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 442 assertions, skips the saga sections and the policy-TTL wait
 # What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -1050,7 +1053,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `PATCH` | `/api/v1/riders/me/availability` | `rider` | `409` while carrying an order |
 | `POST` | `/api/v1/riders/me/orders/{order_id}/picked-up` | the rider carrying it | `204`; signals the saga |
 | `POST` | `/api/v1/riders/me/orders/{order_id}/delivered` | the rider carrying it | `204`; signals the saga, which then releases the rider |
-| `POST` | `/api/v1/ai/search` | `customer` | Hybrid semantic search: nearest dishes and restaurants by meaning, with `max_price`, `dietary_filters` and availability as hard SQL constraints (D59). `200` with empty lists when nothing matches |
+| `POST` | `/api/v1/ai/search` | `customer` | Hybrid semantic search: nearest dishes and restaurants by meaning, with `max_price`, `dietary_filters` and availability as hard constraints, checked against the live Menu and Restaurant Services after the vector match (D59, D66). `200` with empty lists when nothing matches |
 | `POST` | `/api/v1/ai/rag-context` | `customer` for their own `customer_id` (or `system_admin`) | Dishes, restaurants, order history and courier availability in one call; a source that fails is named in `sources_failed`, never silently dropped (D62) |
 
 **Service-to-service only** (`X-Internal-Key`, never reachable with a user token — D26):
@@ -1286,7 +1289,7 @@ docker exec -it sfo-analytics-db psql -U sfo_analytics_admin -d sfo_analytics_co
 # state: dropping them loses nothing a menu publish or `--backfill` cannot rebuild. The one exception is
 # `assistant_interactions` (Week 5, D65), a usage log — losing it loses telemetry, never a menu or order.
 docker exec -it sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core
-#   SELECT restaurant_name, item_name, base_price, dietary_tags FROM menu_item_documents LIMIT 5;
+#   SELECT restaurant_id, item_key, chunk_text FROM menu_item_documents LIMIT 5;   -- no name/price/tags: read live (D66)
 #   SELECT vector_dims(embedding), embedding_model, count(*) FROM menu_item_documents GROUP BY 1, 2;
 #   \di *embedding*          -- the two HNSW indexes
 ```
@@ -1343,6 +1346,9 @@ docker exec -i sfo-order-db psql -U sfo_order_admin -d sfo_order_core < db/order
 docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_week5_permissions.sql
 # assistant_interactions (D65) — before the new ai-service build
 docker exec -i sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core < db/vector/add_assistant_interactions.sql
+# slim document tables (D66): drops and recreates them, so search is empty until the backfill has run
+docker exec -i sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core < db/vector/slim_document_tables.sql
+docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill
 ```
 
 The new `kafka/init-topics.sh` topics (`sfo.menu.events.v1` and its DLQ) are created by the
@@ -1388,9 +1394,10 @@ smartfoodops-backend/
 │   ├── payment/init.sql       # payment_status enum, payments, payment_outbox
 │   ├── rider/init.sql         # riders
 │   ├── analytics/init.sql     # processed_events (dedup), order_projections — Week 3, D44
-│   ├── vector/init.sql        # pgvector: menu_item_documents, restaurant_documents (HNSW) — Week 4;
+│   ├── vector/init.sql        # pgvector: menu_item_documents, restaurant_documents (chunk, hash, embedding; HNSW) — Week 4, D66;
 │   │                          #   assistant_interactions (usage log + attribution) — Week 5
-│   └── vector/add_assistant_interactions.sql  # hand-run (Week 5, D65)
+│   ├── vector/add_assistant_interactions.sql  # hand-run (Week 5, D65)
+│   └── vector/slim_document_tables.sql        # hand-run (D66): drop + recreate the document tables
 ├── services/                  # Shared Docker build context
 │   ├── common/                # Shared chassis — infrastructure only, no domain code
 │   │   ├── auth.py            # RS256 verify/issue, CurrentUser, require_permission, require_self_or_admin

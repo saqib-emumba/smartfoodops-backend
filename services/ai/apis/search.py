@@ -1,8 +1,8 @@
 """`POST /api/v1/ai/search` — hybrid semantic search over dishes and restaurants (Week 4, D59).
 
 Embeds the query with the same model the documents were embedded with (`deps.embedder` — one
-instance, so the two can never drift apart), then asks the database for the nearest documents
-that also satisfy the structured filters.
+instance, so the two can never drift apart), then finds the nearest documents by vector and keeps those that
+still satisfy the structured filters according to the Menu and Restaurant Services (D66).
 
 A plain `def`, not `async def`: embedding is CPU-bound and the database call blocks, so FastAPI's
 threadpool is where both belong — an `async def` doing either would stall the event loop for
@@ -32,8 +32,8 @@ def search(
 ) -> Envelope[SearchResponse]:
     """Find dishes by meaning, constrained by price, tags and availability.
 
-    Results are only ever rows the Menu Service published — available items of active
-    restaurants — so nothing here can suggest a dish that does not exist or is sold out. That
+    Results are read live from the Menu and Restaurant Services after the vector match — available
+    items of active restaurants — so nothing here can suggest a dish that does not exist or is sold out. That
     guarantee is what the Week 5 assistant's zero-hallucination rule builds on.
 
     An empty result is a `200` with empty lists, not a `404`: "nothing matches those filters" is
@@ -45,7 +45,7 @@ def search(
         with _tracer.start_as_current_span("ai.vector_search") as span:
             span.set_attribute("ai.search.top_k", payload.top_k)
             span.set_attribute("ai.search.tag_filters", len(payload.dietary_filters))
-            items, restaurants = deps.vectors.search(
+            items, restaurants = deps.retriever.search(
                 vector,
                 top_k=payload.top_k,
                 max_price=payload.max_price,

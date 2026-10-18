@@ -1,8 +1,9 @@
 """The RAG context assembler (Week 4, D62): one call that gathers what a language model needs to
 answer a customer's food question, grounded in three decoupled stores.
 
-  vector     the dishes and restaurants whose meaning best matches the prompt, constrained by
-             price and tags, from sfo_vector_core
+  vector     the dishes and restaurants whose meaning best matches the prompt, found in
+             sfo_vector_core and then read live from the Menu and Restaurant Services, where the
+             price and tag constraints are applied (D66)
   analytics  what this customer has ordered before, from the Analytics Service (D44)
   courier    how many riders could take an order from each candidate restaurant right now,
              from the Rider Service's Redis geo index (D49)
@@ -34,7 +35,8 @@ from ai.clients.rider import RiderServiceClient
 from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import RAG_LATENCY_SECONDS, RAG_REQUESTS_TOTAL, RAG_SOURCE_FAILURES_TOTAL
 from ai.retrieval.geo import haversine_km
-from ai.repositories.vectors import VectorRepository
+from ai.clients.restaurant import RestaurantServiceClient
+from ai.retrieval.retriever import Retriever
 from ai.schemas.rag import (
     CourierAvailability,
     CustomerProfile,
@@ -52,17 +54,19 @@ _tracer = trace.get_tracer("ai.rag")
 class RagContextAssembler:
     def __init__(
         self,
-        vectors: VectorRepository,
+        retriever: Retriever,
         embedder: Embedder,
         analytics: AnalyticsServiceClient,
         riders: RiderServiceClient,
+        restaurants: RestaurantServiceClient,
         *,
         logger: Logger,
     ):
-        self._vectors = vectors
+        self._retriever = retriever
         self._embedder = embedder
         self._analytics = analytics
         self._riders = riders
+        self._restaurant_names = restaurants
         self._logger = logger
 
     async def assemble(self, request: RagContextRequest) -> RagContextResponse:
@@ -139,7 +143,7 @@ class RagContextAssembler:
     def _search_sync(self, request: RagContextRequest):
         """Embed the prompt and run the hybrid search — CPU-bound and blocking, so off the loop."""
         vector = embed_timed(self._embedder, [request.prompt_query])[0]
-        return self._vectors.search(
+        return self._retriever.search(
             vector,
             top_k=request.top_k,
             max_price=request.max_price,
@@ -180,7 +184,7 @@ class RagContextAssembler:
         if favourites:
             try:
                 names = await asyncio.to_thread(
-                    self._vectors.restaurant_names, [str(f["restaurant_id"]) for f in favourites]
+                    self._restaurant_names.names, [str(f["restaurant_id"]) for f in favourites]
                 )
             except Exception as exc:  # noqa: BLE001 - names are decoration; the profile still stands
                 self._logger.warning("Could not resolve favourite restaurant names: %s", exc)
