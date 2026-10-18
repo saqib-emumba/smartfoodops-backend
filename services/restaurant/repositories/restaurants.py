@@ -13,15 +13,20 @@ from uuid import UUID
 from common.repository import Repository
 from restaurant.schemas.restaurants import RestaurantOnboardRequest
 
-_COLUMNS = "id, owner_id, name, address, latitude, longitude, is_active, capacity"
+_COLUMNS = "id, owner_id, name, address, latitude, longitude, is_active, capacity, prep_time_minutes"
 
 _INSERT_RESTAURANT = f"""
-    INSERT INTO restaurants (owner_id, name, address, latitude, longitude, capacity)
-    VALUES (%s, %s, %s, %s, %s, %s)
+    INSERT INTO restaurants (owner_id, name, address, latitude, longitude, capacity, prep_time_minutes)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     RETURNING {_COLUMNS}
 """
 
 _SELECT_RESTAURANT = f"SELECT {_COLUMNS} FROM restaurants WHERE id = %s"
+
+_UPDATE_PREP_TIME = f"""
+    UPDATE restaurants SET prep_time_minutes = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s
+    RETURNING {_COLUMNS}
+"""
 
 
 class RestaurantRepository(Repository):
@@ -37,8 +42,12 @@ class RestaurantRepository(Repository):
                 payload.latitude,
                 payload.longitude,
                 payload.capacity,
+                payload.prep_time_minutes,
             ),
         )
 
     def find(self, restaurant_id: UUID) -> dict | None:
         return self.one(_SELECT_RESTAURANT, (str(restaurant_id),))
+
+    def set_prep_time(self, restaurant_id: UUID, minutes: int) -> dict | None:
+        return self.write_one(_UPDATE_PREP_TIME, (minutes, str(restaurant_id)))

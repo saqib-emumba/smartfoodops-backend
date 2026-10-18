@@ -12,8 +12,9 @@ below are described by content, not quoted.
 | Any time before | `docker compose up -d`, and make sure the root `.env` has `LLM_PROVIDER=anthropic` and your `ANTHROPIC_API_KEY`. Check: `curl -s localhost/api/v1/ai/health` shows `"llm_provider":"anthropic"` | The assistant answers `503` without a usable model |
 | The day before | `./scripts/seed-demo.sh` (about 4 minutes) | Creates the demo customer, owner, two riders, the **Demo Kitchen** restaurant and menu, 3 delivered orders (2 reviewed), 1 cancelled and refunded order |
 | **Within 1 hour of starting** | `./scripts/seed-demo.sh --live` | Creates a fresh **in-progress** order. The saga cancels an accepted order that nobody picks up after 3600 s (`DELIVERY_TIMEOUT_SECONDS`), so an in-progress order made the night before will be gone. Delivered and cancelled orders last forever |
-| Five minutes before | Open <http://localhost/chat/> and sign in as `demo.customer@smartfoodops.demo` / `DemoPass123!` | |
+| Five minutes before | Open <http://localhost/chat/> and sign in as `demo.customer@smartfoodops.demo` / `DemoPass123!`. The browser asks for your location once: **allow it** to see real trip times, **or** open <http://localhost/chat/?lat=24.88&lon=67.03> to behave as a customer near the Karachi demo kitchen (your real location may be beyond its delivery range, which is itself a good thing to show) | The estimate uses the trip to you |
 | Optional | `./scripts/seed-demo.sh --status` | Shows the in-progress order's current status |
+| If the cancelled order is not the newest cancelled one | `./scripts/seed-demo.sh --cancelled`, **then** `--live` | "Why was my order cancelled?" explains the latest *cancelled* order, so a later cancellation of another kind (for example no courier free) would be quoted instead. Always run `--live` last so the in-progress order is the newest |
 
 To put the orders on an account you already use instead, give its credentials (it must be a customer):
 `CUSTOMER_EMAIL=you@example.com CUSTOMER_PASSWORD='...' ./scripts/seed-demo.sh`.
@@ -21,6 +22,10 @@ To put the orders on an account you already use instead, give its credentials (i
 The script goes through the public API, so every order is real: the saga ran, payments were authorised or refunded, the
 trail rows exist, and Kafka events fired. Re-running it is safe (accounts, restaurant and menu are reused) but adds more
 orders each time.
+
+Each `--live` first finishes any earlier in-progress demo order to free its rider (otherwise two runs would tie up both demo
+riders and the next order would be cancelled for want of a courier). So after several runs the totals grow and the numbers in
+answers differ from the table below; the answers should always match `./scripts/seed-demo.sh --status` and the database.
 
 **What the demo customer has**
 
@@ -42,6 +47,8 @@ Ask these in the chat page. Each says what it proves.
 |---|---|---|
 | `Recommend a spicy halal dish under $15` | **Chicken Karahi** at Demo Kitchen, $12.50, tagged halal and spicy; maybe the Spicy Chicken Burger too. The ✓ badge shows | Retrieval runs *before* generation. Names and prices are checked in code afterwards. The price comes from the live menu, not a stored copy (D66) |
 | `Do you have lamb chops?` | It says it couldn't find them (the dish exists but is **sold out**, so it is never returned) | An unavailable dish can't be recommended. Availability is read live |
+| `How quickly can you deliver a pizza to me?` | A window such as "about 25 to 35 minutes", called an estimate, per restaurant. With your location shared it uses the real trip; without it, it says it assumes a typical trip and that sharing your location gives a closer one. It can mention that preparation time is included (Demo Kitchen's is 20 minutes). A restaurant with no free rider has no estimate, and one too far away is "outside delivery range" (only before ordering: an order you already placed is never out of range, and a far-away location is ignored for it) | The estimate is preparation + courier to the restaurant + trip to you (`common/delivery.py`), with the preparation time stored per restaurant in the database and the trip from the location the chat page sends. A mock model, labelled as such; the guardrail rejects any "N minutes" not in the context |
+| `How long to deliver this order` | For the in-progress order: "about 20 to 30 more minutes", the estimate with the time already spent taken off | Same formula, with the courier's real distance from assignment. Never a verdict like "late" |
 | `Recommend a dish under $0.50` | "I couldn't find anything on the current menus that matches that." | A similarity floor and the budget filter give an honest "nothing", not a poor match |
 | `Something vegan please`, then `and under $9?` | Vegan options, then a narrowed list. The second answer uses the first as context | Conversation memory in Redis (12 messages, 1 hour). The router reads the follow-up in context |
 | `What desserts do you have?` | Chocolate Brownie from Demo Kitchen | Category names come from the live menu |
@@ -57,6 +64,10 @@ question may name them. Ask by Demo Kitchen's dish names when you want the answe
 | `Why was my order cancelled?` | The **cancelled** order: the restaurant was unable to accept it, and the payment was refunded | With no order id, a question about cancellation or refunds is answered for the latest *cancelled* order, not the latest order. The cause is the recorded `kitchen_rejected` reason |
 | `Did I get my money back?` | "Yes, your payment was refunded", about the cancelled order | The money outcome is read from the Payment database, never guessed by the model |
 | `Is my order late?` | A plain statement of the timings and "no promised delivery time is on record", never "late" or "on time". Often the ⚠ banner appears, because the guardrail replaced a draft that tried to give a verdict; it is a good moment to show that | The assistant never says "late" or "on time": the platform stores no promised time to compare against |
+| `How many pending orders do I have?` | A count of orders in progress out of the total (for example "2 orders in progress out of 7"), nothing invented | A separate `order_history` route reads counts over *every* order from the Order service. The guardrail rejects any count that is not one of those |
+| `How many orders have I placed in total?` | The total, split into in progress, delivered and cancelled, with the same numbers as above | The counts are the database's, never the model's arithmetic |
+| `What did I order last time?` | Your newest order: restaurant, items, total, state and how long ago | The history facts carry the newest five orders with their items and totals |
+| `Show me my recent orders` | The five newest, newest first, then the totals | At most five are itemised; older ones can still be asked about by id |
 | `Can you cancel my order for me?` | It can only explain the status | There is no write path in the assistant |
 
 ### C. Restaurants and reviews
@@ -96,6 +107,16 @@ curl -s -X POST localhost/api/v1/ai/partner/promo -H "Authorization: Bearer $OWN
 curl -s -X POST localhost/api/v1/ai/partner/describe-dish -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
   -d "{\"restaurant_id\":\"$REST\",\"dish_name\":\"Chicken Karahi\",\"ingredients\":[\"chicken\",\"tomato\",\"green chilli\"],\"tone\":\"upscale\"}"
 ```
+
+To show the preparation time driving the estimate, change it and ask again (Demo Kitchen starts at 20 minutes):
+
+```bash
+curl -s -X PATCH localhost/api/v1/restaurants/$REST -H "Authorization: Bearer $OWNER" -H 'Content-Type: application/json' \
+  -d '{"prep_time_minutes":35}'
+```
+
+Then ask `how quickly can you deliver a pizza to me?` in the chat page: Demo Kitchen's window moves out by fifteen minutes.
+Put it back with `20` afterwards (re-running `./scripts/seed-demo.sh` also does). Another owner's token gets `403`.
 
 The review summary reports the 2 reviews, average 4.0, praise for the food and one delivery complaint, and says two reviews is
 not a firm pattern. Copy may not contain a number the owner did not supply; the rating figures come from the database. An
@@ -145,13 +166,15 @@ not causation, and it is restaurant-level.
   can order?" can miss a cheaper dish. Ask with a budget instead (`something under $5`).
 - **Review text is not shown to customers.** They see the average and the count. Owners get the written summary through the
   partner tool.
-- **One order at a time.** The assistant explains one order (the one named, the latest, or the latest cancelled). "What did I
-  order last time?" is not answered from a history.
+- **Five orders at most are listed.** History answers cover your newest five orders and the totals over all of them; an older
+  order can still be asked about by its id. Counts are checked against the database, but which state belongs to which order
+  is only the prompt's job (the guardrail's stated ceiling).
 - **The first draft streams before it is checked.** If the guardrail rejects it, the page shows the replacement afterwards
   (the ⚠ banner). Tokens already sent can't be recalled.
 - **No rate limit** on the assistant yet; provider limits are the only ceiling.
-- **Estimates are mock.** The courier estimate is distance at a fixed speed plus padding (`rider/eta.py`), labelled as an
-  estimate; there is no delivery-time promise.
+- **The delivery estimate is a model, not a measurement.** One preparation time per restaurant (not per dish, not load-aware), a
+  straight-line trip at 30 km/h, a typical 3 km trip if no location is shared. It is a ten-minute window, always called an estimate.
+  Nothing compares it with how long orders actually took (the order trail could, and would be how to tune it).
 - **Tags are what owners declared**, so the assistant tells strict-diet users to confirm with the restaurant.
 
 ## 5. If something goes wrong

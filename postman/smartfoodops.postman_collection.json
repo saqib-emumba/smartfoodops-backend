@@ -1682,6 +1682,155 @@
           ]
         },
         {
+          "id": "2e9698af-b4c1-42d0-b7b5-781074c57bd3",
+          "name": "Owner sets the kitchen's preparation time",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/{{rest_id}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"prep_time_minutes\": 25}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": "One figure per restaurant, set by its owner. The assistant's delivery-time estimate is this plus the courier's trip (D68)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });",
+                  "pm.test(\"it is stored\", () => pm.expect(pm.response.json().body.prep_time_minutes).to.eql(25));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "d54a555b-433e-4fd3-bfd1-1333d5ed01f5",
+          "name": "Another restaurant's owner cannot change the preparation time -> 403",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner2_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/{{rest_id}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"prep_time_minutes\": 5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "b31cd7ab-6302-4f13-a316-b43bd295eca4",
+          "name": "A customer cannot change the preparation time -> 403",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/{{rest_id}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"prep_time_minutes\": 5}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "3e550ec8-0909-4181-84be-92961cbfc7f0",
+          "name": "A preparation time of 0 -> 422",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{owner_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/restaurants/{{rest_id}}",
+            "body": {
+              "mode": "raw",
+              "raw": "{\"prep_time_minutes\": 0}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "description": ""
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 422\", () => pm.response.to.have.status(422));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "id": "a00e3361-1180-4ce8-ad01-25033915a950",
           "name": "Customer cannot onboard a restaurant -> 403",
           "request": {
@@ -7062,6 +7211,150 @@
           ]
         },
         {
+          "id": "de72f092-e22f-4ae9-bb74-357151ee1a59",
+          "name": "Assistant stream: how many orders do I have? (order history)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=How%20many%20orders%20do%20I%20have%2C%20and%20how%20many%20are%20pending%3F",
+            "description": "The customer's orders taken together, not one order. The router sends it to order_history, whose facts are the Order Service's counts and the newest five orders. The answer may state only those counts (the guardrail rejects any other number). Wording varies; these tests check the route and the contract."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"routed as order history\", () => pm.expect(f.intent).to.eql(\"order_history\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"the answer states a count (or is the rule-written fallback)\", () => pm.expect(text).to.match(/\\d/)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"a replaced answer carries its replacement\", () => { if (f.grounded === false) pm.expect(f.replacement).to.be.a(\"string\"); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "97a4979a-f1f7-4fc6-a8a1-2db195f6fe15",
+          "name": "Assistant stream: what did I order last time? (order history)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=What%20did%20I%20order%20last%20time%3F",
+            "description": "Answered from the newest order in the customer's history. Before the history path existed the assistant could only see one order and said so."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"routed as order history\", () => pm.expect(f.intent).to.eql(\"order_history\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it names a restaurant or says it cannot see orders, and never invents a verdict\", () => pm.expect(text).to.not.match(/\\b(late|on time|slow)\\b/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "4dfeee48-8e01-4257-a7bf-2b6ad0b226c7",
+          "name": "Assistant stream: why was my order cancelled? (no order id)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Why%20was%20my%20order%20cancelled%3F",
+            "description": "With no id, a question about a cancellation means the latest CANCELLED order, not the latest order. The earlier folders cancelled one (the rejected order), so this must explain a cancellation rather than say the latest order was not cancelled."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"routed as order tracking\", () => pm.expect(f.intent).to.eql(\"order_tracking\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it explains a cancellation\", () => pm.expect(text).to.match(/cancel/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it does not say the order was not cancelled\", () => pm.expect(text).to.not.match(/(hasn.t|has not|wasn.t|was not) been cancelled/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "9dccbfad-cfc3-45b5-be5e-423729cc5fe6",
+          "name": "Assistant stream: how quickly can you deliver? (a delivery-time window, called an estimate)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=how%20quickly%20can%20you%20deliver%20a%20pizza%3F",
+            "description": "The answer is a food-app-style window such as 'about 25 to 35 minutes': the restaurant's preparation time plus the courier's trip to the restaurant plus the trip to the customer (to the shared location when the page sends one, otherwise a typical trip, which the answer says). Always called an estimate, never a promise. A 'N minutes' figure that is not in the context makes the guardrail replace the answer (D68)."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); pm.test(\"tokens stream, then exactly one final chunk\", () => { pm.expect(events.length).to.be.above(1); pm.expect(events.filter(e => e.done).length).to.eql(1); pm.expect(events[events.length - 1].done).to.eql(true); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"routed as food discovery\", () => pm.expect(f.intent).to.eql(\"food_discovery\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"a minutes figure is always called an estimate\", () => { if (/\\d+\\s*(minutes?|mins?)/i.test(text)) pm.expect(text).to.match(/estimate/i); }); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"a time is given as a window, or there is no courier or the address is out of range\", () => pm.expect(text).to.match(/\\d+\\s*(to|-|–)\\s*\\d+\\s*(more\\s+)?minutes|no (courier|rider)|outside|could(n't| not) find|couldn.t find/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it never promises an arrival time\", () => pm.expect(text).to.not.match(/\\b(guarantee|guaranteed|promise[sd]? (to )?(arrive|deliver))/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "id": "070c2c02-60c9-4ebd-a88e-83c282510cd1",
           "name": "Explain a rejected order: cause and refund",
           "request": {
@@ -7257,6 +7550,34 @@
                 }
               }
             }
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 403\", () => pm.response.to.have.status(403));",
+                  "pm.test(\"envelope status matches HTTP status\", () => { const j = pm.response.json(); if (j && typeof j.status !== \"undefined\") pm.expect(String(j.status)).to.eql(String(pm.response.code)); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "cd5ec5ff-dbda-4f36-b58b-17c07fb05c75",
+          "name": "Internal: customer order summary is refused at the gateway -> 403",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{admin_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/orders/internal/customers/{{cust_id}}/summary",
+            "description": ""
           },
           "response": [],
           "event": [

@@ -4,6 +4,9 @@
 #   ./scripts/seed-demo.sh              full seed: accounts, restaurant, menu, rider, 3 delivered orders
 #                                       (2 reviewed), 1 rejected-and-refunded order, 1 order in progress
 #   ./scripts/seed-demo.sh --live       only a FRESH in-progress order (rider assigned, not yet picked up)
+#   ./scripts/seed-demo.sh --cancelled  add one more order the kitchen rejects (cancelled and refunded). Run it BEFORE
+#                                       --live: "why was my order cancelled?" explains the latest cancelled order, and
+#                                       "where is my order?" the latest order, so the in-progress one must be newest
 #   ./scripts/seed-demo.sh --advance    move the in-progress order one step: picked up, then delivered
 #   ./scripts/seed-demo.sh --status     show what the demo customer's orders look like right now
 #
@@ -105,6 +108,22 @@ rider_free() {   # rider_free TOKEN: wait until that rider is available again (t
   done
   die "the demo rider did not become available again"
 }
+# Each in-progress demo order keeps a rider busy until it is advanced or the saga times it out (an hour). Run
+# `--live` a few times and both demo riders would be tied up, so the next order would find nobody and be cancelled.
+# Before making a fresh one, finish whatever an earlier run left a rider holding.
+release_rider() {   # release_rider TOKEN
+  local token="$1" oid
+  call GET /riders/me "" "$token"; oid=$(jget "$BODY" "['body']['current_order_id']")
+  [[ -z "$oid" || "$oid" == "None" ]] && return 0
+  say "  finishing an earlier in-progress order ($oid) to free its rider"
+  call POST "/riders/me/orders/$oid/picked-up" "" "$token"     # may already be picked up; the answer is ignored
+  sleep 4
+  call POST "/riders/me/orders/$oid/delivered" "" "$token"
+  [[ "$CODE" == "200" ]] || die "could not finish the earlier order $oid ($CODE): $BODY"
+  rider_free "$token"
+}
+release_busy_riders() { release_rider "$RIDER_TOKEN"; release_rider "$RIDER2_TOKEN"; }
+
 place() {   # place ITEMS-JSON LABEL -> prints the order id
   call POST /orders "{\"restaurant_id\":\"$REST_ID\",\"items\":$1}" "$CUSTOMER_TOKEN" "demo-$(date +%s)-$RANDOM"
   [[ "$CODE" == "201" ]] || die "could not place the $2 order ($CODE): $BODY"
@@ -139,11 +158,14 @@ setup() {
     call GET "/restaurants/$REST_ID" "" "$CUSTOMER_TOKEN"; [[ "$CODE" == "200" ]] || REST_ID=""
   fi
   if [[ -z "$REST_ID" ]]; then
-    call POST /restaurants/onboard "{\"name\":\"Demo Kitchen\",\"address\":\"1 Demo Street, Karachi\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":50}" "$OWNER_TOKEN"
+    call POST /restaurants/onboard "{\"name\":\"Demo Kitchen\",\"address\":\"1 Demo Street, Karachi\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":50,\"prep_time_minutes\":20}" "$OWNER_TOKEN"
     [[ "$CODE" == "201" ]] || die "could not onboard the restaurant ($CODE): $BODY"
     REST_ID=$(jget "$BODY" "['body']['id']"); state_set restaurant_id "$REST_ID"
   fi
-  ok "Demo Kitchen  $REST_ID"
+  # A restaurant onboarded before the preparation time existed has the default; set the demo kitchen's own.
+  call PATCH "/restaurants/$REST_ID" '{"prep_time_minutes":20}' "$OWNER_TOKEN"
+  [[ "$CODE" == "200" ]] || die "could not set the preparation time ($CODE): $BODY"
+  ok "Demo Kitchen  $REST_ID  (preparation time 20 minutes)"
   MENU=$(cat <<JSON
 {"restaurant_id":"$REST_ID","categories":[
  {"category_id":"mains","category_name":"Mains","display_order":1,"items":[
@@ -174,6 +196,13 @@ JSON
   call PATCH /riders/me/availability '{"is_available":true}' "$RIDER2_TOKEN"
   call GET /riders/me "" "$RIDER2_TOKEN"; RIDER2_ID=$(jget "$BODY" "['body']['id']")
   ok "two riders on shift near the restaurant"
+}
+
+cancelled_order() {   # an order the kitchen rejects: cancelled, and the payment refunded
+  local id; id=$(place '[{"item_id":"biryani","quantity":1}]' "to be rejected") || exit 1
+  call POST "/orders/$id/reject" "" "$OWNER_TOKEN"; [[ "$CODE" == "200" ]] || die "kitchen could not reject $id ($CODE): $BODY"
+  poll_status "$id" cancelled 90 "$CUSTOMER_TOKEN"
+  state_set rejected_order "$id"; ok "cancelled and refunded  ($id)"
 }
 
 in_progress_order() {   # creates the fresh in-progress order and records it
@@ -213,13 +242,16 @@ case "$MODE" in
       *)         die "the order is '$status' (the saga cancelled it, most likely because it waited over an hour); run --live" ;;
     esac
     exit 0 ;;
+  --cancelled)
+    setup; step "A cancelled order"; cancelled_order; exit 0 ;;
   --live)
-    setup; in_progress_order; exit 0 ;;
+    setup; release_busy_riders; in_progress_order; exit 0 ;;
   full) ;;
-  *) die "unknown option '$MODE' (use --live, --advance or --status)" ;;
+  *) die "unknown option '$MODE' (use --live, --cancelled, --advance or --status)" ;;
 esac
 
 setup
+release_busy_riders
 
 step "Delivered orders"
 ORDERS=()
@@ -237,10 +269,7 @@ call POST "/orders/${ORDERS[0]}/review" '{"rating":5,"comment":"Great karahi, ni
 call POST "/orders/${ORDERS[1]}/review" '{"rating":3,"comment":"Burgers were good but the delivery took a little while."}' "$CUSTOMER_TOKEN"; ok "3 stars on the burger order ($CODE)"
 
 step "A cancelled order (the kitchen turns it down, the payment is refunded)"
-id=$(place '[{"item_id":"biryani","quantity":1}]' "to be rejected") || exit 1
-call POST "/orders/$id/reject" "" "$OWNER_TOKEN"; [[ "$CODE" == "200" ]] || die "kitchen could not reject $id ($CODE): $BODY"
-poll_status "$id" cancelled 90 "$CUSTOMER_TOKEN"
-state_set rejected_order "$id"; ok "cancelled and refunded  ($id)"
+cancelled_order
 
 in_progress_order
 

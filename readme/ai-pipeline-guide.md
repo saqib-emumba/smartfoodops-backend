@@ -100,9 +100,11 @@ flowchart TD
     Load --> Router{"ROUTER<br/>LLM returns JSON<br/>intent, budget, tags, order id"}
     Router -->|"out_of_scope"| Refuse["fixed reply<br/>no model call"]
     Router -->|"food or restaurant"| RetrieveFood["RETRIEVE food<br/>rag_context.py<br/>top 18, drop repeats, keep 6"]
-    Router -->|"order_tracking"| RetrieveOrder["RETRIEVE order<br/>order_explainer.py<br/>facts"]
+    Router -->|"order_tracking"| RetrieveOrder["RETRIEVE order<br/>order_explainer.py<br/>facts for ONE order"]
+    Router -->|"order_history"| RetrieveHistory["RETRIEVE history<br/>order_explainer.py<br/>counts and newest 5 orders"]
     RetrieveFood --> Found{"anything above<br/>similarity floor 0.30?"}
     RetrieveOrder --> HasOrder{"order found?"}
+    RetrieveHistory --> HasOrder
     Found -->|"no"| NoResults["fixed reply<br/>nothing matches"]
     HasOrder -->|"no"| NoOrders["fixed reply<br/>no orders yet"]
     Found -->|"yes"| Generate["GENERATE<br/>model writes from context only<br/>tokens stream to the client"]
@@ -221,9 +223,10 @@ returns a LangChain model for the configured provider.
 | Stage | Model? | What it does | File |
 |---|---|---|---|
 | **Memory** | no | Loads this user's earlier messages for this conversation (max 12, 1 hour) from Redis | [ai/assistant/memory.py](../services/ai/assistant/memory.py) |
-| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/assistant/agents/router.py](../services/ai/assistant/agents/router.py), prompt in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
+| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `order_history`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/assistant/agents/router.py](../services/ai/assistant/agents/router.py), prompt in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
 | **Retrieve (food)** | no | Calls the RAG assembler with the router's budget and tags, the similarity floor (`ASSISTANT_MIN_SCORE` 0.30), and a follow-up-aware query (a short follow-up like "and vegan?" is joined to the previous question). Fetches 18 candidates, **drops repeats** (same dish, restaurant name and price), keeps the best 6 | [ai/assistant/agents/graph.py](../services/ai/assistant/agents/graph.py), [ai/assistant/agents/context.py](../services/ai/assistant/agents/context.py) |
-| **Retrieve (order)** | no | Gathers order facts (section 7) | [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) |
+| **Retrieve (order)** | no | Gathers the facts for **one** order: the one named, the latest, or (for a cancellation or refund question with no id) the latest *cancelled* one (section 7) |
+| **Retrieve (history)** | no | For "how many pending orders do I have?" and "what did I order last time?": the customer's counts by state (over every order) and their newest five orders, from one internal Order Service route (section 7) | [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) |
 | **Generate** | yes | The model writes from the context only. Each fragment is sent to the client as it is produced | [ai/llm/provider.py](../services/ai/llm/provider.py) (`stream_model`), prompts in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
 | **Guardrail** | no | Checks the finished answer (section 6). A failing answer is replaced by one written by rules from the same context | [ai/llm/guardrails.py](../services/ai/llm/guardrails.py), [ai/assistant/agents/context.py](../services/ai/assistant/agents/context.py) (`render_food_fallback`) |
 
@@ -267,7 +270,9 @@ The prompt *asks* the model to behave. The guardrails are what make it true. All
 | Prices | A price not in the context. Reads `$12.50` **and** a bare two-decimal number such as `12.50` (not a distance, duration or clock time) | Claude dropped the `$`, so prices were not being checked |
 | Pairings (`verify_pairings`) | A dish, its restaurant and its price that each exist but do not belong together | A local model said "Ollama Test Grill has a Margherita Pizza, $9.5": a pizza from another restaurant with the burger's price |
 | Name families | Relaxes the name check: "Desi Dhaba" passes when it is the shared stem of at least two real names | Claude abbreviated three branches |
+| Bold figures | A bold span that is only a price or a time ("**$10.00**", "**20 to 30 minutes**") is not judged as a dish name; the figure itself is still checked | A model bolded a price and a good answer was replaced for its typography |
 | Denials | A name inside a denial ("I can't find **X**") is not treated as a claim that X exists. The negation must be within three words before the name | Claude echoed the restaurant the customer asked about |
+| Figures (`verify_quantities`) | A "N minutes" or "N km" that is not in the context (the delivery window, preparation time and distances) or in the customer's own question. Reads both ends of a range ("20 to 30", "20-30") and "N more minutes" | "How quickly can you deliver?" made a courier estimate available; any other minutes figure would be invented |
 
 **Order explanations** (`check_explanation` in [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py)):
 
@@ -279,8 +284,16 @@ The prompt *asks* the model to behave. The guardrails are what make it true. All
 | Cause (`verify_cause`) | Saying there is no recorded reason when the facts carry one |
 | Verdict (`verify_no_verdict`) | Judging the order late, on time, early or slow. No promised delivery time is recorded, so there is nothing to compare against |
 
-**The fallback never fails its own checks.** `render_summary` writes the explanation from the facts by rules, and the unit
-checks assert it always passes. So a rejected answer is always replaced by something that is true, plainer, and says what
+**Order history** (`check_history`): counts, prices and times are the only things an answer may state, and each must be in the facts.
+
+| Check | Rejects |
+|---|---|
+| Counts (`verify_counts`) | A number in front of "order(s)" or a state ("3 pending orders", "five delivered") that is not one of the facts' counts. Digits and spelled-out numbers are both read. An item quantity ("2 x Burger") is not a count |
+| Prices (`verify_prices`) | A price that is not one of the listed orders' totals |
+| Figures, verdict | The same `verify_quantities` and `verify_no_verdict` as above |
+
+**The fallback never fails its own checks.** `render_summary` (and `render_history`) writes the answer from the facts by rules, and
+[scripts/ai-guardrail-checks.py](../scripts/ai-guardrail-checks.py), run by the smoke test inside the AI container, asserts it always passes. So a rejected answer is always replaced by something that is true, plainer, and says what
 happened.
 
 **Honest ceiling.** The guardrail catches invented or mismatched names, prices and figures, wrong status, a denied cause and
@@ -295,6 +308,17 @@ exempt from some checks, so "X is not only at Y" would slip through.
 Two doors, one engine: `POST /api/v1/ai/explain-order` ([ai/apis/explain.py](../services/ai/apis/explain.py)) and an order
 question inside the assistant stream. Both call `OrderExplainer` in [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py).
 Only the customer who placed the order (or an admin) may ask.
+
+**Order history (the assistant only).** A question about the customer's orders *as a whole* ("how many pending orders do I
+have?", "what did I order last time?", "show my recent orders") is routed to `order_history`. Its facts come from one internal
+Order Service route, `GET /orders/internal/customers/{id}/summary` ([order/apis/internal_explain.py](../services/order/apis/internal_explain.py)):
+counts by status over **every** order (`total`, `in_progress` = created + confirmed + assigned + picked up, `delivered`,
+`cancelled`), plus the newest five orders with their items and totals. Restaurant names are read live. The answer may state
+only those counts (section 6, `verify_counts`), and the prompt tells the model "pending", "open" and "active" all mean
+`in_progress`. It lists at most five orders, and says so if asked about an older one.
+
+**Which order "my order" means.** With no id: the latest order. For a question about a cancellation or refund: the latest
+*cancelled* order (`latest-order?status=cancelled`), so a newer in-flight order does not hijack the answer.
 
 **Where the facts come from** (the AI Service never touches another service's database):
 
@@ -324,6 +348,23 @@ Only the customer who placed the order (or an admin) may ask.
 refund, anything from a log's free-text `detail`, any rider identity.
 
 ---
+
+### Delivery-time estimate (D68)
+
+"How long will it take?" is answered with a food-app-style window, from one formula in [common/delivery.py](../services/common/delivery.py):
+
+    preparation  +  courier to the restaurant  +  trip from the restaurant to the customer      shown as "about 25 to 35 minutes"
+
+| Part | Where it comes from |
+|---|---|
+| Preparation | `restaurants.prep_time_minutes` in the Restaurant Service database, set by the owner at onboarding or with `PATCH /restaurants/{id}`. Default 15 |
+| Courier to the restaurant | The nearest free courier's distance (Rider Service `/internal/nearby`) for a restaurant not yet ordered from; the distance recorded when a courier was assigned for an order already placed. An assumed 1.5 km if unknown |
+| Trip to the customer | Straight-line distance at an assumed 30 km/h, from the **location the chat page sends** (`latitude`/`longitude`). Orders carry no address, so without one a typical 3 km is assumed and the answer says so |
+
+- **Food path** ([retrieval/rag_context.py](../services/ai/retrieval/rag_context.py)): each restaurant with a free courier carries `delivery_estimate`; one with none has `null` and the answer says no courier is free.
+- **Order path** ([assistant/order_explainer.py](../services/ai/assistant/order_explainer.py)): the same window with the minutes already spent taken off, floored at "0 to 5". A placed order is never "out of range" (the platform accepted it); a shared location beyond range is ignored for it and a typical trip is assumed.
+- **Out of range** (food path only, before an order exists): beyond 15 km there is no estimate and the answer says the address is outside that restaurant's delivery range.
+- **Chat page**: asks the browser for your location once after sign-in. `/chat/?lat=24.86&lon=67.01` fixes a location for demos and testing.
 
 ## 8. Partner tools, reviews and attribution
 

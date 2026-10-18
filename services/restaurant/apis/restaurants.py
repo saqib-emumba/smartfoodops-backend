@@ -7,11 +7,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 
-from common.auth import CurrentUser, get_current_user, require_internal, require_permission
+from common.auth import CurrentUser, get_current_user, require_internal, require_permission, require_self_or_admin
 from common.errors import not_found
 from common.responses import Envelope, ok
 from restaurant import deps
-from restaurant.schemas.restaurants import RestaurantOnboardRequest, RestaurantResponse
+from restaurant.schemas.restaurants import RestaurantOnboardRequest, RestaurantResponse, RestaurantUpdateRequest
 
 router = APIRouter(prefix="/api/v1/restaurants")
 
@@ -33,6 +33,25 @@ def onboard_restaurant(
     deps.user_service.verify_owner(current_user.user_id, current_user)
     row = deps.restaurants.onboard(payload, current_user.user_id)
     return ok(RestaurantResponse(**row), message="Restaurant onboarded", status=201)
+
+
+@router.patch("/{restaurant_id}", response_model=Envelope[RestaurantResponse])
+def update_restaurant(
+    restaurant_id: UUID,
+    payload: RestaurantUpdateRequest,
+    current_user: CurrentUser = Depends(require_permission("restaurant:update")),
+) -> Envelope[RestaurantResponse]:
+    """Set the kitchen's preparation time. Only the restaurant's owner (or a system admin) may.
+
+    The permission says the caller is *a* restaurant admin; whether they own *this* restaurant is a fact about
+    the record, so it is checked here, the same split as `kitchen:decide` and the AI partner tools.
+    """
+    row = deps.restaurants.find(restaurant_id)
+    if row is None:
+        raise not_found(f"Restaurant {restaurant_id} not found")
+    require_self_or_admin(current_user, row["owner_id"], detail=f"You do not own restaurant {restaurant_id}")
+    updated = deps.restaurants.set_prep_time(restaurant_id, payload.prep_time_minutes)
+    return ok(RestaurantResponse(**updated), message="Restaurant updated")
 
 
 @router.get("/{restaurant_id}", response_model=Envelope[RestaurantResponse])

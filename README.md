@@ -650,9 +650,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 628 assertions against http://localhost
+./scripts/smoke-test.sh            # 703 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 448 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 523 assertions, skips the saga sections and the policy-TTL wait
 # What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -741,7 +741,7 @@ copy-pasteable `curl` commands, grouped by service, with the expected response f
 
 For exercising the same contract from Postman instead of a terminal, import
 [postman/smartfoodops.postman_collection.json](postman/smartfoodops.postman_collection.json) —
-195 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
+200 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
 including a Collection-Runner-only happy path through the saga (self-looping status polls,
 since checkout is asynchronous). See [postman/README.md](postman/README.md) for import steps,
 run order, and what it can't check that the shell script can.
@@ -889,7 +889,11 @@ curl -s -X POST http://localhost/api/v1/restaurants/onboard \
   -H "Authorization: Bearer $OWNER" \
   -H 'Content-Type: application/json' \
   -d '{"name":"SFO Diner","address":"12 Blue Area, Islamabad",
-       "latitude":33.6844,"longitude":73.0479,"capacity":40}'
+       "latitude":33.6844,"longitude":73.0479,"capacity":40,"prep_time_minutes":20}'
+
+# The owner can change the preparation time later (the assistant's delivery-time estimate uses it):
+curl -s -X PATCH http://localhost/api/v1/restaurants/$REST -H "Authorization: Bearer $OWNER" \
+  -H 'Content-Type: application/json' -d '{"prep_time_minutes":25}'
 ```
 
 The restaurant is owned by the token's subject. There is no `owner_id` to send.
@@ -1038,7 +1042,8 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `GET` | `/api/v1/users/{user_id}` | the subject, or `system_admin` | Joins `roles`, returns the role **name** |
 | `POST` | `/api/v1/users/{user_id}/roles` | the subject, or `system_admin` | Adds a role to the account; idempotent — granting a held role is a no-op. Rules in [readme/multi-role-rbac-design.md](readme/multi-role-rbac-design.md) §3.6 |
 | `DELETE` | `/api/v1/users/{user_id}/roles/{role_name}` | the subject, or `system_admin` | Removes a role; refuses to leave the account with none |
-| `POST` | `/api/v1/restaurants/onboard` | `restaurant_admin` | `201`; owner taken from the token, verified over HTTP |
+| `POST` | `/api/v1/restaurants/onboard` | `restaurant_admin` | `201`; owner taken from the token, verified over HTTP. Optional `prep_time_minutes` (1 to 120, default 15) |
+| `PATCH` | `/api/v1/restaurants/{restaurant_id}` | the restaurant's `restaurant_admin` | Sets the kitchen's `prep_time_minutes` (the only editable field); `403` for another owner. Used by the assistant's delivery-time estimate (D68) |
 | `GET` | `/api/v1/restaurants/{restaurant_id}` | any signed-in user | Exposes `is_active` to other services |
 | `POST` | `/api/v1/menus` | `restaurant_admin` **owning that restaurant** | Upsert full category/item/customization tree; items may carry `dietary_tags` (D60), and a successful publish is announced to the AI Service (D61) |
 | `GET` | `/api/v1/menus/{restaurant_id}` | any signed-in user | Used by the Order Service to price a cart |
@@ -1081,6 +1086,7 @@ Role names in the "Who may call it" column are shorthand for the permission that
 | `POST` | `/api/v1/riders/internal/nearby` | AI Service | Available-rider count and nearest distance around a point — aggregates only, never a rider id or position (D62) |
 | `GET` | `/api/v1/analytics/internal/customers/{customer_id}/summary` | AI Service | Order counts and favourite restaurants; zeros for a customer with no history (D62). Not routed by the gateway |
 | `GET` | `/api/v1/orders/internal/{order_id}/explain-context` | AI Service | The order, its reduced trail (status, service, reason code, time, and on the `assigned` row the dispatch estimate and distance — never `detail`, `raw_log` or a rider id) plus when the kitchen answered and the running workflows' stage (D64) |
+| `GET` | `/api/v1/orders/internal/customers/{customer_id}/summary[?limit=]` | AI Service | A customer's order counts by status (over every order) and their newest five orders with items, for "how many pending orders do I have?" and "what did I order last time?" (D67) |
 | `GET` | `/api/v1/orders/internal/customers/{customer_id}/latest-order[?status=cancelled]` | AI Service | A customer's most recent order id (or most recent *cancelled* one), so "why is my order late?" and "why was my order cancelled?" need no id |
 | `GET` | `/api/v1/orders/internal/restaurants/{restaurant_id}/reviews` | AI Service | Review count, average and recent commented reviews — no customer id (D64) |
 | `POST` | `/api/v1/riders/internal/order-courier` | AI Service | Distance from a point to the rider carrying an order — never an id, position or ETA (D64) |
@@ -1354,6 +1360,9 @@ docker exec -i sfo-order-db psql -U sfo_order_admin -d sfo_order_core < db/order
 docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_week5_permissions.sql
 # assistant_interactions (D65) — before the new ai-service build
 docker exec -i sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core < db/vector/add_assistant_interactions.sql
+# restaurants.prep_time_minutes and the PATCH permission (D68) — before the new restaurant-service build
+docker exec -i sfo-restaurant-db psql -U sfo_restaurant_admin -d sfo_restaurant_core < db/restaurant/add_prep_time.sql
+docker exec -i sfo-user-db psql -U sfo_user_admin -d sfo_user_core < db/user/add_restaurant_update_permission.sql
 # slim document tables (D66): drops and recreates them, so search is empty until the backfill has run
 docker exec -i sfo-vector-db psql -U sfo_vector_admin -d sfo_vector_core < db/vector/slim_document_tables.sql
 docker exec sfo-ai-ingestion-worker python -m ai.ingestion --backfill
@@ -1394,6 +1403,8 @@ smartfoodops-backend/
 │   ├── user/add_rbac_permissions.sql  # hand-run migration for an already-initialised user DB
 │   ├── user/add_ai_permissions.sql    # hand-run: ai:search / ai:rag_context (Week 4)
 │   ├── user/add_week5_permissions.sql # hand-run: ai:assistant / ai:explain_order / ai:partner / order:review (Week 5)
+│   ├── user/add_restaurant_update_permission.sql  # hand-run: restaurant:update and PATCH /restaurants/{id} (D68)
+│   ├── restaurant/add_prep_time.sql   # hand-run: restaurants.prep_time_minutes (D68)
 │   ├── restaurant/init.sql    # restaurants
 │   ├── menu/init.sql          # menus (category tree as JSONB)
 │   ├── menu/add_dietary_tags.sql  # hand-run: menu_items.dietary_tags (Week 4, D60)

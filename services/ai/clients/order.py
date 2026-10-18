@@ -41,6 +41,15 @@ class OrderServiceClient(ServiceFacade):
             raise
         return body["order_id"]
 
+    def customer_summary(self, customer_id: str, limit: int = 5) -> dict:
+        """`{counts: {total, in_progress, delivered, cancelled, by_status}, recent: [...]}` for one customer."""
+        return self._client.get(
+            f"/api/v1/orders/internal/customers/{customer_id}/summary?limit={limit}",
+            missing=f"Customer {customer_id} has no orders",
+            unreachable_hint="cannot read the customer's orders",
+            headers=internal_headers(),
+        )
+
     def restaurant_reviews(self, restaurant_id: str, limit: int = 30) -> dict:
         """`{review_count, average_rating, reviews[{rating, comment, created_at}]}`."""
         return self._client.get(

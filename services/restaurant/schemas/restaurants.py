@@ -13,6 +13,15 @@ class RestaurantOnboardRequest(BaseModel):
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
     capacity: int = Field(50, gt=0)
+    # How long the kitchen takes to prepare an order. Optional: a restaurant that does not say gets the default.
+    prep_time_minutes: int = Field(15, ge=1, le=120)
+
+
+class RestaurantUpdateRequest(BaseModel):
+    """What an owner may change after onboarding. Only the preparation time so far: the other fields feed
+    identity, location and capacity, which have consequences (dispatch, the menu index) a plain PATCH should not have."""
+
+    prep_time_minutes: int = Field(..., ge=1, le=120)
 
 
 class RestaurantResponse(BaseModel):
@@ -24,5 +33,6 @@ class RestaurantResponse(BaseModel):
     longitude: float
     is_active: bool
     capacity: int
+    prep_time_minutes: int
 
     model_config = ConfigDict(from_attributes=True)

@@ -35,6 +35,7 @@ from ai.clients.rider import RiderServiceClient
 from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import RAG_LATENCY_SECONDS, RAG_REQUESTS_TOTAL, RAG_SOURCE_FAILURES_TOTAL
 from ai.retrieval.geo import haversine_km
+from common.delivery import delivery_estimate
 from ai.clients.restaurant import RestaurantServiceClient
 from ai.retrieval.retriever import Retriever
 from ai.schemas.rag import (
@@ -106,7 +107,7 @@ class RagContextAssembler:
             # an empty list would read as "no riders", which is a claim this response cannot make.
             failed.append("courier")
         else:
-            courier, courier_failed = await self._courier(item_rows, restaurant_rows)
+            courier, courier_failed = await self._courier(item_rows, restaurant_rows, request)
             if courier_failed:
                 failed.append("courier")
 
@@ -207,7 +208,7 @@ class RagContextAssembler:
 
     # --- courier ---------------------------------------------------------------------------------
 
-    async def _courier(self, item_rows: list[dict], restaurant_rows: list[dict]):
+    async def _courier(self, item_rows: list[dict], restaurant_rows: list[dict], request: RagContextRequest):
         """Availability around each candidate restaurant: `(entries, any_lookup_failed)`.
 
         Anchored on the *restaurant*, not the customer: what decides whether an order can be
@@ -216,11 +217,13 @@ class RagContextAssembler:
         `RAG_MAX_COURIER_LOOKUPS`. Entries that succeeded are returned even if another failed.
         """
         candidates: dict[str, tuple[float, float]] = {}
+        prep: dict[str, int | None] = {}
         for row in [*restaurant_rows, *item_rows]:
             rid = str(row["restaurant_id"])
             if rid in candidates or row.get("latitude") is None:
                 continue
             candidates[rid] = (float(row["latitude"]), float(row["longitude"]))
+            prep[rid] = row.get("prep_time_minutes")
             if len(candidates) == config.RAG_MAX_COURIER_LOOKUPS:
                 break
 
@@ -233,11 +236,23 @@ class RagContextAssembler:
             return rid, result, failed
 
         outcomes = await asyncio.gather(*(lookup(rid, *coords) for rid, coords in candidates.items()))
+
+        def estimate(rid: str, result: dict) -> dict | None:
+            """A delivery window from the courier's distance and, if the caller shared a location, the trip to them."""
+            if not result["available_riders"]:
+                return None
+            trip_km = None
+            if request.latitude is not None:
+                lat, lon = candidates[rid]
+                trip_km = haversine_km(request.latitude, request.longitude, lat, lon)
+            return delivery_estimate(result.get("nearest_available_km"), trip_km, prep[rid])
+
         entries = [
             CourierAvailability(
                 restaurant_id=rid,
                 available_riders=result["available_riders"],
                 nearest_available_km=result.get("nearest_available_km"),
+                delivery_estimate=estimate(rid, result),
                 radius_km=result["radius_km"],
             )
             for rid, result, failed in outcomes

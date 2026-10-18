@@ -244,6 +244,7 @@ SELECT r.name AS role, p.name AS permission
 | `payment:create` | `customer` | Paying directly, outside the saga |
 | `payment:read` | `customer` | Reading a payment, ownership still settled by reading its order |
 | `restaurant:onboard` | `restaurant_admin` | Registering a restaurant |
+| `restaurant:update` | `restaurant_admin` | Changing a restaurant's own settings, today its preparation time (D68); ownership checked in the handler |
 | `menu:write` | `restaurant_admin` | Publishing or replacing a menu |
 | `kitchen:read` | `restaurant_admin` | Reading a kitchen queue |
 | `kitchen:decide` | `restaurant_admin` | Accepting or rejecting an order |
@@ -267,6 +268,7 @@ and still in the handlers — they need the resource row, so they can never move
 | `POST /api/v1/users/{id}/roles` | `NULL` (authenticated) | `require_self_or_admin` + `system_admin` carve-out | §3.6 |
 | `DELETE /api/v1/users/{id}/roles/{role}` | `NULL` (authenticated) | `require_self_or_admin` + last-role guard + carve-out | §3.6 |
 | `POST /api/v1/restaurants/onboard` | `restaurant:onboard` | — (creates own restaurant) | |
+| `PATCH /api/v1/restaurants/{id}` | `restaurant:update` | `require_self_or_admin` on the restaurant's `owner_id` | |
 | `GET /api/v1/restaurants/{id}` | `NULL` (authenticated) | — | |
 | `POST /api/v1/menus` | `menu:write` | manual `owner_id` compare | |
 | `GET /api/v1/menus/{restaurant_id}` | `NULL` (authenticated) | — | |

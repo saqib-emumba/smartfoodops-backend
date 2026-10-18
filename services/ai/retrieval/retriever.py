@@ -186,6 +186,7 @@ class Retriever:
                     "dietary_tags": list(item.get("dietary_tags") or []),
                     "latitude": restaurant.get("latitude"),
                     "longitude": restaurant.get("longitude"),
+                    "prep_time_minutes": restaurant.get("prep_time_minutes"),
                     "score": candidate["score"],
                 }
             )
@@ -213,6 +214,7 @@ class Retriever:
                         "address": restaurant.get("address"),
                         "latitude": restaurant.get("latitude"),
                         "longitude": restaurant.get("longitude"),
+                        "prep_time_minutes": restaurant.get("prep_time_minutes"),
                         "score": candidate["score"],
                     }
                 )

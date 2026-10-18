@@ -2612,6 +2612,79 @@ left holding only what no other service can supply. The mentor review of this ch
 - **A republish no longer re-embeds the menu.** Previously every publish replaced every row; now an
   unchanged dish costs nothing. This also makes `--backfill` cheap to run often.
 
+### D67 — The assistant can answer about all of a customer's orders, and about courier arrival
+
+Two gaps found while rehearsing a demo, both answered honestly before and neither useful.
+
+**Order history.** "How many pending orders do I have?" got "the only order I can see is..." because the order path
+fetched the facts of exactly one order. A fifth router intent, `order_history`, now fetches a customer's orders as a whole
+from a new internal Order Service route (`GET /orders/internal/customers/{id}/summary`): counts by status over every
+order, and the newest five with their items and totals. The answer may state only those counts. The guardrail gained
+`verify_counts` (a number before "order(s)" or a state must be one of the facts' counts, digits or words) and
+`verify_prices`, and the rule-written fallback is checked against them. "Pending" means `in_progress`: created, confirmed,
+assigned or picked up.
+
+**Instead of:** reusing the Analytics customer summary (it has no pending count and lags the order database), or letting the
+model query the Order database (it would become the access-control boundary, D01 and D64).
+
+**Delivery speed.** "How quickly can you deliver a pizza?" got "I don't have any delivery time information". A first fix quoted only
+the courier's trip to the restaurant; D68 replaced it with a full delivery-time estimate.
+
+**Costs:**
+
+- **Counts are checked, which order is which is not.** A model that attached the wrong state to the right order would pass if
+  the counts add up. The prompt forbids it; it is the same ceiling as D63's, now stated for lists.
+- **At most five orders are itemised.** An older order is out of reach by listing, though it can still be asked about by id.
+- **A new step in the router prompt** that has to tell "where is my order" (one order) from "how many orders do I have"
+  (all of them). A mis-route costs a slightly odd answer, not a wrong fact, because each path only states its own facts.
+
+### D68 — The assistant gives a delivery-time estimate, from the restaurant's preparation time and the customer's location
+
+A delivery app answers "how long?" with a window ("25-35 min"). The assistant used to say there was no delivery time to give
+(true: no promise is recorded) and, in a first fix, quote only the courier's trip to the restaurant. It now gives a labelled
+estimate:
+
+    preparation  +  courier reaching the restaurant  +  the trip from the restaurant to the customer
+
+shown as a ten-minute window around the total, centred on the nearest five minutes (`common/delivery.py`, shared by the food
+path and the order path so they cannot disagree).
+
+- **Preparation time is per restaurant and lives in the database.** `restaurants.prep_time_minutes` (1 to 120, default 15) in the
+  Restaurant Service, set at onboarding and changed by the owner with `PATCH /api/v1/restaurants/{id}` (new permission
+  `restaurant:update`, ownership checked in the handler; migrations `db/restaurant/add_prep_time.sql` and
+  `db/user/add_restaurant_update_permission.sql`). A fallback constant exists only for a restaurant whose figure could not be
+  read.
+- **The trip uses the customer's location when the chat page sends it.** The page asks the browser once after sign-in and sends
+  `latitude`/`longitude` with each question; the trip is the great-circle distance from the restaurant at an assumed 30 km/h. Orders
+  carry no delivery address, so without a shared location a typical 3 km trip is assumed, and the answer says "assumes a typical
+  trip, share your location for a closer one". Beyond 15 km there is no estimate: the answer says the address is outside that
+  restaurant's delivery range.
+- **For an order already placed** the answer is the time *left*: the same window with the minutes already spent taken off, floored
+  at "0 to 5", so an order past its window never reads as negative or as a verdict. A placed order is never "out of range": the
+  platform accepted it, and the page sends where the customer is *now*, which need not be where the order is going (orders store no
+  address). A location beyond range is therefore ignored for an order and the typical trip is assumed. Found when a customer asked
+  "how long to deliver this" about their own in-flight order from a location too far from the restaurant, and was told the address
+  was outside delivery range.
+- **A restaurant with no free courier has no estimate** and the answer says no courier is free.
+- **Guarded.** A "N minutes" or "N km" in a food answer must be in the context or in the customer's own question; the check now
+  reads both ends of a range ("20 to 30", "20-30") and "N more minutes". Found while testing: it had read only the number beside
+  the unit, so an invented low end slipped through. A bold span that is only a price or a time is no longer judged as a dish name.
+
+**Instead of:** keeping "there is no delivery time" (honest, but not what a customer asked), adding a per-dish preparation time (the
+platform has no such data and an owner would have to maintain it for every dish), or routing through a maps service (a new
+external dependency for a number that is only an estimate).
+
+**Costs, named so they are chosen rather than discovered:**
+
+- **It is a model, not a measurement.** 30 km/h, a straight-line distance, one preparation time per restaurant that does not change
+  with how busy the kitchen is. It does not know traffic, queue depth or a dish that takes longer. The window is ten minutes wide so it
+  does not claim precision it lacks, and the prompt calls it an estimate, never a promise.
+- **An assumed trip is still a guess.** Without a shared location, every restaurant is treated as three kilometres away.
+- **Only the preparation time can be edited.** The `PATCH` route accepts nothing else, because the other fields (location,
+  capacity) have consequences for dispatch and the menu index that a plain update should not have.
+- **The estimate is unchecked against reality.** Nothing compares it with how long an order actually took. That would need a
+  recorded delivery time per order, which the platform does have (the trail), and is the obvious way to tune the constants.
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:

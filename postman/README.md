@@ -2,7 +2,7 @@
 
 `smartfoodops.postman_collection.json` is every route the Nginx gateway exposes across all 8
 services (user, restaurant, menu, order, payment, rider, orchestrator, ai), built from the same
-contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 191 requests across 12 folders,
+contract [scripts/smoke-test.sh](../scripts/smoke-test.sh) drives: 200 requests across 12 folders,
 covering the happy path, authorisation boundaries, validation edge cases, and the Temporal-driven
 order saga end to end (kitchen accept/reject, rider dispatch, pickup, delivery), the Week 4 AI
 layer (dietary-tagged menus, semantic search, RAG context), and the Week 5 AI layer (the streaming
@@ -175,7 +175,7 @@ docker run --rm -v "$PWD:/c:ro" postman/newman:alpine run /c/smartfoodops.postma
   --delay-request 250 --timeout-request 150000 --color off
 ```
 
-Measured against Claude: 191 requests, all passing, in about 150 s, with the one manual request reported as skipped. **Without the
+Measured against Claude: 200 requests and 476 assertions, all passing, in about 150 s, with the one manual request reported as skipped. **Without the
 internal key exactly 9 assertions fail**, each on a request that correctly answers `401` when the key is missing
 (the audit-log write, the internal order read, and the two rider-report durability checks).
 

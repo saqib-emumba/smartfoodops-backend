@@ -75,6 +75,10 @@ class CourierAvailability(BaseModel):
     restaurant_id: UUID
     available_riders: int
     nearest_available_km: Optional[float] = None
+    # A food-app-style delivery window for an order from this restaurant to this customer (common/delivery.py):
+    # `{minutes_low, minutes_high, trip_assumed}`, or `{out_of_range: true}` when the customer is beyond delivery
+    # range. None when no courier is free, because then there is nothing to base one on.
+    delivery_estimate: Optional[dict] = None
     radius_km: float
 
 

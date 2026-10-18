@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS restaurants (
     longitude DECIMAL(9, 6) NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     capacity INT NOT NULL DEFAULT 50,
+    -- How long the kitchen takes to prepare an order, in minutes. One figure per restaurant, set by its owner: the
+    -- delivery-time estimate the AI assistant gives a customer is this plus the courier's trip (D68). The default is
+    -- a stand-in until an owner sets their own.
+    prep_time_minutes INT NOT NULL DEFAULT 15 CHECK (prep_time_minutes BETWEEN 1 AND 120),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

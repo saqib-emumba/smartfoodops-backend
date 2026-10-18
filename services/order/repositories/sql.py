@@ -201,6 +201,15 @@ SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS = """
     SELECT id FROM orders WHERE customer_id = %s AND status = %s::order_status ORDER BY created_at DESC LIMIT 1
 """
 
+# "How many orders do I have, and which were the latest?" (the assistant's order-history path): one count per
+# status, and the newest few orders with the one column the other order reads leave out (`created_at`).
+SELECT_CUSTOMER_STATUS_COUNTS = """
+    SELECT status::text AS status, count(*) AS n FROM orders WHERE customer_id = %s GROUP BY status
+"""
+SELECT_CUSTOMER_RECENT = f"""
+    SELECT {_COLUMNS}, created_at FROM orders WHERE customer_id = %s ORDER BY created_at DESC LIMIT %s
+"""
+
 SELECT_BY_STATUS = f"""
     SELECT {_COLUMNS} FROM orders WHERE status = %(status)s::order_status ORDER BY created_at
 """

@@ -2,7 +2,7 @@
 
 The router asks the model for one JSON object. Models sometimes wrap it in prose or a code fence,
 and a user can try to talk the model into a different shape, so the parse never trusts it:
-the intent must be one of the four, tags are intersected with the shared vocabulary (a tag the
+the intent must be one of the five, tags are intersected with the shared vocabulary (a tag the
 menu cannot carry would only filter everything out), the budget must be a positive number and the
 order id must be a UUID. A reply that cannot be parsed falls back to food discovery with no
 constraints — retrieval and its similarity floor, not the router, are what stop a nonsense
@@ -16,7 +16,7 @@ from uuid import UUID
 
 from common.dietary import DIETARY_TAGS
 
-INTENTS = ("food_discovery", "order_tracking", "restaurant_support", "out_of_scope")
+INTENTS = ("food_discovery", "order_tracking", "order_history", "restaurant_support", "out_of_scope")
 _OBJECT = re.compile(r"\{.*\}", re.S)
 
 

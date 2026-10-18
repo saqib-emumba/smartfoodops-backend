@@ -90,7 +90,7 @@
   </header>
   <div id="log" aria-live="polite"></div>
   <div class="hints" id="hints"></div>
-  <div class="opts"><label><input type="checkbox" id="useLocation"> Share my location (adds distances to restaurants)</label></div>
+  <div class="opts"><label><input type="checkbox" id="useLocation"> <span id="locationLabel">Use my location (makes delivery-time estimates and distances exact)</span></label></div>
   <form class="composer" id="composer">
     <textarea id="input" rows="1" maxlength="500" placeholder="Ask about food, a restaurant, or an order…" aria-label="Your message"></textarea>
     <button id="send" type="submit">Send</button>
@@ -118,6 +118,18 @@ let conversationId = null;
 let busy = false;
 let registering = false;
 let coords = null;
+// A fixed location for demos and testing: open /chat/?lat=24.86&lon=67.01 to behave as a customer there instead of
+// asking the browser. The assistant uses it to work out the trip from a restaurant to you.
+{
+  const q = new URLSearchParams(location.search), lat = parseFloat(q.get("lat")), lon = parseFloat(q.get("lon"));
+  if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+    coords = { latitude: lat, longitude: lon };
+    document.addEventListener("DOMContentLoaded", () => {
+      $("useLocation").checked = true; $("useLocation").disabled = true;
+      $("locationLabel").textContent = `Using location ${lat.toFixed(3)}, ${lon.toFixed(3)} (from the page address)`;
+    });
+  }
+}
 
 // ---- API helpers -------------------------------------------------------------------------------
 // Every response is the platform envelope {status, body, message, errors} (D35).
@@ -190,6 +202,7 @@ function showChat() {
   $("auth").hidden = true; $("chat").hidden = false;
   $("who").textContent = store.email;
   if (!$("log").children.length) greet();
+  if (!coords && !askedForLocation) { askedForLocation = true; setLocation(true); }
   $("input").focus();
 }
 function greet() {
@@ -203,13 +216,20 @@ function greet() {
 }
 $("newChat").onclick = () => { if (busy) return; conversationId = null; $("log").innerHTML = ""; greet(); $("input").focus(); };
 
-$("useLocation").onchange = (e) => {
-  if (!e.target.checked) { coords = null; return; }
-  if (!navigator.geolocation) { e.target.checked = false; return; }
+// The delivery-time estimate uses the trip from the restaurant to you, so the page asks for your location once after
+// sign-in (the browser shows its own prompt) and sends it with every question. Say no, or untick the box, and the
+// assistant assumes a typical trip and says so. A fixed location in the page address (?lat=&lon=) skips all of this.
+function setLocation(on) {
+  const box = $("useLocation");
+  if (!on) { coords = null; box.checked = false; return; }
+  if (!navigator.geolocation) { box.checked = false; return; }
+  box.checked = true;
   navigator.geolocation.getCurrentPosition(
     (p) => { coords = { latitude: p.coords.latitude, longitude: p.coords.longitude }; },
-    () => { e.target.checked = false; coords = null; });
-};
+    () => { box.checked = false; coords = null; });
+}
+$("useLocation").onchange = (e) => setLocation(e.target.checked);
+let askedForLocation = false;
 
 // The model's text is untrusted: escape everything, then turn **bold**, "- " bullets and line breaks into markup.
 function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }

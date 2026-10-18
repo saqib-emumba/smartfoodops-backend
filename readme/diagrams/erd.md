@@ -132,6 +132,7 @@ erDiagram
         decimal longitude
         boolean is_active
         int capacity
+        int prep_time_minutes "1-120, default 15; the kitchen's preparation time, set by the owner (D68)"
         timestamp created_at
         timestamp updated_at
     }

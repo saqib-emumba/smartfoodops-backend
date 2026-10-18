@@ -69,6 +69,43 @@ async def explain_context(order_id: UUID) -> Envelope[OrderExplainContext]:
     )
 
 
+# What a customer would call "pending": placed, but not yet delivered or cancelled.
+_IN_PROGRESS = ("created", "confirmed", "assigned", "picked_up")
+
+
+@router.get("/internal/customers/{customer_id}/summary")
+def customer_summary(customer_id: UUID, limit: int = Query(5, ge=1, le=10)) -> Envelope[dict]:
+    """A customer's order counts and newest orders, for "how many pending orders do I have?" and "what did I
+    order last time?".
+
+    Counts cover every order the customer has; `recent` is the newest `limit` (default 5, at most 10) with
+    their items. `in_progress` is created + confirmed + assigned + picked_up; `cancelled` includes
+    `compensation_failed`, a cancellation whose refund still needs a person (its own count is kept in
+    `by_status`). Internal-key only and unmapped at the gateway, like the rest of this module.
+    """
+    summary = deps.orders.customer_summary(customer_id, limit)
+    by_status = summary["by_status"]
+    counts = {
+        "total": sum(by_status.values()),
+        "in_progress": sum(by_status.get(s, 0) for s in _IN_PROGRESS),
+        "delivered": by_status.get("delivered", 0),
+        "cancelled": by_status.get("cancelled", 0) + by_status.get("compensation_failed", 0),
+        "by_status": by_status,
+    }
+    recent = [
+        {
+            "order_id": str(order["id"]),
+            "restaurant_id": str(order["restaurant_id"]),
+            "status": order["status"],
+            "total_amount": float(order["total_amount"]),
+            "created_at": order["created_at"].isoformat(),
+            "items": [{"name": item["name"], "quantity": item["quantity"]} for item in order["items"]],
+        }
+        for order in summary["recent"]
+    ]
+    return ok({"counts": counts, "recent": recent}, message="Customer order summary")
+
+
 @router.get("/internal/customers/{customer_id}/latest-order")
 def latest_order(customer_id: UUID, status: str | None = Query(None, pattern="^cancelled$")) -> Envelope[dict]:
     """The id of a customer's most recent order, so "why is my order late?" needs no id.

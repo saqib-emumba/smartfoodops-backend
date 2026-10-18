@@ -25,7 +25,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 448 of the 628
+# It is a real reduction in coverage, not just in runtime. --fast asserts 523 of the 703
 # checks (counts as of Week 5's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -407,6 +407,20 @@ assert "  restaurant defaults to active" "$(jfield "['is_active']")" "True"
 assert "  owner taken from the token, not the body" "$(jfield "['owner_id']")" "$OWNER_ID"
 
 expect "fetch restaurant by id" 200 GET "/api/v1/restaurants/$REST_ID" "" "${CUST_AUTH[@]}"
+assert "  a restaurant that sets no preparation time gets the 15-minute default" "$(jfield "['prep_time_minutes']")" "15"
+
+# The kitchen's preparation time (D68): one figure per restaurant, set by its owner, used in the assistant's
+# delivery-time estimate. Ownership is the record's, so it is checked in the handler, not by the permission alone.
+expect "the owner sets the preparation time" 200 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":25}' "${OWNER_AUTH[@]}"
+assert "  it is stored" "$(jfield "['prep_time_minutes']")" "25"
+expect "  and read back" 200 GET "/api/v1/restaurants/$REST_ID" "" "${CUST_AUTH[@]}"
+assert "  as 25" "$(jfield "['prep_time_minutes']")" "25"
+expect "another restaurant's owner cannot change it -> 403" 403 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":5}' "${OWNER2_AUTH[@]}"
+expect "a customer cannot change it -> 403" 403 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":5}' "${CUST_AUTH[@]}"
+expect "no token -> 401" 401 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":5}'
+expect "a preparation time of 0 -> 422" 422 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":0}' "${OWNER_AUTH[@]}"
+expect "a preparation time of 500 -> 422" 422 PATCH "/api/v1/restaurants/$REST_ID" '{"prep_time_minutes":500}' "${OWNER_AUTH[@]}"
+expect "an unknown restaurant -> 404" 404 PATCH "/api/v1/restaurants/11111111-1111-4111-8111-111111111111" '{"prep_time_minutes":5}' "${OWNER_AUTH[@]}"
 
 MENU=$(cat <<JSON
 {"restaurant_id":"$REST_ID","categories":[{"category_id":"c1","category_name":"Mains","display_order":1,
@@ -641,7 +655,7 @@ if have_container sfo-user-db; then
             (SELECT count(*) FROM role_permissions)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NOT NULL)||'|'||
             (SELECT count(*) FROM route_permissions WHERE permission_id IS NULL);" 2>/dev/null | tr -d '[:space:]')
-  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "16|31|23|8"
+  assert "policy tables seeded (perms|grants|gated|auth-only)" "$POLICY_COUNTS" "17|33|24|8"
 
   # system_admin must hold every permission, or the seed's CROSS JOIN has regressed and the
   # table stops telling the whole story (db/user/init.sql section 1e).
@@ -1610,6 +1624,10 @@ assert "  restaurants carry a distance from the caller" \
 assert "  and are listed nearest first" \
   "$(jeval "[r['distance_km'] for r in b['restaurants']] == sorted(r['distance_km'] for r in b['restaurants'])")" "True"
 assert "  courier availability was looked up" "$(jeval "len(b['courier_availability']) > 0")" "True"
+assert "  a restaurant with a free courier carries a delivery-time window, in minutes and low to high" \
+  "$(jeval "all(isinstance(c['delivery_estimate'], dict) and 0 < c['delivery_estimate'].get('minutes_low', 1) <= c['delivery_estimate'].get('minutes_high', 1) for c in b['courier_availability'] if c['available_riders'] > 0)")" "True"
+assert "  and one with no free courier has none" \
+  "$(jeval "all(c['delivery_estimate'] is None for c in b['courier_availability'] if c['available_riders'] == 0)")" "True"
 
 expect "asking for another customer's context -> 403" 403 POST /api/v1/ai/rag-context \
   "{\"customer_id\":\"$OTHER_ID\",\"prompt_query\":\"lunch\"}" "${CUST_AUTH[@]}"
@@ -1743,8 +1761,39 @@ if have_container sfo-order-service; then
     expect "  and that order really is cancelled" 200 GET "/api/v1/orders/$LATEST_CANCELLED" "" "${CUST_AUTH[@]}"
     assert "  status" "$(jfield "['status']")" "cancelled"
   fi
+  # The order-history facts ("how many pending orders do I have?"): counts over every order, and the newest few.
+  SUMMARY_URL="/api/v1/orders/internal/customers/$CUST_ID/summary"
+  SUMMARY_REPLY=$(order_internal "$SUMMARY_URL")
+  assert "the order summary route answers" "$(cut -d' ' -f1 <<<"$SUMMARY_REPLY")" "200"
+  sumeval() { python3 -c "import json,sys; b=json.loads(sys.argv[1].split(' ',1)[1])['body']; c=b['counts']; r=b['recent']; print($1)" "$SUMMARY_REPLY" 2>/dev/null; }
+  assert "  the total is the sum of the per-status counts" "$(sumeval "c['total'] == sum(c['by_status'].values())")" "True"
+  assert "  in progress is created + confirmed + assigned + picked_up" \
+    "$(sumeval "c['in_progress'] == sum(c['by_status'].get(s,0) for s in ('created','confirmed','assigned','picked_up'))")" "True"
+  assert "  the customer has at least one order in progress (the checkout above)" "$(sumeval "c['in_progress'] >= 1")" "True"
+  assert "  the newest orders are listed, at most five, each with its items" \
+    "$(sumeval "0 < len(r) <= 5 and all(o['items'] and 'name' in o['items'][0] for o in r)")" "True"
+  assert "  and they carry no customer or rider id" "$(sumeval "not any('customer_id' in o or 'rider_id' in o for o in r)")" "True"
+  assert "a limit of 0 -> 422" "$(order_internal "$SUMMARY_URL?limit=0" | cut -d' ' -f1)" "422"
+  expect "the order summary route is refused at the gateway -> 403" 403 GET \
+    "/api/v1/orders/internal/customers/$CUST_ID/summary" "" "${ADMIN_AUTH[@]}"
 else
   printf '  %sSKIP%s  latest-order lookup (docker/sfo-order-service not reachable)\n' "$DIM" "$RESET"
+fi
+
+# --- the guardrails, tested directly ------------------------------------------------------------------
+# A real model rarely misbehaves on demand, so each rule is shown to fire here, inside the AI container, against
+# answers written to break it (scripts/ai-guardrail-checks.py). No model call, no network.
+if have_container sfo-ai-service; then
+  GUARD=$(docker exec -i sfo-ai-service python - < "$(dirname "${BASH_SOURCE[0]}")/ai-guardrail-checks.py" 2>/dev/null | tail -n1)
+  if [[ -n "$GUARD" ]]; then
+    while IFS='=' read -r name passed; do
+      assert "guardrail: ${name//_/ }" "$passed" "True"
+    done < <(python3 -c "import json,sys; [print(k+'='+str(v)) for k,v in json.loads(sys.argv[1]).items()]" "$GUARD")
+  else
+    bad "guardrail checks ran" "no output from the AI container"
+  fi
+else
+  printf '  %sSKIP%s  guardrail checks (docker/sfo-ai-service not reachable)\n' "$DIM" "$RESET"
 fi
 
 # --- reviews (D64) -----------------------------------------------------------------------------

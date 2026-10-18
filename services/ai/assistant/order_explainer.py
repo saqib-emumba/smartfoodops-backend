@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from logging import Logger
 
 from common.auth import CurrentUser, require_self_or_admin
+from common.delivery import MAX_DELIVERY_KM, delivery_estimate, minutes_remaining
+from ai.retrieval.geo import haversine_km
 from ai.clients.order import OrderServiceClient
 from ai.clients.restaurant import RestaurantServiceClient
 from ai.clients.rider import RiderServiceClient
@@ -70,6 +72,21 @@ WAITING_TEXT = {
 }
 
 
+# How many of a customer's newest orders the history path itemises.
+HISTORY_LIMIT = 5
+
+# An order's state as a customer reads it in a list.
+HISTORY_STATUS = {
+    "created": "in progress (placed, waiting to be confirmed)",
+    "confirmed": "in progress (with the restaurant)",
+    "assigned": "in progress (a courier has been assigned)",
+    "picked_up": "in progress (on its way to you)",
+    "delivered": "delivered",
+    "cancelled": "cancelled",
+    "compensation_failed": "cancelled (the refund could not be completed automatically and is with our team)",
+}
+
+
 def _minutes(delta_seconds: float) -> int:
     return max(0, round(delta_seconds / 60))
 
@@ -102,8 +119,68 @@ class OrderExplainer:
     async def latest_order_id(self, current_user: CurrentUser, status: str | None = None) -> str | None:
         return await asyncio.to_thread(self._orders.latest_order_id, str(current_user.user_id), status)
 
-    async def facts(self, order_id: str, current_user: CurrentUser) -> dict:
-        """The grounded facts for one order. `403` unless it is the caller's own (or an admin's call)."""
+    async def history_facts(self, current_user: CurrentUser) -> dict | None:
+        """Facts about the caller's orders as a whole: counts by state and their newest few orders.
+
+        For "how many pending orders do I have?" and "what did I order last time?". The customer is whoever
+        the token says, so there is no id to check ownership against. `None` when they have never ordered.
+        Counts come from the Order Service's own grouped query and cover every order; only the newest few are
+        itemised. Restaurant names are read live; a name that could not be read becomes "a restaurant" and is
+        listed in `unavailable`, never guessed.
+        """
+        summary = await asyncio.to_thread(self._orders.customer_summary, str(current_user.user_id), HISTORY_LIMIT)
+        counts = summary["counts"]
+        if not counts["total"]:
+            return None
+        unavailable: list[str] = []
+        names: dict[str, dict] = {}
+        restaurant_ids = list({order["restaurant_id"] for order in summary["recent"]})
+        if restaurant_ids:
+            try:
+                names = await asyncio.to_thread(self._restaurants.names, restaurant_ids)
+            except Exception as exc:  # noqa: BLE001 - a name is decoration; the counts still stand
+                self._logger.warning("Could not read restaurant names for an order history: %s", exc)
+                unavailable.append("restaurant names")
+        now = datetime.now(timezone.utc)
+        recent = []
+        for order in summary["recent"]:
+            ago = _minutes((now - _parse(order["created_at"])).total_seconds())
+            recent.append(
+                {
+                    "restaurant": (names.get(order["restaurant_id"]) or {}).get("name") or "a restaurant",
+                    "status": HISTORY_STATUS.get(order["status"], "in an unusual state"),
+                    "total": f"${order['total_amount']:.2f}",
+                    "items": [f"{item['quantity']} x {item['name']}" for item in order["items"]],
+                    # Minutes only while recent; an exact date after that, so a stale "about 4000 minutes ago"
+                    # never reaches the customer.
+                    "placed": (
+                        f"{_span(ago)} ago" if ago < 90 else f"on {_parse(order['created_at']):%d %B %Y}"
+                    ),
+                    "placed_minutes_ago": ago if ago < 90 else None,
+                }
+            )
+        facts = {
+            "kind": "order_history",
+            "total_orders": counts["total"],
+            "in_progress": counts["in_progress"],
+            "delivered": counts["delivered"],
+            "cancelled": counts["cancelled"],
+            "recent_orders_shown": len(recent),
+            "recent_orders": recent,
+            "unavailable": unavailable,
+        }
+        facts["plain_summary"] = render_history(facts)
+        return facts
+
+    async def facts(
+        self, order_id: str, current_user: CurrentUser, destination: tuple[float, float] | None = None
+    ) -> dict:
+        """The grounded facts for one order. `403` unless it is the caller's own (or an admin's call).
+
+        `destination` is the customer's shared `(latitude, longitude)`, if any. Orders carry no delivery address,
+        so it is the only way the delivery estimate can use the real trip to the customer; without it a typical
+        trip is assumed and the facts say so.
+        """
         context = await asyncio.to_thread(self._orders.explain_context, order_id)
         require_self_or_admin(
             current_user,
@@ -114,7 +191,7 @@ class OrderExplainer:
         unavailable: list[str] = []
         restaurant = await self._restaurant(context["restaurant_id"], unavailable)
         courier = await self._courier(context, restaurant, unavailable)
-        return self._build(context, restaurant, courier, unavailable)
+        return self._build(context, restaurant, courier, unavailable, destination)
 
     async def _restaurant(self, restaurant_id: str, unavailable: list[str]) -> dict | None:
         try:
@@ -143,7 +220,14 @@ class OrderExplainer:
             return {"assigned": True, "distance_km": None}
         return {"assigned": result["assigned"], "distance_km": result.get("distance_km")}
 
-    def _build(self, context: dict, restaurant: dict | None, courier: dict | None, unavailable: list[str]) -> dict:
+    def _build(
+        self,
+        context: dict,
+        restaurant: dict | None,
+        courier: dict | None,
+        unavailable: list[str],
+        destination: tuple[float, float] | None = None,
+    ) -> dict:
         status = context["status"]
         timeline = context["timeline"]
         stamps = [_parse(entry["occurred_at"]) for entry in timeline]
@@ -186,6 +270,27 @@ class OrderExplainer:
                     )
                 facts["estimate_at_assignment"] = estimate
                 break
+
+        # A food-app-style estimate of the time left (common/delivery.py), for an order still on its way. The
+        # courier's distance is the one recorded at assignment; the trip to the customer is the real one if a
+        # location was shared and a typical one otherwise. `minutes_remaining` takes the time already spent off
+        # and floors at 0-5, so an order past its window reads "0 to 5 minutes", never a negative or a verdict.
+        if status not in TERMINAL and "placed_minutes_ago" in facts:
+            courier_km = (facts.get("estimate_at_assignment") or {}).get("courier_distance_km")
+            trip_km = None
+            if destination is not None and restaurant and restaurant.get("latitude") is not None:
+                trip_km = haversine_km(
+                    destination[0], destination[1], float(restaurant["latitude"]), float(restaurant["longitude"])
+                )
+                # The order was placed, so the platform accepted it: it cannot be "out of range". A location
+                # beyond range is simply not where this order is going (orders store no address, and the page
+                # sends where the customer is *now*), so it is ignored and a typical trip is assumed.
+                if trip_km > MAX_DELIVERY_KM:
+                    trip_km = None
+            facts["delivery_estimate"] = minutes_remaining(
+                delivery_estimate(courier_km, trip_km, (restaurant or {}).get("prep_time_minutes")),
+                facts["placed_minutes_ago"],
+            )
 
         # Splitting the wait. `confirmed` -> `assigned` lumps two things together: the restaurant taking
         # the order, then a courier being found. The kitchen's answer is not a trail row (accepting does
@@ -243,6 +348,10 @@ def quantities_in(facts: dict) -> set[float]:
     for key in ("courier_minutes", "courier_distance_km", "minutes_since_assignment"):
         if estimate.get(key) is not None:
             figures.add(float(estimate[key]))
+    window = facts.get("delivery_estimate") or {}
+    for key in ("minutes_low", "minutes_high", "prep_minutes"):
+        if window.get(key) is not None:
+            figures.add(float(window[key]))
     return figures
 
 
@@ -274,10 +383,18 @@ def render_summary(facts: dict) -> str:
         parts.append(f"It is currently waiting for {facts['waiting_on']}{so_far}.")
     if facts.get("placed_minutes_ago") is not None:
         parts.append(f"It was placed {_span(facts['placed_minutes_ago'])} ago.")
-    if facts["status"] not in TERMINAL:
+    if facts["status"] not in TERMINAL and not facts.get("delivery_estimate"):
         # Honest about why no verdict is given — and worded without any word `verify_no_verdict` rejects,
-        # so this fallback can never fail its own check.
+        # so this fallback can never fail its own check. With an estimate, its own "(an estimate, not a
+        # promise)" says it.
         parts.append("No promised delivery time is on record to compare this against.")
+    window = facts.get("delivery_estimate")
+    if window:
+        basis = " based on a typical trip" if window["trip_assumed"] else ""
+        parts.append(
+            f"The platform estimates about {window['minutes_low']} to {window['minutes_high']} more minutes"
+            f"{basis} (an estimate, not a promise)."
+        )
     estimate = facts.get("estimate_at_assignment")
     if estimate:
         minutes = f"{estimate['courier_minutes']:g}"
@@ -291,6 +408,62 @@ def render_summary(facts: dict) -> str:
     if facts["unavailable"]:
         parts.append(f"I could not load: {', '.join(facts['unavailable'])}.")
     return " ".join(parts)
+
+
+def render_history(facts: dict) -> str:
+    """The order-history answer, written by rules from the facts alone (the fallback if the model is rejected).
+
+    Every number it states is one of the facts' own counts, so it always passes `check_history`.
+    """
+    total = facts["total_orders"]
+    parts = [
+        f"You have {total} order{'' if total == 1 else 's'} in total: {facts['in_progress']} in progress, "
+        f"{facts['delivered']} delivered and {facts['cancelled']} cancelled."
+    ]
+    shown = facts["recent_orders"]
+    if shown:
+        lines = []
+        for order in shown:
+            items = ", ".join(order["items"]) or "items not listed"
+            lines.append(f"{order['restaurant']} ({items}, {order['total']}): {order['status']}, placed {order['placed']}")
+        label = "Your most recent order is" if len(shown) == 1 else f"Your {len(shown)} most recent orders are"
+        parts.append(f"{label}: " + "; ".join(lines) + ".")
+    if facts["unavailable"]:
+        parts.append(f"I could not load: {', '.join(facts['unavailable'])}.")
+    return " ".join(parts)
+
+
+def history_counts(facts: dict) -> set[int]:
+    """The counts an order-history answer may state: the totals, and how many orders are listed."""
+    return {
+        facts["total_orders"],
+        facts["in_progress"],
+        facts["delivered"],
+        facts["cancelled"],
+        facts["recent_orders_shown"],
+    }
+
+
+def check_history(text: str, facts: dict):
+    """Hold an order-history answer against its facts: every count, price and "N minutes" must be one the
+    facts carry, and it may not judge an order late or on time.
+
+    Not checked: which state belongs to which order. A model that said the wrong order was delivered would
+    pass if the counts add up; the prompt forbids it and the ceiling is stated, as for food answers (D63).
+    """
+    from ai.llm.guardrails import verify_counts, verify_no_verdict, verify_prices, verify_quantities
+
+    prices = {float(order["total"].lstrip("$")) for order in facts["recent_orders"]}
+    minutes = {float(o["placed_minutes_ago"]) for o in facts["recent_orders"] if o["placed_minutes_ago"] is not None}
+    verdict = verify_counts(text, counts=history_counts(facts))
+    for extra in (
+        verify_prices(text, prices=prices),
+        verify_quantities(text, quantities=minutes),
+        verify_no_verdict(text),
+    ):
+        verdict.ok = verdict.ok and extra.ok
+        verdict.violations += extra.violations
+    return verdict
 
 
 def check_explanation(text: str, facts: dict):

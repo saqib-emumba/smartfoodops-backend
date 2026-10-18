@@ -29,6 +29,8 @@ from order.repositories.sql import (
     SELECT_BY_STATUS,
     SELECT_KITCHEN_DECIDED_AT,
     SELECT_KITCHEN_QUEUE,
+    SELECT_CUSTOMER_RECENT,
+    SELECT_CUSTOMER_STATUS_COUNTS,
     SELECT_LATEST_FOR_CUSTOMER,
     SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS,
     SELECT_LINE_ITEM_OPTIONS_FOR_LINE_ITEMS,
@@ -86,6 +88,17 @@ class OrderRepository(Repository):
         else:
             row = self.one(SELECT_LATEST_FOR_CUSTOMER_WITH_STATUS, (str(customer_id), status))
         return row["id"] if row else None
+
+    def customer_summary(self, customer_id: UUID, limit: int = 5) -> dict:
+        """A customer's order counts by status and their newest `limit` orders, items attached.
+
+        Counts come from one grouped query and cover *every* order; `recent` is only the newest few, so a
+        caller can say "you have 12 orders, the latest three are..." without reading all twelve.
+        """
+        by_status = {row["status"]: int(row["n"]) for row in self.all(SELECT_CUSTOMER_STATUS_COUNTS, (str(customer_id),))}
+        recent = self.all(SELECT_CUSTOMER_RECENT, (str(customer_id), limit))
+        self._attach_items(recent)
+        return {"by_status": by_status, "recent": recent}
 
     def find_by_idempotency_key(self, key: str) -> dict | None:
         order = self.one(SELECT_BY_KEY, (key,))

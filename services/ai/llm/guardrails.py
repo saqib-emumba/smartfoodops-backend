@@ -30,7 +30,19 @@ _PRICE = re.compile(r"\$\s?(\d+(?:\.\d{1,2})?)|(?<![\d.$])(\d+\.\d{2})(?!\d)(?!\
 
 def _prices_in(text: str) -> list[str]:
     return [m.group(1) or m.group(2) for m in _PRICE.finditer(text)]
-_QUANTITY = re.compile(r"(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|km)\b", re.I)
+# "12 minutes", "12 more minutes", "4.3 km" — and a range, "20 to 30 minutes" / "20-30 minutes", whose *both* ends are
+# figures (reading only the number beside the unit would let an invented low end through).
+_UNIT = r"(?:more\s+|extra\s+|additional\s+)?(?:minutes?|mins?|km)\b"
+_QUANTITY = re.compile(rf"(\d+(?:\.\d+)?)\s*{_UNIT}", re.I)
+_QUANTITY_RANGE = re.compile(rf"(\d+(?:\.\d+)?)\s*(?:to|-|–|—)\s*(\d+(?:\.\d+)?)\s*{_UNIT}", re.I)
+
+
+def quantities_stated(text: str) -> list[str]:
+    """Every figure in `text` that sits before a time or distance unit, both ends of a range included."""
+    figures = list(_QUANTITY.findall(text))
+    for low, high in _QUANTITY_RANGE.findall(text):
+        figures.append(low)  # the high end was already read by `_QUANTITY`
+    return figures
 _TRAILING = re.compile(r"[\s\.,;:!?'’]+$|['’]s$")
 
 
@@ -49,6 +61,16 @@ class Verdict:
     def add(self, kind: str, detail: str) -> None:
         self.ok = False
         self.violations.append((kind, detail))
+
+
+def _is_figure(span: str) -> bool:
+    """A bold span that is only a price or a time ("$10.00", "20 to 30 minutes"): no letters once the units go.
+
+    The prompt asks for bold on names and nothing else, but a model sometimes bolds a figure too. That is not a
+    claim that a dish by that name exists, and the price and quantity checks already hold the figure itself to the
+    context, so judging it as a name would only reject a good answer for its typography.
+    """
+    return not re.search(r"[a-z]", re.sub(r"\b(?:minutes?|mins?|km|to|more)\b", "", span.lower()))
 
 
 def name_families(names: set[str]) -> set[str]:
@@ -139,9 +161,11 @@ def verify_food_answer(
     prices: set[float],
     offers: list[tuple[str, str, float]] | None = None,
     budget: float | None = None,
+    quantities: set[float] | None = None,
 ) -> Verdict:
     """Every bold name must be a name in the context; every price must be a price in it; and, given
-    `offers`, a dish, its restaurant and its price must belong together (see `verify_pairings`).
+    `offers`, a dish, its restaurant and its price must belong together (see `verify_pairings`). Given
+    `quantities`, every "N minutes" / "N km" must be a figure the context carried (or the customer's own).
 
     `names` are already normalised; `prices` includes anything legitimately restated from the
     question (a stated budget), because "under $15" is not an invented price.
@@ -150,7 +174,7 @@ def verify_food_answer(
     families = name_families(names)
     for match in _BOLD.finditer(answer):
         span = normalize(match.group(1))
-        if span in names or span in families:
+        if span in names or span in families or _is_figure(span):
             continue
         # A name inside a denial ("I can't find **X**", "there is no **X**") is not a claim that X exists. Claude
         # echoed the restaurant a customer asked about, bolded, while saying it had no information on it; the
@@ -166,15 +190,63 @@ def verify_food_answer(
         pairing = verify_pairings(answer, offers=offers, budget=budget)
         verdict.ok = verdict.ok and pairing.ok
         verdict.violations += pairing.violations
+    if quantities is not None:
+        measured = verify_quantities(answer, quantities=quantities)
+        verdict.ok = verdict.ok and measured.ok
+        verdict.violations += measured.violations
     return verdict
 
 
 def verify_quantities(answer: str, *, quantities: set[float]) -> Verdict:
     """Every "N minutes" / "N km" in an explanation must be a figure the facts carried."""
     verdict = Verdict()
-    for raw in _QUANTITY.findall(answer):
+    for raw in quantities_stated(answer):
         if not any(abs(float(raw) - known) < 0.05 for known in quantities):
             verdict.add("unknown_quantity", raw)
+    return verdict
+
+
+_NUMBER_WORDS = {
+    word: value
+    for value, word in enumerate(
+        "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+        "sixteen seventeen eighteen nineteen twenty".split()
+    )
+}
+_NUMBER = r"(\d+|" + "|".join(_NUMBER_WORDS) + r")"
+_STATE = r"(?:pending|in[- ]progress|active|open|delivered|cancell?ed|completed|refunded)"
+# "3 orders", "2 pending orders", "one delivered order" — a number in front of the word order(s), with at most
+# a couple of describing words between. And "2 in progress", "1 delivered" — a number straight before a state.
+_COUNT_CLAIMS = (
+    re.compile(rf"\b{_NUMBER}\s+(?:[\w-]+\s+){{0,2}}orders?\b", re.I),
+    re.compile(rf"\b{_NUMBER}\s+(?:are\s+|is\s+|of them\s+(?:are\s+)?)?{_STATE}\b", re.I),
+)
+
+
+def verify_counts(answer: str, *, counts: set[int]) -> Verdict:
+    """Every "N orders" / "N delivered" claim must be a count the facts carried.
+
+    Digits and spelled-out numbers are both read ("two pending orders"), because a model that was told to
+    copy numbers exactly still writes small ones as words. Only a number sitting directly before the word
+    order(s) or a status is a count claim, so an item quantity ("2 x Burger") or a price is left to its own check.
+    """
+    verdict = Verdict()
+    for pattern in _COUNT_CLAIMS:
+        for match in pattern.finditer(answer):
+            raw = match.group(1).lower()
+            value = int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]
+            if value not in counts:
+                verdict.add("unknown_count", raw)
+    return verdict
+
+
+def verify_prices(answer: str, *, prices: set[float]) -> Verdict:
+    """Every price in an answer must be one the facts carried (a standalone form of the check inside
+    `verify_food_answer`, for answers that have no dish names to check)."""
+    verdict = Verdict()
+    for raw in _prices_in(answer):
+        if not any(abs(float(raw) - known) < 0.005 for known in prices):
+            verdict.add("unknown_price", f"${raw}")
     return verdict
 
 

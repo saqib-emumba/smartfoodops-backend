@@ -175,6 +175,7 @@ INSERT INTO permissions (name, description) VALUES
 ('payment:create',     'Pay for an order directly, outside the saga'),
 ('payment:read',       'Read a payment belonging to an order the caller owns'),
 ('restaurant:onboard', 'Register a restaurant and become its admin'),
+('restaurant:update',  'Change settings of a restaurant the caller owns, such as its preparation time (D68)'),
 ('menu:write',         'Publish or replace a restaurant menu'),
 ('kitchen:read',       'Read a restaurant kitchen queue'),
 ('kitchen:decide',     'Accept or reject an order on behalf of a restaurant'),
@@ -211,6 +212,7 @@ FROM (VALUES
     ('customer',         'ai:explain_order'),
     ('customer',         'order:review'),
     ('restaurant_admin', 'restaurant:onboard'),
+    ('restaurant_admin', 'restaurant:update'),
     ('restaurant_admin', 'menu:write'),
     ('restaurant_admin', 'kitchen:read'),
     ('restaurant_admin', 'kitchen:decide'),
@@ -266,6 +268,7 @@ FROM (VALUES
     ('POST',  '/api/v1/payments',                          'payment:create',     'Direct payment'),
     ('GET',   '/api/v1/payments/{payment_id}',              'payment:read',       'Payment state; ownership settled by reading its order as the caller'),
     ('POST',  '/api/v1/restaurants/onboard',               'restaurant:onboard', 'Restaurant onboarding'),
+    ('PATCH', '/api/v1/restaurants/{restaurant_id}',        'restaurant:update',  'Change a restaurant''s settings; ownership checked in the handler'),
     ('POST',  '/api/v1/menus',                             'menu:write',         'Publish a menu'),
     ('GET',   '/api/v1/orders/kitchen/{restaurant_id}',    'kitchen:read',       'Kitchen queue'),
     ('POST',  '/api/v1/orders/{order_id}/accept',          'kitchen:decide',     'Kitchen accepts'),
@@ -333,6 +336,10 @@ CREATE TABLE IF NOT EXISTS restaurants (
     longitude DECIMAL(9, 6) NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     capacity INT NOT NULL DEFAULT 50,
+    -- How long the kitchen takes to prepare an order, in minutes. One figure per restaurant, set by its owner: the
+    -- delivery-time estimate the AI assistant gives a customer is this plus the courier's trip (D68). The default is
+    -- a stand-in until an owner sets their own.
+    prep_time_minutes INT NOT NULL DEFAULT 15 CHECK (prep_time_minutes BETWEEN 1 AND 120),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );

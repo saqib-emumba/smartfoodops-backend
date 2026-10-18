@@ -51,11 +51,11 @@ from ai.assistant.agents.context import (
 )
 from ai.assistant.agents.router import parse_router
 from ai.clients.order import OrderServiceClient
-from ai.llm.guardrails import mentioned, verify_food_answer
+from ai.llm.guardrails import mentioned, quantities_stated, verify_food_answer
 from ai.llm.provider import call_model, stream_model
 from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 from ai.assistant.memory import ConversationStore
-from ai.assistant.order_explainer import OrderExplainer, check_explanation
+from ai.assistant.order_explainer import OrderExplainer, check_explanation, check_history
 from ai.retrieval.rag_context import RagContextAssembler
 from ai.schemas.rag import RagContextRequest
 
@@ -138,6 +138,7 @@ class Assistant:
             ("refuse", self._refuse),
             ("retrieve_food", self._retrieve_food),
             ("retrieve_order", self._retrieve_order),
+            ("retrieve_history", self._retrieve_history),
             ("generate", self._generate),
             ("guardrail", self._guardrail),
         ):
@@ -146,16 +147,19 @@ class Assistant:
         graph.add_edge(START, "router")
         graph.add_conditional_edges(
             "router",
-            lambda s: {"out_of_scope": "refuse", "order_tracking": "retrieve_order"}.get(
-                s["intent"], "retrieve_food"
-            ),
-            ["refuse", "retrieve_order", "retrieve_food"],
+            lambda s: {
+                "out_of_scope": "refuse",
+                "order_tracking": "retrieve_order",
+                "order_history": "retrieve_history",
+            }.get(s["intent"], "retrieve_food"),
+            ["refuse", "retrieve_order", "retrieve_history", "retrieve_food"],
         )
         # Retrieval that found nothing has already set the answer, so it ends the run: the model
         # is not called with nothing to ground it.
         found = lambda s: END if s.get("outcome") == "no_results" else "generate"  # noqa: E731
         graph.add_conditional_edges("retrieve_food", found, [END, "generate"])
         graph.add_conditional_edges("retrieve_order", found, [END, "generate"])
+        graph.add_conditional_edges("retrieve_history", found, [END, "generate"])
         graph.add_edge("generate", "guardrail")
         for terminal in ("refuse", "guardrail"):
             graph.add_edge(terminal, END)
@@ -237,13 +241,20 @@ class Assistant:
         order_id = order_id or await self._explainer.latest_order_id(user)
         if order_id is None:
             return {"answer": NO_ORDERS, "outcome": "no_results", "recommended_item_ids": [], "recommended_restaurant_ids": []}
-        facts = await self._explainer.facts(order_id, user)
+        here = (state["latitude"], state["longitude"]) if state.get("latitude") is not None else None
+        facts = await self._explainer.facts(order_id, user, here)
+        return {"facts": facts}
+
+    async def _retrieve_history(self, state: AssistantState):
+        facts = await self._explainer.history_facts(state["user"])
+        if facts is None:
+            return {"answer": NO_ORDERS, "outcome": "no_results", "recommended_item_ids": [], "recommended_restaurant_ids": []}
         return {"facts": facts}
 
     async def _generate(self, state: AssistantState):
         writer = get_stream_writer()
-        if state["intent"] == "order_tracking":
-            system = prompts.EXPLAIN
+        if state["intent"] in ("order_tracking", "order_history"):
+            system = prompts.HISTORY if state["intent"] == "order_history" else prompts.EXPLAIN
             block = f"FACTS: {json.dumps(state['facts'], default=str)}"
         else:
             system = prompts.ASSISTANT
@@ -261,14 +272,22 @@ class Assistant:
 
     async def _guardrail(self, state: AssistantState):
         draft = state["draft"]
-        if state["intent"] == "order_tracking":
-            verdict = check_explanation(draft, state["facts"])
+        if state["intent"] in ("order_tracking", "order_history"):
+            check = check_history if state["intent"] == "order_history" else check_explanation
+            verdict = check(draft, state["facts"])
             fallback = state["facts"]["plain_summary"]
             catalogue = None
         else:
             food = state["food"]
+            # Figures the customer typed themselves ("under 20 minutes") are theirs, not inventions.
+            asked = {float(n) for n in quantities_stated(state["question"])}
             verdict = verify_food_answer(
-                draft, names=food.names, prices=food.prices, offers=food.offers, budget=food.budget
+                draft,
+                names=food.names,
+                prices=food.prices,
+                offers=food.offers,
+                budget=food.budget,
+                quantities=food.quantities | asked,
             )
             fallback = render_food_fallback(food)
             catalogue = food

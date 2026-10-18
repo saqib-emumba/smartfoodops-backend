@@ -26,6 +26,9 @@ class FoodContext:
     # (dish, restaurant, price), names normalised: what the guardrail checks pairings against.
     offers: list[tuple[str, str, float]] = field(default_factory=list)
     budget: float | None = None
+    # Every "N minutes" / "N km" the context carries: the courier estimates and distances. What the guardrail
+    # lets an answer quote.
+    quantities: set[float] = field(default_factory=set)
 
 
 def _distinct(rows, key):
@@ -81,6 +84,8 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
         : config.ASSISTANT_TOP_K
     ]:
         entry = {"name": restaurant.name, "address": restaurant.address, "distance_km": restaurant.distance_km}
+        if restaurant.distance_km is not None:
+            context.quantities.add(float(restaurant.distance_km))
         stats = ratings.get(str(restaurant.restaurant_id))
         if stats and stats["review_count"]:
             entry["average_rating"] = stats["average_rating"]
@@ -105,6 +110,7 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
                 "restaurant": restaurant_names[str(c.restaurant_id)],
                 "available_riders": c.available_riders,
                 "nearest_km": c.nearest_available_km,
+                "delivery_estimate": c.delivery_estimate,
             }
             for c in body.courier_availability
             if str(c.restaurant_id) in restaurant_names
@@ -112,6 +118,12 @@ def build_food_context(body: RagContextResponse, ratings: dict[str, dict], max_p
         ],
         lambda c: (normalize(c["restaurant"]), c["available_riders"], c["nearest_km"]),
     )
+    for c in couriers:
+        if c["nearest_km"] is not None:
+            context.quantities.add(float(c["nearest_km"]))
+        for key in ("minutes_low", "minutes_high", "prep_minutes"):
+            if (c["delivery_estimate"] or {}).get(key) is not None:
+                context.quantities.add(float(c["delivery_estimate"][key]))
 
     context.budget = max_price
     if max_price is not None:
