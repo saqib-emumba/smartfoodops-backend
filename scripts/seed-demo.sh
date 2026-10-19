@@ -36,10 +36,12 @@ OWNER_EMAIL="demo.owner@smartfoodops.demo"
 RIDER_EMAIL="demo.rider@smartfoodops.demo"
 RIDER2_EMAIL="demo.rider2@smartfoodops.demo"
 
-# A city no other test in this repository uses, so the demo rider is the only one near the demo kitchen and
-# dispatch cannot hand the order to a rider left over from another run.
-REST_LAT=24.8607
-REST_LON=67.0011
+# Islamabad, about 10 km from the 33.70, 73.00 the smoke and Postman tests put their riders at, so the demo riders
+# are the only ones near the demo kitchen and dispatch cannot hand the order to a rider left over from another run.
+# Override to demo from another city: REST_LAT=24.8607 REST_LON=67.0011 (Karachi).
+REST_LAT="${REST_LAT:-33.6500}"
+REST_LON="${REST_LON:-73.0900}"
+RIDER2_LAT=$(python3 -c "print(round($REST_LAT + 0.009, 6))")   # about a kilometre north
 
 BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; RED=$'\033[31m'; RESET=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
@@ -158,7 +160,7 @@ setup() {
     call GET "/restaurants/$REST_ID" "" "$CUSTOMER_TOKEN"; [[ "$CODE" == "200" ]] || REST_ID=""
   fi
   if [[ -z "$REST_ID" ]]; then
-    call POST /restaurants/onboard "{\"name\":\"Demo Kitchen\",\"address\":\"1 Demo Street, Karachi\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":50,\"prep_time_minutes\":20}" "$OWNER_TOKEN"
+    call POST /restaurants/onboard "{\"name\":\"Demo Kitchen\",\"address\":\"1 Demo Street, Islamabad\",\"latitude\":$REST_LAT,\"longitude\":$REST_LON,\"capacity\":50,\"prep_time_minutes\":20}" "$OWNER_TOKEN"
     [[ "$CODE" == "201" ]] || die "could not onboard the restaurant ($CODE): $BODY"
     REST_ID=$(jget "$BODY" "['body']['id']"); state_set restaurant_id "$REST_ID"
   fi
@@ -186,13 +188,15 @@ JSON
   step "Rider"
   call POST /riders "{\"vehicle_type\":\"motorbike\",\"vehicle_number\":\"DEMO-001\",\"current_latitude\":$REST_LAT,\"current_longitude\":$REST_LON}" "$RIDER_TOKEN"
   [[ "$CODE" == "201" || "$CODE" == "409" ]] || die "could not register the rider ($CODE): $BODY"
-  call PATCH /riders/me/location "{\"latitude\":$REST_LAT,\"longitude\":$REST_LON}" "$RIDER_TOKEN"
+  call PATCH /riders/me/location "{\"current_latitude\":$REST_LAT,\"current_longitude\":$REST_LON}" "$RIDER_TOKEN"
+  [[ "$CODE" == "200" ]] || die "could not place the rider ($CODE): $BODY"
   call PATCH /riders/me/availability '{"is_available":true}' "$RIDER_TOKEN"
   call GET /riders/me "" "$RIDER_TOKEN"; RIDER_ID=$(jget "$BODY" "['body']['id']")
   # The second rider is about a kilometre away, so dispatch prefers the first when both are free.
-  call POST /riders "{\"vehicle_type\":\"bicycle\",\"vehicle_number\":\"DEMO-002\",\"current_latitude\":24.8697,\"current_longitude\":$REST_LON}" "$RIDER2_TOKEN"
+  call POST /riders "{\"vehicle_type\":\"bicycle\",\"vehicle_number\":\"DEMO-002\",\"current_latitude\":$RIDER2_LAT,\"current_longitude\":$REST_LON}" "$RIDER2_TOKEN"
   [[ "$CODE" == "201" || "$CODE" == "409" ]] || die "could not register the second rider ($CODE): $BODY"
-  call PATCH /riders/me/location "{\"latitude\":24.8697,\"longitude\":$REST_LON}" "$RIDER2_TOKEN"
+  call PATCH /riders/me/location "{\"current_latitude\":$RIDER2_LAT,\"current_longitude\":$REST_LON}" "$RIDER2_TOKEN"
+  [[ "$CODE" == "200" ]] || die "could not place the second rider ($CODE): $BODY"
   call PATCH /riders/me/availability '{"is_available":true}' "$RIDER2_TOKEN"
   call GET /riders/me "" "$RIDER2_TOKEN"; RIDER2_ID=$(jget "$BODY" "['body']['id']")
   ok "two riders on shift near the restaurant"

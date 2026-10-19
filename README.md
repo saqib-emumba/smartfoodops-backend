@@ -1494,6 +1494,7 @@ smartfoodops-backend/
 │                                #                (Redis), deps
 │                                #   Two containers, one image (Weeks 4-5, D59-D65)  (:8009)
 ├── scripts/
+│   ├── seed-restaurants.sh     # Ten more restaurants (Chinese, Thai, Japanese, Italian, Arabic, Korean, Indian, Mexican, healthy, fast food) with 57 tagged dishes
 │   ├── seed-demo.sh            # A demo customer with delivered, cancelled and in-progress orders (see readme/interview-demo-guide.md)
 │   ├── smoke-test.sh           # End-to-end assertions across the whole stack
 │   ├── saga-resilience-test.sh # Concurrency, durability and lost-signal recovery

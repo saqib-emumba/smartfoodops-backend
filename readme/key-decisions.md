@@ -2244,9 +2244,9 @@ connection, so the shared pool in `common` needed no change.
 ### D60 — Menu items carry owner-declared tags from a fixed vocabulary
 
 **Decided:** `menu_items.dietary_tags TEXT[]`, declared by the owner on `POST /api/v1/menus` from a
-fixed vocabulary in `common/dietary.py` — 40 tags in seven groups: diets (vegan, keto, …), religious
-(halal, kosher), allergen-free (gluten-free, nut-free, …), cuisine (pakistani, italian, …), format
-(fast-food, bbq), dish type (steak, burger, pizza, …) and meal style (light-meal, comfort-meal, hot,
+fixed vocabulary in `common/dietary.py` — 52 tags in seven groups: diets (vegan, keto, …), religious
+(halal, kosher), allergen-free (gluten-free, nut-free, …), cuisine (pakistani, italian, korean, …), format
+(fast-food, bbq), dish type (steak, burger, soup, noodles, dessert, …) and meal style (light-meal, comfort-meal, hot,
 warm, spicy). They are lower-cased, de-duplicated and validated on publish — an unknown tag is a
 `422`, and so is one in a search filter. Nothing is inferred.
 
