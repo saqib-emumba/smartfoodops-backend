@@ -223,7 +223,7 @@ returns a LangChain model for the configured provider.
 | Stage | Model? | What it does | File |
 |---|---|---|---|
 | **Memory** | no | Loads this user's earlier messages for this conversation (max 12, 1 hour) from Redis | [ai/assistant/memory.py](../services/ai/assistant/memory.py) |
-| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `order_history`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/assistant/agents/router.py](../services/ai/assistant/agents/router.py), prompt in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
+| **Router** | yes | Returns JSON: intent (`food_discovery`, `order_tracking`, `order_history`, `restaurant_support`, `out_of_scope`), budget, dietary tags, order id, a **cleaned search phrase** (so chatty filler does not sink the similarity score), a **named restaurant** (scopes the search to its menu) and a **distance limit**. Parsed defensively: unknown tags dropped, bad JSON becomes plain food discovery | [ai/assistant/agents/router.py](../services/ai/assistant/agents/router.py), prompt in [ai/assistant/agents/prompts.py](../services/ai/assistant/agents/prompts.py) |
 | **Retrieve (food)** | no | Calls the RAG assembler with the router's budget and tags, the similarity floor (`ASSISTANT_MIN_SCORE` 0.30), and a follow-up-aware query (a short follow-up like "and vegan?" is joined to the previous question). Fetches 18 candidates, **drops repeats** (same dish, restaurant name and price), keeps the best 6 | [ai/assistant/agents/graph.py](../services/ai/assistant/agents/graph.py), [ai/assistant/agents/context.py](../services/ai/assistant/agents/context.py) |
 | **Retrieve (order)** | no | Gathers the facts for **one** order: the one named, the latest, or (for a cancellation or refund question with no id) the latest *cancelled* one (section 7) |
 | **Retrieve (history)** | no | For "how many pending orders do I have?" and "what did I order last time?": the customer's counts by state (over every order) and their newest five orders, from one internal Order Service route (section 7) | [ai/assistant/order_explainer.py](../services/ai/assistant/order_explainer.py) |
@@ -348,6 +348,16 @@ only those counts (section 6, `verify_counts`), and the prompt tells the model "
 refund, anything from a log's free-text `detail`, any rider identity.
 
 ---
+
+### What the food path does with the router's output (D69)
+
+| Router field | Effect |
+|---|---|
+| `search_query` | The vector search runs on it instead of the raw question ("light meal" scores 0.49 against a salad; "something light for a warm afternoon" scores 0.22 and used to miss the 0.30 floor) |
+| `restaurant_name` | Resolved to restaurant ids by `RagContextAssembler.resolve_restaurants` (the whole name, or the name plus more words: branches of one restaurant). The search is scoped to those ids, with no similarity floor. No match: "I couldn't find a restaurant called X" |
+| `max_distance_km` | A hard filter on live restaurant coordinates (`Retriever`, `near`). No shared location: the model is told to say it cannot filter by distance |
+| *(question wording)* "based on what I ordered before", "my usual", "last time" | The dishes in the customer's newest orders become the search and are passed to the model by name only |
+| *(question wording)* "Order #102", "order number 42" | A fixed reply: orders are identified by a long id, and answering about the latest order would be a different order from the one asked about |
 
 ### Delivery-time estimate (D68)
 

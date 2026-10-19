@@ -50,7 +50,7 @@ def search(
                 top_k=payload.top_k,
                 max_price=payload.max_price,
                 tags=payload.dietary_filters,
-                restaurant_id=payload.restaurant_id,
+                restaurant_ids=[str(payload.restaurant_id)] if payload.restaurant_id else None,
                 min_score=payload.min_score,
             )
     except Exception:

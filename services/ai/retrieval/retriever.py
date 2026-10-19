@@ -32,6 +32,7 @@ from ai import config
 from ai.clients.menu import MenuServiceClient
 from ai.clients.restaurant import RestaurantServiceClient
 from ai.repositories.vectors import VectorRepository
+from ai.retrieval.geo import haversine_km
 
 
 class _Live:
@@ -60,6 +61,17 @@ class _Live:
 
     def menu(self, rid: str) -> dict[str, tuple[str, dict]]:
         return self._menus.get(rid) or {}
+
+
+def _within(restaurant: dict, near: tuple[float, float, float] | None) -> bool:
+    """True if no distance limit was asked for, or the restaurant is inside it. A restaurant with no recorded
+    location cannot be shown to be inside a limit, so it is outside."""
+    if near is None:
+        return True
+    if restaurant.get("latitude") is None:
+        return False
+    lat, lon, max_km = near
+    return haversine_km(lat, lon, float(restaurant["latitude"]), float(restaurant["longitude"])) <= max_km
 
 
 def _passes(item: dict, max_price: float | None, tags: list[str]) -> bool:
@@ -115,10 +127,15 @@ class Retriever:
         top_k: int,
         max_price: float | None = None,
         tags: list[str] | None = None,
-        restaurant_id: str | None = None,
+        restaurant_ids: list[str] | None = None,
         min_score: float | None = None,
+        near: tuple[float, float, float] | None = None,
     ) -> tuple[list[dict], list[dict]]:
-        """`(item_rows, restaurant_rows)`, best first, every fact read live."""
+        """`(item_rows, restaurant_rows)`, best first, every fact read live.
+
+        `near` is `(latitude, longitude, max_km)`: only restaurants within that distance of the point survive,
+        the same way a price or tag limit does (a hard filter on live facts, so it can shrink a result below `top_k`).
+        """
         tags = list(tags or [])
         live = _Live(self)  # shared by both passes, so a restaurant is read at most once
         limits = [config.SEARCH_CANDIDATES]
@@ -126,13 +143,13 @@ class Retriever:
             limits.append(config.SEARCH_MAX_CANDIDATES)
         for limit in limits:
             item_candidates = self._vectors.nearest_items(
-                vector, limit=limit, restaurant_id=restaurant_id, min_score=min_score
+                vector, limit=limit, restaurant_ids=restaurant_ids, min_score=min_score
             )
             restaurant_candidates = self._vectors.nearest_restaurants(
-                vector, limit=limit, restaurant_id=restaurant_id, min_score=min_score
+                vector, limit=limit, restaurant_ids=restaurant_ids, min_score=min_score
             )
-            items = self._items(item_candidates, live, top_k, max_price, tags)
-            restaurants = self._restaurant_rows(restaurant_candidates, live, top_k, max_price, tags)
+            items = self._items(item_candidates, live, top_k, max_price, tags, near)
+            restaurants = self._restaurant_rows(restaurant_candidates, live, top_k, max_price, tags, near)
             # A full result, or a candidate list that was not even full (so there is nothing more to
             # look at), is final. Otherwise the filters were selective enough to eat the candidates:
             # look again, wider, once.
@@ -142,7 +159,7 @@ class Retriever:
                 break
         return items, restaurants
 
-    def _items(self, candidates, live: _Live, top_k, max_price, tags) -> list[dict]:
+    def _items(self, candidates, live: _Live, top_k, max_price, tags, near=None) -> list[dict]:
         by_restaurant: dict[str, list[dict]] = {}
         for candidate in candidates:  # already best first, so each list is too
             by_restaurant.setdefault(str(candidate["restaurant_id"]), []).append(candidate)
@@ -154,7 +171,7 @@ class Retriever:
             position += len(wave)
             live.load(wave)
             for rid in wave:
-                found.extend(self._item_rows(rid, by_restaurant[rid], live, max_price, tags))
+                found.extend(self._item_rows(rid, by_restaurant[rid], live, max_price, tags, near))
             found.sort(key=lambda row: row["score"], reverse=True)
             if len(found) >= top_k:
                 # Stop unless a restaurant not yet read could still place a dish above the k-th.
@@ -162,9 +179,9 @@ class Retriever:
                     break
         return found[:top_k]
 
-    def _item_rows(self, rid, candidates, live: _Live, max_price, tags) -> list[dict]:
+    def _item_rows(self, rid, candidates, live: _Live, max_price, tags, near=None) -> list[dict]:
         restaurant = live.restaurant(rid)
-        if restaurant is None:
+        if restaurant is None or not _within(restaurant, near):
             return []
         menu = live.menu(rid)
         rows = []
@@ -192,7 +209,7 @@ class Retriever:
             )
         return rows
 
-    def _restaurant_rows(self, candidates, live: _Live, top_k, max_price, tags) -> list[dict]:
+    def _restaurant_rows(self, candidates, live: _Live, top_k, max_price, tags, near=None) -> list[dict]:
         """Active restaurants with at least one dish a customer could order under the same filters."""
         rows: list[dict] = []
         position = 0
@@ -203,7 +220,7 @@ class Retriever:
             for candidate in wave:
                 rid = str(candidate["restaurant_id"])
                 restaurant = live.restaurant(rid)
-                if restaurant is None:
+                if restaurant is None or not _within(restaurant, near):
                     continue
                 if not any(_passes(item, max_price, tags) for _, item in live.menu(rid).values()):
                     continue

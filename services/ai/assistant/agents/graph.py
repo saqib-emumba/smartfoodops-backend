@@ -45,13 +45,16 @@ from ai.assistant.agents.context import (
     NO_RESULTS,
     REFUSAL,
     SEARCH_UNAVAILABLE,
+    UNKNOWN_ORDER_REF,
     FoodContext,
     build_food_context,
+    no_results_message,
     render_food_fallback,
+    restaurant_not_found,
 )
 from ai.assistant.agents.router import parse_router
 from ai.clients.order import OrderServiceClient
-from ai.llm.guardrails import mentioned, quantities_stated, verify_food_answer
+from ai.llm.guardrails import mentioned, normalize, quantities_stated, verify_food_answer
 from ai.llm.provider import call_model, stream_model
 from ai.metrics import GUARDRAIL_VIOLATIONS_TOTAL
 from ai.assistant.memory import ConversationStore
@@ -69,6 +72,17 @@ _HISTORY_FOR_GENERATION = 6
 _ABOUT_CANCELLATION = re.compile(r"\b(cancel+ed|cancel+ation|refund(?:ed)?|reject(?:ed)?|money back)\b", re.I)
 
 
+# A food question that leans on what the customer ordered before ("something like my last order", "my usual").
+_PERSONAL = re.compile(
+    r"\b(?:(?:what|that|something|stuff) i (?:ordered|had|got)|ordered before|last time|my usual|"
+    r"(?:previous|past|earlier) orders?|order(?:ed)? again|re-?order|similar to (?:what|my|the)|"
+    r"based on (?:what|my) (?:i|order|history))\b",
+    re.I,
+)
+# "Order #102", "order number 42", "#7": a number is not how orders are identified here.
+_ORDER_NUMBER = re.compile(r"\border\s*(?:no\.?|number|#)\s*\d+\b|#\s*\d{2,}\b", re.I)
+
+
 class AssistantState(TypedDict, total=False):
     # inputs
     question: str
@@ -81,6 +95,9 @@ class AssistantState(TypedDict, total=False):
     max_price: float | None
     dietary_filters: list[str]
     order_id: str | None
+    search_query: str | None
+    restaurant_name: str | None
+    max_distance_km: float | None
     # retrieval
     food: FoodContext
     facts: dict
@@ -179,26 +196,73 @@ class Assistant:
             "max_price": decision.max_price,
             "dietary_filters": decision.dietary_filters,
             "order_id": decision.order_id,
+            "search_query": decision.search_query,
+            "restaurant_name": decision.restaurant_name,
+            "max_distance_km": decision.max_distance_km,
         }
 
     async def _refuse(self, state: AssistantState):
         return {"answer": REFUSAL, "outcome": "refused", "recommended_item_ids": [], "recommended_restaurant_ids": []}
 
+    async def _previous_dishes(self, user: CurrentUser) -> list[str]:
+        """The dish names from the customer's newest orders, distinct, newest first. Empty on any failure: a missing
+        history makes a recommendation less personal, never wrong."""
+        try:
+            summary = await asyncio.to_thread(self._orders.customer_summary, str(user.user_id), 5)
+        except Exception as exc:  # noqa: BLE001 - personalisation is decoration
+            self._logger.warning("Could not read order history for a recommendation: %s", exc)
+            return []
+        names = [item["name"] for order in summary["recent"] for item in order["items"] if item.get("name")]
+        return list(dict.fromkeys(names))[:6]
+
     async def _retrieve_food(self, state: AssistantState):
         question = state["question"]
         previous = [m["content"] for m in state["history"] if m["role"] == "user"]
-        # A short follow-up ("and under $10?") has no meaning alone; retrieve on it with the
-        # question before it.
-        query = f"{previous[-1]}. {question}" if previous and len(question.split()) < 6 else question
+        lat, lon = state.get("latitude"), state.get("longitude")
+
+        # A restaurant named in the question scopes the search to its menu. A name that matches nothing is said
+        # plainly, not answered around: describing other restaurants would be answering a different question.
+        scope: list[str] | None = None
+        if state.get("restaurant_name"):
+            found = await self._rag.resolve_restaurants(state["restaurant_name"])
+            if not found:
+                return {
+                    "answer": restaurant_not_found(state["restaurant_name"]),
+                    "outcome": "no_results",
+                    "recommended_item_ids": [],
+                    "recommended_restaurant_ids": [],
+                }
+            scope = [r["id"] for r in found]
+
+        # What to search for: the router's cleaned phrase if it gave one, else the question. A short follow-up
+        # ("and under $10?") has no meaning alone, so it is joined to the question before it.
+        query = state.get("search_query") or question
+        if previous and len(question.split()) < 6 and not state.get("search_query"):
+            query = f"{previous[-1]}. {question}"
+
+        # "Something like what I ordered before": search for those dishes, and hand the model the list.
+        previous_dishes: list[str] = []
+        if _PERSONAL.search(question):
+            previous_dishes = await self._previous_dishes(state["user"])
+            if previous_dishes:
+                query = ", ".join(previous_dishes)
+
+        # A distance limit needs somewhere to measure from; without a shared location it cannot be applied, and the
+        # model is told to say so rather than quietly ignore it.
+        want_distance = state.get("max_distance_km")
+        location_needed = bool(want_distance) and lat is None
         request = RagContextRequest(
             customer_id=state["user"].user_id,
             prompt_query=query[: config.ASSISTANT_MAX_QUESTION_CHARS],
-            latitude=state.get("latitude"),
-            longitude=state.get("longitude"),
+            latitude=lat,
+            longitude=lon,
             top_k=config.ASSISTANT_CANDIDATES,
             max_price=state.get("max_price"),
             dietary_filters=state.get("dietary_filters") or [],
-            min_score=config.ASSISTANT_MIN_SCORE,
+            # A named restaurant's whole menu is relevant to a question about it, so no similarity floor there.
+            min_score=None if scope else config.ASSISTANT_MIN_SCORE,
+            restaurant_ids=scope,
+            max_distance_km=want_distance if want_distance and lat is not None else None,
         )
         body = await self._rag.assemble(request)
 
@@ -207,12 +271,23 @@ class Assistant:
             ratings = await self._ratings([str(r.restaurant_id) for r in body.restaurants[:3]])
 
         food = build_food_context(body, ratings, state.get("max_price"))
+        if previous_dishes:
+            food.prompt["previous_orders"] = previous_dishes
+            food.names.update(normalize(name) for name in previous_dishes)
+        if location_needed:
+            food.prompt["location_needed"] = True
         update: dict = {"food": food}
         nothing = not food.prompt["items"] and not (
             state["intent"] == "restaurant_support" and food.prompt["restaurants"]
         )
         if nothing:
-            text = SEARCH_UNAVAILABLE if "vector" in body.sources_failed else NO_RESULTS
+            text = (
+                SEARCH_UNAVAILABLE
+                if "vector" in body.sources_failed
+                else no_results_message(
+                    state.get("dietary_filters") or [], state.get("max_price"), request.max_distance_km
+                )
+            )
             update.update(answer=text, outcome="no_results", recommended_item_ids=[], recommended_restaurant_ids=[])
         return update
 
@@ -233,6 +308,9 @@ class Assistant:
     async def _retrieve_order(self, state: AssistantState):
         user = state["user"]
         order_id = state.get("order_id")
+        if order_id is None and _ORDER_NUMBER.search(state["question"]):
+            # Not "the latest order, quietly": that would explain a different order from the one asked about.
+            return {"answer": UNKNOWN_ORDER_REF, "outcome": "no_results", "recommended_item_ids": [], "recommended_restaurant_ids": []}
         if order_id is None and _ABOUT_CANCELLATION.search(state["question"]):
             # "Why was my order cancelled?" with no id means the latest cancelled order, not the latest order
             # (which may be one still in flight). None cancelled falls through to the latest, so the answer

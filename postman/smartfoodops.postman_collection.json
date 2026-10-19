@@ -7355,6 +7355,109 @@
           ]
         },
         {
+          "id": "b55f7e18-f123-4da9-bca6-ddfda1b8395f",
+          "name": "Assistant stream: an order asked for by number is not answered with a different order",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=Explain%20the%20current%20delivery%20status%20of%20Order%20%23102.",
+            "description": "Orders are identified by a long id, not a number. A question naming '#102' used to be answered about the customer's latest order, which is a different order from the one asked about. It now gets a fixed reply, with no model call and nothing invented."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it says orders are not looked up by number\", () => pm.expect(text).to.match(/can.t look an order up by number/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it is a fixed, grounded reply\", () => pm.expect(f.grounded).to.eql(true)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it does not describe any order\", () => pm.expect(text).to.not.match(/courier|restaurant accepted|placed about/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "2c07de77-40d9-4e3c-8f8a-1791658594e9",
+          "name": "Assistant stream: a restaurant that does not exist is said plainly",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=What%20can%20I%20get%20from%20Pizza%20Palace%20Nowhere%3F",
+            "description": "A restaurant named in the question scopes the search to its menu. A name that matches nothing is said plainly rather than answered around: describing other restaurants would answer a different question."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it says it could not find that restaurant\", () => pm.expect(text).to.match(/couldn.t find a restaurant called Pizza Palace Nowhere/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it is a fixed, grounded reply\", () => pm.expect(f.grounded).to.eql(true)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "ce577c02-1566-41da-ad87-47916c7dd68d",
+          "name": "Assistant stream: a vague, chatty food question still finds food",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{cust_token}}"
+              }
+            ],
+            "url": "{{base_url}}/api/v1/ai/assistant/stream?q=something%20light%20for%20a%20warm%20afternoon",
+            "description": "The spec's own motivating example. Conversational filler lowers the vector similarity below the 'nothing matches' floor (0.22 against a salad, where 'light meal' scores 0.49), so the router also returns a cleaned search phrase and the search uses that."
+          },
+          "response": [],
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status is 200\", () => pm.response.to.have.status(200));",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"routed as food discovery\", () => pm.expect(f.intent).to.eql(\"food_discovery\")); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const f = events[events.length - 1]; const text = (f.grounded === false && f.replacement) ? f.replacement : events.map(e => e.token).join(''); pm.test(\"it finds something instead of saying nothing matches\", () => pm.expect(text).to.not.match(/couldn.t find anything on the current menus that matches that/i)); }",
+                  "{ const events = pm.response.text().split(\"\\n\").filter(l => l.startsWith(\"data: \")).map(l => JSON.parse(l.slice(6))); const streamed = events.map(e => e.token).join(''); const last = events[events.length - 1] || {};\npm.visualizer.set(`\n<style>body{font-family:-apple-system,Segoe UI,sans-serif;padding:14px;max-width:760px} .box{border-left:4px solid #2e7d32;background:#f4f9f4;padding:10px 14px;margin:8px 0;white-space:pre-wrap}\n.bad{border-color:#c62828;background:#fdf3f3} .meta{color:#555;font-size:12px} b.tag{background:#eee;border-radius:3px;padding:1px 6px;margin-right:4px}</style>\n<div class=\"meta\"><b class=\"tag\">intent: {{intent}}</b><b class=\"tag\">grounded: {{grounded}}</b><b class=\"tag\">chunks: {{chunks}}</b></div>\n<div class=\"box {{#unless grounded}}bad{{/unless}}\"><b>What streamed:</b>\\n{{streamed}}</div>\n{{#if replacement}}<div class=\"box\"><b>Replacement the client shows instead:</b>\\n{{replacement}}</div>{{/if}}\n{{#if error}}<div class=\"box bad\"><b>Error:</b> {{error}}</div>{{/if}}`,\n{ intent: last.intent, grounded: last.grounded, chunks: events.length, streamed: streamed, replacement: last.replacement, error: last.error }); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "id": "070c2c02-60c9-4ebd-a88e-83c282510cd1",
           "name": "Explain a rejected order: cause and refund",
           "request": {

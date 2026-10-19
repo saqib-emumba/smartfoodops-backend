@@ -6,7 +6,7 @@ tags or whether a restaurant is open. Those are read live from the Menu and Rest
 `ai.retrieval.retriever`, which asks this class for more candidates than it needs and filters them.
 
 `min_score` bounds the cosine *distance*, the same expression the HNSW index orders by, so a
-similarity floor costs nothing extra. `restaurant_id` scopes a search to one restaurant; that is
+similarity floor costs nothing extra. `restaurant_ids` scopes a search to those restaurants; that is
 a filter, so the iterative scan (pgvector 0.8) is switched on to keep it from leaving the result
 short. Both settings are `SET LOCAL`: they apply to this transaction only and never leak into
 another request sharing the pooled connection.
@@ -32,12 +32,12 @@ class VectorRepository(Repository):
         vector: list[float],
         *,
         limit: int,
-        restaurant_id: str | None = None,
+        restaurant_ids: list[str] | None = None,
         min_score: float | None = None,
     ) -> list[dict]:
         """`[{item_key, restaurant_id, score}]` nearest to `vector`, best first. `score` is cosine similarity."""
         return self._nearest(
-            "menu_item_documents", "item_key, restaurant_id", vector, limit, restaurant_id, min_score
+            "menu_item_documents", "item_key, restaurant_id", vector, limit, restaurant_ids, min_score
         )
 
     def nearest_restaurants(
@@ -45,21 +45,21 @@ class VectorRepository(Repository):
         vector: list[float],
         *,
         limit: int,
-        restaurant_id: str | None = None,
+        restaurant_ids: list[str] | None = None,
         min_score: float | None = None,
     ) -> list[dict]:
         """`[{restaurant_id, score}]` nearest to `vector`, best first."""
-        return self._nearest("restaurant_documents", "restaurant_id", vector, limit, restaurant_id, min_score)
+        return self._nearest("restaurant_documents", "restaurant_id", vector, limit, restaurant_ids, min_score)
 
-    def _nearest(self, table, columns, vector, limit, restaurant_id, min_score) -> list[dict]:
+    def _nearest(self, table, columns, vector, limit, restaurant_ids, min_score) -> list[dict]:
         clauses, params = [], {"vector": as_vector(vector), "limit": limit}
         if min_score is not None:
             # `1 - score` because `<=>` is cosine *distance*.
             clauses.append("embedding <=> %(vector)s::vector <= %(max_distance)s")
             params["max_distance"] = 1.0 - min_score
-        if restaurant_id is not None:
-            clauses.append("restaurant_id = %(restaurant_id)s")
-            params["restaurant_id"] = str(restaurant_id)
+        if restaurant_ids is not None:
+            clauses.append("restaurant_id = ANY(%(restaurant_ids)s::uuid[])")
+            params["restaurant_ids"] = [str(r) for r in restaurant_ids]
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
             SELECT {columns}, 1 - (embedding <=> %(vector)s::vector) AS score

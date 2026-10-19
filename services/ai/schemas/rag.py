@@ -26,6 +26,11 @@ class RagContextRequest(BaseModel):
     # sets this so it can say "nothing matches" instead of presenting a poor one (D63).
     min_score: Optional[float] = Field(None, ge=0, le=1)
     dietary_filters: List[str] = []
+    # Scope the search to these restaurants: "popular items from Zen Sushi" is a question about one restaurant's menu,
+    # not about the whole platform's. The assistant resolves a named restaurant to these ids before searching.
+    restaurant_ids: Optional[List[UUID]] = None
+    # "Within 3 km": only restaurants inside this distance of the caller's location. Needs a location.
+    max_distance_km: Optional[float] = Field(None, gt=0)
 
     @field_validator("dietary_filters")
     @classmethod
@@ -36,6 +41,8 @@ class RagContextRequest(BaseModel):
     def check_location_pair(self) -> "RagContextRequest":
         if (self.latitude is None) != (self.longitude is None):
             raise ValueError("latitude and longitude must be given together")
+        if self.max_distance_km is not None and self.latitude is None:
+            raise ValueError("max_distance_km needs latitude and longitude")
         return self
 
 

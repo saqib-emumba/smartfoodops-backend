@@ -163,8 +163,38 @@ NO_RESULTS = (
     "I couldn't find anything on the current menus that matches that. "
     "You could try a different cuisine, a higher budget, or fewer dietary filters."
 )
+
+
+def no_results_message(tags: list[str], max_price: float | None, max_km: float | None) -> str:
+    """"Nothing matches", naming the limits that were applied, so an allergy question ("nut-free") or a budget is not
+    answered with a vague shrug. No limits at all gives the plain message."""
+    limits = []
+    if tags:
+        limits.append("tagged " + ", ".join(tags))
+    if max_price is not None:
+        limits.append(f"under ${max_price:.2f}")
+    if max_km is not None:
+        limits.append(f"within {max_km:g} km of you")
+    if not limits:
+        return NO_RESULTS
+    return (
+        f"I couldn't find anything on the current menus {' and '.join(limits)}. "
+        "You could relax one of those, or ask me what is available."
+    )
+
+
 SEARCH_UNAVAILABLE = "I couldn't search the menus just now. Please try again in a moment."
 NO_ORDERS = "I can't see any orders on your account yet."
+# "Explain Order #102": orders are identified by a long id, not a number, and answering about the latest order instead
+# would be explaining a different order from the one asked about.
+UNKNOWN_ORDER_REF = (
+    "I can't look an order up by number: each order has a long id instead. Ask me about your latest order, "
+    "or paste the order's id and I'll explain that one."
+)
+
+
+def restaurant_not_found(name: str) -> str:
+    return f"I couldn't find a restaurant called {name} on SmartFoodOps. Check the spelling, or ask me what's on the menus."
 REFUSAL = (
     "I can help with food recommendations, your orders and questions about restaurants on "
     "SmartFoodOps. What would you like to eat?"

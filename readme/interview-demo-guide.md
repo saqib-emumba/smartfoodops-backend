@@ -122,6 +122,28 @@ The review summary reports the 2 reviews, average 4.0, praise for the food and o
 not a firm pattern. Copy may not contain a number the owner did not supply; the rating figures come from the database. An
 owner of a different restaurant gets `403`.
 
+### G. The spec's own example questions
+
+Every example question in the Week 4 and 5 requirements was put to the live assistant. This is what to expect, and what to say.
+
+| Spec example | What happens | Note |
+|---|---|---|
+| "What should I eat tonight under $10?" | Dishes at or under $10, with the budget as a hard filter | |
+| "Recommend spicy healthy food near me." | Spicy dishes, and it says nothing is tagged "healthy" (there is no such tag); with your location it also states distances | Tags are what owners declare (D60); the assistant does not guess "healthy" |
+| "What are the popular combo items from Zen Sushi?" (try `Demo Kitchen`) | Scoped to that restaurant's menu; says it has no popularity data and lists the dishes | A named restaurant scopes the search (D69). The platform records no item-level order counts |
+| "something light for a warm afternoon" | Finds the light dishes (vegan salad) | The router's cleaned search phrase makes vague wording work (D69) |
+| Personalised recommendations from order history | `Suggest something based on what I ordered before` names the past dishes and recommends from what is on the menu now | By dish name only; it does not know where each was ordered |
+| Strict budget, dietary and **distance** constraints | `Recommend halal food within 3 km of me`: filters by distance when a location is shared (use `?lat=24.88&lon=67.03`); without one it says it cannot | A hard filter on live restaurant coordinates |
+| "Why is my order delayed?" | The facts and the estimate, never "late" | The premise is not accepted; the prompt forbids a verdict |
+| "Explain the current delivery status of Order #102." | "I can't look an order up by number: each order has a long id instead" | It will not explain a different order than the one asked about |
+| Kitchen rejection, refund compensation | `Why was my order cancelled?` names the cause and says the payment was refunded | Plain words, no stack traces |
+| Driver timeout, no courier | The same path, from the recorded reason (`pickup_timeout`, `no_rider_available`) in the order's trail | Not reproducible on demand in the demo data |
+| Router: Food Discovery / Order Tracking / Restaurant Support | Five intents, including `order_history` | `Where is Demo Kitchen located?` is Restaurant Support |
+| Owner tools: descriptions, promos, review summaries | The three partner endpoints (section F) | The chat page is for customers; an owner is refused by the gateway |
+
+Not in the spec examples but worth knowing: the "Recommendation Acceptance Rate" metric talks about items added to a cart; this
+platform has no cart, so it measures an order placed at a recommended restaurant within 24 hours (D65).
+
 ## 3. Things to open on screen if asked how it works
 
 | Show | Where | What it proves |

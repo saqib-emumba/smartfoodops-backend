@@ -10,6 +10,10 @@ import json
 from ai.llm.guardrails import verify_counts, verify_quantities, verify_food_answer
 from ai.assistant.order_explainer import render_history, check_history, history_counts
 from ai.assistant.agents.router import parse_router
+from ai.assistant.agents import graph as assistant_graph
+from ai.assistant.agents.context import no_results_message
+from ai.llm.guardrails import verify_no_internal_terms
+from ai.retrieval.retriever import _within
 from common.delivery import delivery_estimate, minutes_remaining
 from datetime import datetime, timedelta, timezone
 from ai.assistant.order_explainer import OrderExplainer, check_explanation, quantities_in
@@ -86,4 +90,33 @@ out["a_placed_order_is_never_out_of_range"] = "out_of_range" not in far["deliver
 out["a_location_beyond_range_is_ignored_for_a_placed_order"] = far["delivery_estimate"] == nowhere["delivery_estimate"] and far["delivery_estimate"]["trip_assumed"] is True
 out["a_nearby_location_is_used_for_a_placed_order"] = near["delivery_estimate"]["trip_assumed"] is False
 out["the_far_order_summary_passes_its_own_check"] = check_explanation(far["plain_summary"], far).ok
+# --- scenarios from the Week 4/5 spec and what customers actually type (D69) ---------------------------------------
+decision = parse_router(json.dumps({"intent": "food_discovery", "search_query": "  light   meal ", "restaurant_name": "Zen Sushi", "max_distance_km": 3}))
+out["router_reads_a_cleaned_search_phrase"] = decision.search_query == "light meal"
+out["router_reads_a_named_restaurant"] = decision.restaurant_name == "Zen Sushi"
+out["router_reads_a_distance_limit"] = decision.max_distance_km == 3.0
+out["router_rejects_an_absurd_distance"] = parse_router('{"intent":"food_discovery","max_distance_km":0}').max_distance_km is None and parse_router('{"intent":"food_discovery","max_distance_km":5000}').max_distance_km is None
+out["router_ignores_non_text_names"] = parse_router('{"intent":"food_discovery","restaurant_name":42,"search_query":["x"]}').restaurant_name is None
+out["router_bounds_a_long_name"] = len(parse_router(json.dumps({"intent": "food_discovery", "restaurant_name": "x" * 500})).restaurant_name) == 80
+order_ref = assistant_graph._ORDER_NUMBER
+out["order_hash_number_is_recognised"] = bool(order_ref.search("Explain the current delivery status of Order #102."))
+out["order_number_words_are_recognised"] = bool(order_ref.search("where is order number 42")) and bool(order_ref.search("order no. 7"))
+out["an_ordinary_order_question_is_not_a_number"] = not order_ref.search("Where is my order from Demo Kitchen? It was placed 5 minutes ago") and not order_ref.search("my order")
+personal = assistant_graph._PERSONAL
+out["history_based_asks_are_recognised"] = all(personal.search(q) for q in ["Suggest something based on what I ordered before", "what I had last time again", "my usual please", "something similar to what I ordered", "reorder my last meal"])
+out["plain_food_asks_are_not_personal"] = not personal.search("Recommend a spicy dish under $15") and not personal.search("something light for a warm afternoon")
+out["prompt_labels_may_not_reach_a_customer"] = not verify_no_internal_terms("CONTEXT has no address for it.").ok and not verify_no_internal_terms("Per FACTS the order is late.").ok
+out["field_names_may_not_reach_a_customer"] = not verify_no_internal_terms("Your total_orders is 3 and trip_assumed is true.").ok
+out["ordinary_words_are_fine"] = verify_no_internal_terms("The context of your order is simple: the facts are clear.").ok
+out["leaks_are_caught_in_food_answers"] = not verify_food_answer("**A** is $5.00. CONTEXT has no more.", names={"a"}, prices={5.0}).ok
+out["leaks_are_caught_in_order_answers"] = not check_explanation("According to FACTS, about 19 to 29 more minutes.", order).ok
+out["leaks_are_caught_in_history_answers"] = not check_history("Your recent_orders show 7 orders.", facts).ok
+out["no_results_names_the_allergy_filter"] = "tagged nut-free" in no_results_message(["nut-free"], None, None)
+out["no_results_names_every_limit"] = all(x in no_results_message(["vegan"], 5.0, 3.0) for x in ("tagged vegan", "under $5.00", "within 3 km"))
+out["no_results_without_limits_is_the_plain_message"] = no_results_message([], None, None).startswith("I couldn't find anything on the current menus")
+here = (24.8607, 67.0011, 3.0)
+out["a_nearby_restaurant_is_within_range"] = _within({"latitude": 24.87, "longitude": 67.01}, here)
+out["a_far_restaurant_is_not"] = not _within({"latitude": 33.68, "longitude": 73.04}, here)
+out["no_limit_means_everywhere"] = _within({"latitude": 33.68, "longitude": 73.04}, None)
+out["an_unlocated_restaurant_cannot_be_shown_within_a_limit"] = not _within({"latitude": None, "longitude": None}, here)
 print(json.dumps(out))

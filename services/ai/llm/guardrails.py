@@ -194,6 +194,9 @@ def verify_food_answer(
         measured = verify_quantities(answer, quantities=quantities)
         verdict.ok = verdict.ok and measured.ok
         verdict.violations += measured.violations
+    leaked = verify_no_internal_terms(answer)
+    verdict.ok = verdict.ok and leaked.ok
+    verdict.violations += leaked.violations
     return verdict
 
 
@@ -221,6 +224,23 @@ _COUNT_CLAIMS = (
     re.compile(rf"\b{_NUMBER}\s+(?:[\w-]+\s+){{0,2}}orders?\b", re.I),
     re.compile(rf"\b{_NUMBER}\s+(?:are\s+|is\s+|of them\s+(?:are\s+)?)?{_STATE}\b", re.I),
 )
+
+
+# Words that belong to the prompt, not to the customer: the block labels the model is handed and the field names inside
+# them. A model that says "CONTEXT has no address for it" has leaked its instructions, however well meant.
+_INTERNAL = re.compile(
+    r"\b(?:CONTEXT|FACTS)\b"
+    r"|\b(?:sources_failed|trip_assumed|minutes_low|minutes_high|prep_minutes|delivery_estimate|estimate_at_assignment"
+    r"|recent_orders|total_orders|plain_summary|previous_orders|location_needed|restaurant_not_found)\b"
+)
+
+
+def verify_no_internal_terms(answer: str) -> Verdict:
+    """The answer may not mention the prompt's own block labels or field names."""
+    verdict = Verdict()
+    for match in _INTERNAL.finditer(answer):
+        verdict.add("internal_term", match.group(0))
+    return verdict
 
 
 def verify_counts(answer: str, *, counts: set[int]) -> Verdict:

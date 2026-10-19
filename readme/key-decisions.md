@@ -2685,6 +2685,38 @@ external dependency for a number that is only an estimate).
 - **The estimate is unchecked against reality.** Nothing compares it with how long an order actually took. That would need a
   recorded delivery time per order, which the platform does have (the trail), and is the obvious way to tune the constants.
 
+### D69 — Scenarios from the spec that the assistant got wrong, found by asking it the spec's own questions
+
+Each of the spec's example questions (Weeks 4 and 5) was put to the live assistant, with the variations a customer would type.
+Most were fine; these were not, and each is now fixed and tested.
+
+| Question | What went wrong | Fix |
+|---|---|---|
+| "Explain the current delivery status of **Order #102**" | Answered about the customer's *latest* order, as if it were #102: a wrong answer, stated confidently | A number is not an order identifier here (orders have long ids). A question naming one, with no UUID, gets a fixed reply saying so |
+| "popular combo items from **Zen Sushi**", "Where is **Demo Kitchen** located?" | A restaurant named in the question did not scope the search, so the answer was about other restaurants, and it said "CONTEXT has no address" | The router returns the restaurant's name; it is resolved to restaurant ids (the whole name or the name plus more words, so branches of one restaurant match) and the search is scoped to them, with no similarity floor. A name that matches nothing is said plainly |
+| "something light for a warm afternoon" (the spec's own example) | "I couldn't find anything": the filler scored 0.22 against a salad, below the 0.30 floor, where "light meal" scores 0.49 | The router also returns a cleaned search phrase, and the vector search uses that |
+| "Suggest something based on what I ordered before" | "I couldn't find anything": nothing in the question describes food | The dishes from the customer's newest orders become the search, and are given to the model by name only |
+| "within 3 km of me", "near me" | The spec asks for distance constraints; there was none, only sorting | `max_distance_km` from the router is a hard filter on live restaurant coordinates, like price and tags. Without a shared location the answer says it cannot filter by distance |
+| An allergy ("I have a nut allergy") with nothing tagged | The generic "try a different cuisine" shrug | The "nothing matches" message names the limits applied ("tagged nut-free") |
+| Any answer | The model sometimes wrote "CONTEXT has no..." to the customer | The guardrail rejects the prompt's own block labels and field names in any answer |
+
+**Instead of:** a bigger prompt (it cannot fix a retrieval that never saw the restaurant, or a query that scores below a floor), or a
+tool-calling agent that picks its own tools (D63: retrieval must always run first).
+
+**Costs:**
+
+- **The router now decides more.** It extracts a search phrase, a restaurant name and a distance as well as an intent. A wrong
+  extraction costs a worse search, never a wrong fact, because each answer is still checked against what was retrieved.
+- **Name resolution is exact on purpose.** "Zen Sushi" finds its branches; a misspelling finds nothing and says so rather than
+  guessing a restaurant.
+- **"Popular" is still unanswerable.** The platform records no item-level order counts, so the assistant says it has no popularity
+  data and shows the menu.
+- **"Healthy" is not a tag.** There is no such tag in the vocabulary (D60), so "spicy healthy food" is answered as spicy, and the
+  assistant says nothing is tagged healthy.
+- **Personalisation is by dish name only.** It knows what was ordered, not where, so it does not attach a past dish to a restaurant.
+- **A "favourite restaurant" question** is answered from the newest five orders' restaurants and says it cannot be sure; the
+  Analytics favourites are used by the food path only.
+
 ## Open questions
 
 Not yet decided, and worth settling before the code forces an answer:

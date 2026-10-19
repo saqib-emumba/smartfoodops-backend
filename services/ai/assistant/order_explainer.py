@@ -451,7 +451,7 @@ def check_history(text: str, facts: dict):
     Not checked: which state belongs to which order. A model that said the wrong order was delivered would
     pass if the counts add up; the prompt forbids it and the ceiling is stated, as for food answers (D63).
     """
-    from ai.llm.guardrails import verify_counts, verify_no_verdict, verify_prices, verify_quantities
+    from ai.llm.guardrails import verify_counts, verify_no_internal_terms, verify_no_verdict, verify_prices, verify_quantities
 
     prices = {float(order["total"].lstrip("$")) for order in facts["recent_orders"]}
     minutes = {float(o["placed_minutes_ago"]) for o in facts["recent_orders"] if o["placed_minutes_ago"] is not None}
@@ -460,6 +460,7 @@ def check_history(text: str, facts: dict):
         verify_prices(text, prices=prices),
         verify_quantities(text, quantities=minutes),
         verify_no_verdict(text),
+        verify_no_internal_terms(text),
     ):
         verdict.ok = verdict.ok and extra.ok
         verdict.violations += extra.violations
@@ -474,7 +475,14 @@ def check_explanation(text: str, facts: dict):
     The one check both `explain` and the assistant's order path run, so the two cannot disagree about what
     counts as grounded.
     """
-    from ai.llm.guardrails import verify_cause, verify_money, verify_no_verdict, verify_quantities, verify_status
+    from ai.llm.guardrails import (
+        verify_cause,
+        verify_money,
+        verify_no_internal_terms,
+        verify_no_verdict,
+        verify_quantities,
+        verify_status,
+    )
 
     verdict = verify_quantities(text, quantities=quantities_in(facts))
     for extra in (
@@ -482,6 +490,7 @@ def check_explanation(text: str, facts: dict):
         verify_status(text, status=facts["status"]),
         verify_cause(text, cause=facts.get("cause")),
         verify_no_verdict(text),
+        verify_no_internal_terms(text),
     ):
         verdict.ok = verdict.ok and extra.ok
         verdict.violations += extra.violations

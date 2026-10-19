@@ -32,6 +32,7 @@ from opentelemetry import trace
 from ai import config
 from ai.clients.analytics import AnalyticsServiceClient
 from ai.clients.rider import RiderServiceClient
+from ai.llm.guardrails import normalize
 from ai.retrieval.embeddings import Embedder, embed_timed
 from ai.metrics import RAG_LATENCY_SECONDS, RAG_REQUESTS_TOTAL, RAG_SOURCE_FAILURES_TOTAL
 from ai.retrieval.geo import haversine_km
@@ -144,13 +145,42 @@ class RagContextAssembler:
     def _search_sync(self, request: RagContextRequest):
         """Embed the prompt and run the hybrid search — CPU-bound and blocking, so off the loop."""
         vector = embed_timed(self._embedder, [request.prompt_query])[0]
+        near = (
+            (request.latitude, request.longitude, request.max_distance_km)
+            if request.max_distance_km is not None
+            else None
+        )
         return self._retriever.search(
             vector,
             top_k=request.top_k,
             max_price=request.max_price,
             tags=request.dietary_filters,
+            restaurant_ids=[str(r) for r in request.restaurant_ids] if request.restaurant_ids else None,
             min_score=request.min_score,
+            near=near,
         )
+
+    async def resolve_restaurants(self, name: str) -> list[dict]:
+        """`[{id, name}]` for the restaurants a customer named, or [] if none matches.
+
+        A match is the whole name, or the name followed by more words ("Zen Sushi" finds "Zen Sushi 1409" and
+        "Zen Sushi 0790": several branches of one restaurant share a stem, the same family idea the name guardrail
+        uses). Never a fuzzy guess: scoping a question to the wrong restaurant would answer confidently about
+        something the customer did not ask about, so no match is a clear "I could not find that restaurant".
+        """
+        return await asyncio.to_thread(self._resolve_sync, name)
+
+    def _resolve_sync(self, name: str) -> list[dict]:
+        wanted = normalize(name)
+        if not wanted:
+            return []
+        vector = embed_timed(self._embedder, [name])[0]
+        _, rows = self._retriever.search(vector, top_k=20)
+        return [
+            {"id": str(row["restaurant_id"]), "name": row["name"]}
+            for row in rows
+            if normalize(row["name"]) == wanted or normalize(row["name"]).startswith(wanted + " ")
+        ]
 
     def _restaurants(self, rows: list[dict], request: RagContextRequest) -> list[RagRestaurant]:
         """Restaurants, nearest first when the caller gave a location.

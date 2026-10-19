@@ -179,7 +179,7 @@ owner's restaurant and a customer for the tools; a review summary reports the da
 - **Smoke test:** a new *AI assistant and explanations (Week 5)* section. Access control, validation and the
   review rules run whatever the provider. The wording checks that needed the `fake` provider were removed with it.
 - **Postman:** folders 10 and 11 (22 and 38 requests; folder 3 gained four for the preparation time), assertions that hold on any provider because they check what a client
-  would show. Run end to end with Newman against Claude: **200 requests, 476 assertions, 0 failed.** That run also found
+  would show. Run end to end with Newman against Claude: **203 requests, 486 assertions, 0 failed.** That run also found
   and fixed script bugs that had been in the older folders since they were written (booleans compared to `"True"`,
   `{{var}}` written inside script text, `body.role` where the API returns `roles`), and a rider-dispatch problem (every
   session used the same coordinates, so a used stack handed the order to another run's rider). See
@@ -196,9 +196,9 @@ was stamped and `sfo_ai_attributed_orders_total` / `sfo_ai_attributed_revenue_to
 
 Run on the dev stack. Current counts; the fake model has since been removed:
 
-- `./scripts/smoke-test.sh` — **703 passed, 0 failed** (75 added since 628 for order history, the delivery-time estimate, the preparation time and the in-container guardrail checks; 628 before them, 601 after the fake model and its wording checks were removed, 677 before; D66 added 18). (The three `compensation_failed` timing failures that
+- `./scripts/smoke-test.sh` — **727 passed, 0 failed** (99 added since 628 for order history, the delivery-time estimate, the preparation time and the in-container guardrail checks; 628 before them, 601 after the fake model and its wording checks were removed, 677 before; D66 added 18). (The three `compensation_failed` timing failures that
   appeared in earlier Week 4 runs did not occur.)
-- `./scripts/smoke-test.sh --fast` — **523 passed, 0 failed** (448 before order history, 424 after the fake-model removal, 482 before).
+- `./scripts/smoke-test.sh --fast` — **547 passed, 0 failed** (448 before order history, 424 after the fake-model removal, 482 before).
 - A follow-up (explanations also quote the recorded dispatch estimate, and split the wait into the restaurant's time
   and the courier search) was verified on a real delivered order against its raw trail timestamps, on an in-flight
   order waiting on the kitchen, and by unit-checking six timelines (accepted, rejected, instant, waiting on the

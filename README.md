@@ -650,9 +650,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 703 assertions against http://localhost
+./scripts/smoke-test.sh            # 727 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 523 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 547 assertions, skips the saga sections and the policy-TTL wait
 # What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -741,7 +741,7 @@ copy-pasteable `curl` commands, grouped by service, with the expected response f
 
 For exercising the same contract from Postman instead of a terminal, import
 [postman/smartfoodops.postman_collection.json](postman/smartfoodops.postman_collection.json) —
-200 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
+203 requests across 12 folders (Week 4's AI retrieval and Week 5's AI assistant are folders 10 and 11), hand-maintained from the same scenarios `smoke-test.sh` drives,
 including a Collection-Runner-only happy path through the saga (self-looping status polls,
 since checkout is asynchronous). See [postman/README.md](postman/README.md) for import steps,
 run order, and what it can't check that the shell script can.
