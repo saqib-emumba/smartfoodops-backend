@@ -303,7 +303,7 @@ curl -s -X POST http://localhost/api/v1/ai/rag-context -H "Authorization: Bearer
   -d "{\"customer_id\":\"$CUST_ID\",\"prompt_query\":\"lunch near me\",\"latitude\":33.68,\"longitude\":73.04}"
 ```
 
-- **Tags.** Menu items carry owner-declared `dietary_tags` from a fixed vocabulary of 40
+- **Tags.** Menu items carry owner-declared `dietary_tags` from a fixed vocabulary of 52
   (diets, religious, allergens, cuisines, formats, dish types, meal styles —
   [services/common/dietary.py](services/common/dietary.py)); nothing is inferred. An unknown tag is a
   `422` on publish and on search. A filter requires **every** tag asked for, so send one
@@ -650,9 +650,9 @@ exactly as a client would — the full checkout chain, the whole order lifecycle
 edge case in the contract — and asserts status codes and response fields:
 
 ```bash
-./scripts/smoke-test.sh            # 727 assertions against http://localhost
+./scripts/smoke-test.sh            # 732 assertions against http://localhost
 ./scripts/smoke-test.sh --wait     # poll until services are up, then run
-./scripts/smoke-test.sh --fast     # 547 assertions, skips the saga sections and the policy-TTL wait
+./scripts/smoke-test.sh --fast     # 552 assertions, skips the saga sections and the policy-TTL wait
 # What the assistant *says* is not asserted here (a real model's wording varies): see postman/README.md
 ./scripts/smoke-test.sh --verbose  # also print response bodies
 BASE_URL=http://host:8080 ./scripts/smoke-test.sh
@@ -660,6 +660,10 @@ BASE_URL=http://host:8080 ./scripts/smoke-test.sh
 
 It exits `0` when everything passes and `1` with a list of failures otherwise, so it works
 as a pre-commit check or a CI step. Colour is suppressed when the output is piped.
+
+Each run leaves its two riders behind at the same coordinates. Dispatch considers only the 50 nearest riders by
+distance, so the saga section removes earlier runs' riders from the Redis geo index before it starts (their
+availability is already grounded), or a long-lived stack would eventually cancel its orders with `no_rider_in_range`.
 
 What it covers beyond status codes:
 

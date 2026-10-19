@@ -131,7 +131,7 @@ Every example question in the Week 4 and 5 requirements was put to the live assi
 |---|---|---|
 | "What should I eat tonight under $10?" | Dishes at or under $10, with the budget as a hard filter | |
 | "Recommend spicy healthy food near me." | Spicy dishes, and it says nothing is tagged "healthy" (there is no such tag); with your location it also states distances | Tags are what owners declare (D60); the assistant does not guess "healthy" |
-| "What are the popular combo items from Zen Sushi?" (try `Demo Kitchen`) | Scoped to that restaurant's menu; says it has no popularity data and lists the dishes | A named restaurant scopes the search (D69). The platform records no item-level order counts |
+| "What are the popular combo items from Zen Sushi?" (after `seed-restaurants.sh`, which creates Zen Sushi with a combo platter; otherwise try `Demo Kitchen`) | Scoped to that restaurant's menu; says it has no popularity data and lists the dishes | A named restaurant scopes the search (D69). The platform records no item-level order counts |
 | "something light for a warm afternoon" | Finds the light dishes (vegan salad) | The router's cleaned search phrase makes vague wording work (D69) |
 | Personalised recommendations from order history | `Suggest something based on what I ordered before` names the past dishes and recommends from what is on the menu now | By dish name only; it does not know where each was ordered |
 | Strict budget, dietary and **distance** constraints | `Recommend halal food within 3 km of me`: filters by distance when a location is shared (use `?lat=24.88&lon=67.03`); without one it says it cannot | A hard filter on live restaurant coordinates |

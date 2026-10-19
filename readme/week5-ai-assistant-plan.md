@@ -196,9 +196,9 @@ was stamped and `sfo_ai_attributed_orders_total` / `sfo_ai_attributed_revenue_to
 
 Run on the dev stack. Current counts; the fake model has since been removed:
 
-- `./scripts/smoke-test.sh` — **727 passed, 0 failed** (99 added since 628 for order history, the delivery-time estimate, the preparation time and the in-container guardrail checks; 628 before them, 601 after the fake model and its wording checks were removed, 677 before; D66 added 18). (The three `compensation_failed` timing failures that
+- `./scripts/smoke-test.sh` — **732 passed, 0 failed** (99 added since 628 for order history, the delivery-time estimate, the preparation time and the in-container guardrail checks; 628 before them, 601 after the fake model and its wording checks were removed, 677 before; D66 added 18). (The three `compensation_failed` timing failures that
   appeared in earlier Week 4 runs did not occur.)
-- `./scripts/smoke-test.sh --fast` — **547 passed, 0 failed** (448 before order history, 424 after the fake-model removal, 482 before).
+- `./scripts/smoke-test.sh --fast` — **552 passed, 0 failed** (448 before order history, 424 after the fake-model removal, 482 before).
 - A follow-up (explanations also quote the recorded dispatch estimate, and split the wait into the restaurant's time
   and the courier search) was verified on a real delivered order against its raw trail timestamps, on an in-flight
   order waiting on the kitchen, and by unit-checking six timelines (accepted, rejected, instant, waiting on the

@@ -204,7 +204,10 @@ column drop must never precede the new code going live:
 - Dual-rider tie-breaking registration/location assertions (~lines 699-717): unchanged — the HTTP
   contract is identical.
 - The two direct-`psql` groundings (~726-731, ~865-869) only touch `is_available`/`current_order_id`,
-  which never move — unchanged.
+  which never move — unchanged. One addition since: the grounding step also `ZREM`s the earlier runs' riders from
+  `riders:geo`. Dispatch reads only the 50 nearest candidates (`RIDER_DISPATCH_CANDIDATE_CAP`) before filtering for
+  availability, and every run leaves two riders at identical coordinates, so past ~50 stale riders the run's own
+  riders could fall outside the window and the order was cancelled with `no_rider_in_range`.
 - **New**: right after the location-ping assertion, `docker exec sfo-redis redis-cli -n 2 GEOPOS
   riders:geo "$RIDER_USER_ID"` asserting a non-null coordinate pair — the Redis-side grounding step
   this migration needs, cheap insurance against `set_location` silently no-op'ing.

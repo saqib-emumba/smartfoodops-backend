@@ -25,7 +25,7 @@
 # per-release: it runs in ~17s against ~12min, because the saga sections wait on two 120s
 # kitchen timeouts and two 200s lost-signal timers.
 #
-# It is a real reduction in coverage, not just in runtime. --fast asserts 547 of the 727
+# It is a real reduction in coverage, not just in runtime. --fast asserts 552 of the 732
 # checks (counts as of Week 5's AI layer) and leaves fourteen
 # routes COMPLETELY untouched -- every one the saga drives:
 #
@@ -926,6 +926,16 @@ if have_container sfo-rider-db; then
   docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -q -c \
     "UPDATE riders SET is_available = FALSE WHERE id NOT IN ('$RIDER_ID', '$RIDER2_ID');" \
     >/dev/null 2>&1
+  # Grounding is not enough on its own. Dispatch asks Redis for only the RIDER_DISPATCH_CANDIDATE_CAP (50) nearest
+  # riders and filters availability afterwards, and every earlier run's two riders sit at these same coordinates, tied
+  # at distance zero. Once more than 50 had piled up, this run's riders could fall outside the 50 and the order was
+  # cancelled with no_rider_in_range. So also drop the leftovers' locations from the geo index (the demo riders keep
+  # theirs: scripts/seed-demo.sh owns them). A rider who pings again is added back.
+  if have_container sfo-redis; then
+    docker exec sfo-rider-db psql -U sfo_rider_admin -d sfo_rider_core -tA -c \
+      "SELECT user_id FROM riders WHERE id NOT IN ('$RIDER_ID', '$RIDER2_ID') AND vehicle_number NOT LIKE 'DEMO-%';" 2>/dev/null \
+      | tr -d '\r' | xargs -r -n 100 docker exec sfo-redis redis-cli -n 2 ZREM riders:geo >/dev/null 2>&1
+  fi
 fi
 
 # --- internal-only surfaces --------------------------------------------------------------

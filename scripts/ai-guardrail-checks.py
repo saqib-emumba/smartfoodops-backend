@@ -119,4 +119,13 @@ out["a_nearby_restaurant_is_within_range"] = _within({"latitude": 24.87, "longit
 out["a_far_restaurant_is_not"] = not _within({"latitude": 33.68, "longitude": 73.04}, here)
 out["no_limit_means_everywhere"] = _within({"latitude": 33.68, "longitude": 73.04}, None)
 out["an_unlocated_restaurant_cannot_be_shown_within_a_limit"] = not _within({"latitude": None, "longitude": None}, here)
+from common.dietary import DIETARY_TAGS, normalize_dietary_tags
+out["cuisine_and_dish_tags_are_in_the_vocabulary"] = all(t in DIETARY_TAGS for t in ("chinese", "korean", "soup", "noodles", "dessert", "drink", "seafood"))
+out["the_vocabulary_has_no_duplicates"] = len(set(DIETARY_TAGS)) == len(DIETARY_TAGS)
+out["a_new_tag_is_normalised_on_publish"] = normalize_dietary_tags([" Soup ", "soup", "CHINESE"]) == ["soup", "chinese"]
+try:
+    normalize_dietary_tags(["soupy"]); out["an_unknown_tag_is_rejected"] = False
+except ValueError:
+    out["an_unknown_tag_is_rejected"] = True
+out["the_router_keeps_a_new_tag"] = parse_router('{"intent":"food_search","dietary_filters":["soup","chinese","bogus"]}').dietary_filters == ["soup", "chinese"]
 print(json.dumps(out))
