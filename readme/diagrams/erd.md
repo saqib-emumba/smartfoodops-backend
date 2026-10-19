@@ -321,12 +321,12 @@ erDiagram
         uuid id PK
         uuid customer_id "References USERS.id, cross-db, no engine FK"
         varchar conversation_id "The label a client continues a conversation with"
-        varchar intent "food_discovery, order_tracking, restaurant_support or out_of_scope"
+        varchar intent "food_discovery, order_tracking, order_history, restaurant_support or out_of_scope"
         varchar outcome "answered, fallback, no_results or refused"
         uuid_array recommended_restaurant_ids "Restaurants named in the answer"
         text_array recommended_item_ids "Menu item keys named in the answer"
         timestamptz created_at
         uuid converted_order_id "Unique, nullable -- set by the attribution consumer (D65)"
         timestamptz converted_at "Nullable"
-    }
+    } 
 ```
